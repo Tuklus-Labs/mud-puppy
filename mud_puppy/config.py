@@ -31,7 +31,3 @@ class TrainingConfig:
                 f"Unsupported finetuning method: {self.finetuning_method}"
             )
 
-        if self.precision not in {"fp16", "bf16", "fp8"}:
-            raise ValueError(f"Unsupported precision: {self.precision}")
-
-
