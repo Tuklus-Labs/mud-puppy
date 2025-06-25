@@ -26,6 +26,7 @@ def load_model(config: TrainingConfig):
         if not hasattr(torch, "float8_e4m3fn"):
             raise RuntimeError("FP8 precision is not supported in this PyTorch build")
         model.to(torch.float8_e4m3fn)
+
     return model, tokenizer
 
 
@@ -75,6 +76,7 @@ class FP8Trainer(Trainer):
     def training_step(self, model, inputs):
         with torch.autocast("cuda", dtype=torch.float8_e4m3fn):
             return super().training_step(model, inputs)
+
 
 
 def configure_rocm():
@@ -131,6 +133,7 @@ def run_training(config: TrainingConfig):
 
     trainer_cls = FP8Trainer if config.precision == "fp8" else Trainer
     trainer = trainer_cls(
+
         model=model,
         args=training_args,
         train_dataset=dataset,

@@ -20,6 +20,7 @@ def main():
         choices=["fp16", "bf16", "fp8"],
         help="training precision",
     )
+
     args = parser.parse_args()
 
     config = TrainingConfig(

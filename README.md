@@ -27,7 +27,6 @@ mud-puppy your-model your-dataset --method lora --output ./finetuned
 ```
 
 ## ROCm optimization
-
 mud-puppy is designed to run efficiently on AMD GPUs. It defaults to `bf16` precision and enables gradient checkpointing to keep memory usage low on `GFX1100` cards. You can also opt into experimental `fp8` training by passing `--precision fp8` if your hardware supports it.
 The trainer configures ROCm with `PYTORCH_HIP_ALLOC_CONF=max_split_size_mb:128` and
 enables TF32 matrix multiply for additional speed when available.
