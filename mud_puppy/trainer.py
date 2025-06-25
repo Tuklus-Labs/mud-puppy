@@ -1,5 +1,6 @@
 import os
-from typing import Optional
+from typing import Optional, Dict, List
+
 
 import torch
 from transformers import (
@@ -7,6 +8,7 @@ from transformers import (
     AutoTokenizer,
     Trainer,
     TrainingArguments,
+    DataCollatorForLanguageModeling,
 )
 
 from .config import TrainingConfig
@@ -33,7 +35,15 @@ def prepare_lora(model, config: TrainingConfig):
     lora_config = LoraConfig(
         r=config.lora_r,
         lora_alpha=config.lora_alpha,
-        target_modules=["q_proj", "v_proj"],
+        target_modules=[
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ],
     )
     model = get_peft_model(model, lora_config)
     return model
@@ -64,21 +74,26 @@ def run_training(config: TrainingConfig):
         model = prepare_lora(model, config)
 
     training_args = create_training_args(config)
+    dataset = load_and_preprocess_dataset(config, tokenizer)
 
-    # Placeholder dataset loading
-    from datasets import load_dataset
+    data_collator = DataCollatorForLanguageModeling(
+        tokenizer=tokenizer, mlm=False
+    )
 
-    dataset = load_dataset(config.dataset_path)
-    if "train" not in dataset:
-        raise ValueError("Dataset must contain a train split")
+    trainer_cls = FP8Trainer if config.precision == "fp8" else Trainer
+    trainer = trainer_cls(
 
-    trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=dataset["train"],
+        train_dataset=dataset,
+        data_collator=data_collator,
         tokenizer=tokenizer,
     )
 
     trainer.train()
+
+
+    trainer.save_model(config.output_dir)
+    tokenizer.save_pretrained(config.output_dir)
 
 

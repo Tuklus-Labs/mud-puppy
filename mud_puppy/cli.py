@@ -14,6 +14,7 @@ def main():
     parser.add_argument("--output", default="./outputs", dest="output", help="output directory")
     parser.add_argument("--preference", dest="preference", help="preference method")
     parser.add_argument("--precision", dest="precision", default="bf16")
+
     args = parser.parse_args()
 
     config = TrainingConfig(
