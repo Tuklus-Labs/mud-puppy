@@ -92,7 +92,7 @@ def apply_chat_template(examples: Dict[str, List[Dict[str, str]]], tokenizer):
     return {"text": text}
 
 
-def load_and_preprocess_dataset(config: TrainingConfig, tokenizer):
+ddef load_and_preprocess_dataset(config: TrainingConfig, tokenizer):
     """Load a JSONL chat dataset and tokenize it."""
     from datasets import load_dataset
 
@@ -104,14 +104,21 @@ def load_and_preprocess_dataset(config: TrainingConfig, tokenizer):
         remove_columns=dataset.column_names,
     )
 
-    # Tokenize
+    # Tokenize WITHOUT return_tensors="pt" in batched mode
+    def tokenize_function(examples):
+        return tokenizer(
+            examples["text"], 
+            truncation=True, 
+            padding=False,  # Let DataCollator handle padding
+            max_length=2048
+        )
+
     dataset = dataset.map(
-        lambda ex: tokenizer(
-            ex["text"], truncation=True, padding=False, return_tensors="pt"
-        ),
+        tokenize_function,
         batched=True,
+        remove_columns=["text"]
     )
-    dataset.set_format(type="torch", columns=["input_ids", "attention_mask"])
+    
     return dataset
 
 
