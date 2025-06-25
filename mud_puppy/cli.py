@@ -13,7 +13,14 @@ def main():
     parser.add_argument("--method", default="full", dest="method", help="finetuning method")
     parser.add_argument("--output", default="./outputs", dest="output", help="output directory")
     parser.add_argument("--preference", dest="preference", help="preference method")
-    parser.add_argument("--precision", dest="precision", default="bf16")
+    parser.add_argument(
+        "--precision",
+        dest="precision",
+        default="bf16",
+        choices=["fp16", "bf16", "fp8"],
+        help="training precision",
+    )
+
     args = parser.parse_args()
 
     config = TrainingConfig(

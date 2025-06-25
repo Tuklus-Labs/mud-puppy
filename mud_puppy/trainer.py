@@ -22,6 +22,11 @@ def get_device() -> torch.device:
 def load_model(config: TrainingConfig):
     model = AutoModelForCausalLM.from_pretrained(config.model_name_or_path)
     tokenizer = AutoTokenizer.from_pretrained(config.model_name_or_path)
+    if config.precision == "fp8":
+        if not hasattr(torch, "float8_e4m3fn"):
+            raise RuntimeError("FP8 precision is not supported in this PyTorch build")
+        model.to(torch.float8_e4m3fn)
+
     return model, tokenizer
 
 
@@ -63,6 +68,15 @@ def create_training_args(config: TrainingConfig) -> TrainingArguments:
         gradient_checkpointing=config.use_gradient_checkpointing,
         optim="adamw_torch",
     )
+
+
+class FP8Trainer(Trainer):
+    """Trainer subclass enabling FP8 autocast."""
+
+    def training_step(self, model, inputs):
+        with torch.autocast("cuda", dtype=torch.float8_e4m3fn):
+            return super().training_step(model, inputs)
+
 
 
 def configure_rocm():
@@ -117,7 +131,9 @@ def run_training(config: TrainingConfig):
         tokenizer=tokenizer, mlm=False
     )
 
-    trainer = Trainer(
+    trainer_cls = FP8Trainer if config.precision == "fp8" else Trainer
+    trainer = trainer_cls(
+
         model=model,
         args=training_args,
         train_dataset=dataset,
