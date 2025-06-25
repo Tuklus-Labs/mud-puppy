@@ -1,2 +1,30 @@
 # mud-puppy
-Like Axolotl, but for ROCm
+
+mud-puppy is a ROCm-first LLM fine‑tuning framework inspired by [Axolotl](https://github.com/OpenAccess-AI-Collective/axolotl). It targets AMD GPUs and is optimized for the `GFX1100` architecture.
+
+## Features
+
+- **Full fine‑tuning** using the HuggingFace `Trainer` API
+- **LoRA** and **QLoRA** via the `peft` library
+- **GPTQ** and **QAT** hooks (placeholders)
+- **Preference tuning** with support for DPO, IPO, KTO and ORPO (placeholders)
+- **Reinforcement Learning** with GRPO (placeholder)
+- **Multimodal support** (placeholder)
+- **Reward Modelling** / **Process Reward Modelling** (placeholder)
+
+The framework is still experimental and many advanced algorithms are yet to be implemented.
+
+### Quick start
+
+Install from source and launch a run:
+
+```bash
+pip install -e .
+
+mud-puppy your-model your-dataset --method lora --output ./finetuned
+```
+
+## ROCm optimization
+
+mud-puppy is designed to run efficiently on AMD GPUs. It defaults to `bf16` precision and enables gradient checkpointing to keep memory usage low on `GFX1100` cards.
+
