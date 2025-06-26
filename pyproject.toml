@@ -1,0 +1,19 @@
+[project]
+name = "mud-puppy"
+version = "0.1.0"
+description = "A ROCm-first LLM fine-tuning framework"
+authors = [ { name = "LLM" } ]
+requires-python = ">=3.9"
+dependencies = [
+    "torch",
+    "transformers",
+    "datasets",
+    "peft",
+    "bitsandbytes-cuda117",
+    "auto-gptq",
+    "trl",
+]
+
+[project.scripts]
+mud-puppy = "mud_puppy.cli:main"
+
