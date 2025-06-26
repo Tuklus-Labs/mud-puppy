@@ -40,6 +40,7 @@ def main():
         default=1,
         help="dataset preprocessing workers",
     )
+
     args = parser.parse_args()
 
     config = TrainingConfig(

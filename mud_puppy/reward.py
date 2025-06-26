@@ -8,8 +8,8 @@ from transformers import (
     Trainer,
 )
 
-from .config import TrainingConfig
 
+from .config import TrainingConfig
 
 def train_reward_model(config: TrainingConfig):
     """Train a reward model for RM or PRM."""
@@ -39,4 +39,5 @@ def train_reward_model(config: TrainingConfig):
     trainer.train()
     trainer.save_model(config.output_dir)
     tokenizer.save_pretrained(config.output_dir)
+
 

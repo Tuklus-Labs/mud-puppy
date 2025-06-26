@@ -1,5 +1,8 @@
 import os
+<<<<<<< ozocca-codex/create-llm-fine-tuning-framework-with-rocm-support
 os.environ.setdefault("PYTORCH_HIP_ALLOC_CONF", "max_split_size_mb:128")
+=======
+>>>>>>> main
 from typing import Optional, Dict, List
 
 import torch
@@ -9,7 +12,10 @@ from transformers import (
     Trainer,
     TrainingArguments,
     DataCollatorForLanguageModeling,
+<<<<<<< ozocca-codex/create-llm-fine-tuning-framework-with-rocm-support
     BitsAndBytesConfig,
+=======
+>>>>>>> main
 )
 
 from .config import TrainingConfig
@@ -22,6 +28,7 @@ def get_device() -> torch.device:
 
 
 def load_model(config: TrainingConfig):
+<<<<<<< ozocca-codex/create-llm-fine-tuning-framework-with-rocm-support
     """Load the base model and tokenizer with optional quantization."""
     tokenizer = AutoTokenizer.from_pretrained(config.model_name_or_path)
 
@@ -52,11 +59,18 @@ def load_model(config: TrainingConfig):
     else:
         model = AutoModelForCausalLM.from_pretrained(config.model_name_or_path)
 
+=======
+    model = AutoModelForCausalLM.from_pretrained(config.model_name_or_path)
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name_or_path)
+>>>>>>> main
     if config.precision == "fp8":
         if not hasattr(torch, "float8_e4m3fn"):
             raise RuntimeError("FP8 precision is not supported in this PyTorch build")
         model.to(torch.float8_e4m3fn)
+<<<<<<< ozocca-codex/create-llm-fine-tuning-framework-with-rocm-support
 
+=======
+>>>>>>> main
     return model, tokenizer
 
 
@@ -96,8 +110,11 @@ def create_training_args(config: TrainingConfig) -> TrainingArguments:
         fp16=fp16,
         bf16=bf16,
         gradient_checkpointing=config.use_gradient_checkpointing,
+<<<<<<< ozocca-codex/create-llm-fine-tuning-framework-with-rocm-support
         dataloader_num_workers=config.dataloader_workers,
         dataloader_pin_memory=True,
+=======
+>>>>>>> main
         optim="adamw_torch",
     )
 
@@ -112,6 +129,10 @@ class FP8Trainer(Trainer):
 
 def configure_rocm():
     """Apply ROCm-specific environment settings."""
+<<<<<<< ozocca-codex/create-llm-fine-tuning-framework-with-rocm-support
+=======
+    os.environ.setdefault("PYTORCH_HIP_ALLOC_CONF", "max_split_size_mb:128")
+>>>>>>> main
     torch.backends.cuda.matmul.allow_tf32 = True
 
 
@@ -132,7 +153,10 @@ def load_and_preprocess_dataset(config: TrainingConfig, tokenizer):
     dataset = dataset.map(
         lambda ex: apply_chat_template(ex, tokenizer),
         remove_columns=dataset.column_names,
+<<<<<<< ozocca-codex/create-llm-fine-tuning-framework-with-rocm-support
         num_proc=config.preprocessing_workers,
+=======
+>>>>>>> main
     )
 
     # Tokenize WITHOUT return_tensors="pt" in batched mode
@@ -148,7 +172,10 @@ def load_and_preprocess_dataset(config: TrainingConfig, tokenizer):
         tokenize_function,
         batched=True,
         remove_columns=["text"],
+<<<<<<< ozocca-codex/create-llm-fine-tuning-framework-with-rocm-support
         num_proc=config.preprocessing_workers,
+=======
+>>>>>>> main
     )
 
     return dataset
@@ -159,6 +186,7 @@ def run_training(config: TrainingConfig):
     device = get_device()
     model, tokenizer = load_model(config)
 
+<<<<<<< ozocca-codex/create-llm-fine-tuning-framework-with-rocm-support
     if config.compile:
         model = torch.compile(model)
 
@@ -170,11 +198,19 @@ def run_training(config: TrainingConfig):
         model.qconfig = get_default_qat_qconfig("fbgemm")
         model = prepare_qat(model)
 
+=======
+    if config.finetuning_method in {"lora", "qlora"}:
+        model = prepare_lora(model, config)
+
+>>>>>>> main
     if config.use_gradient_checkpointing:
         # Enable checkpointing and ensure inputs require grad so backward works
         model.gradient_checkpointing_enable()
         model.enable_input_require_grads()
+<<<<<<< ozocca-codex/create-llm-fine-tuning-framework-with-rocm-support
         model.config.use_cache = False
+=======
+>>>>>>> main
 
     training_args = create_training_args(config)
 
@@ -195,6 +231,7 @@ def run_training(config: TrainingConfig):
 
     trainer.train()
 
+<<<<<<< ozocca-codex/create-llm-fine-tuning-framework-with-rocm-support
     if config.finetuning_method == "gptq":  # pragma: no cover - auto_gptq optional
         try:
             from auto_gptq import AutoGPTQForCausalLM
@@ -211,6 +248,8 @@ def run_training(config: TrainingConfig):
     if config.finetuning_method == "qat":  # pragma: no cover - qat optional
         model = convert(model)
 
+=======
+>>>>>>> main
     trainer.save_model(config.output_dir)
     tokenizer.save_pretrained(config.output_dir)
 

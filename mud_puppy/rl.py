@@ -8,6 +8,7 @@ from trl import (
     AutoModelForCausalLMWithValueHead,
 )
 
+
 from .config import TrainingConfig
 
 
@@ -45,4 +46,3 @@ def run_grpo_training(config: TrainingConfig):
     trainer.train()
     trainer.save_model(config.output_dir)
     tokenizer.save_pretrained(config.output_dir)
-

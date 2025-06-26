@@ -6,6 +6,7 @@ from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments
 from trl import DPOTrainer
 
+
 from .config import TrainingConfig
 
 
@@ -53,4 +54,5 @@ def run_preference_training(config: TrainingConfig):
     trainer.train()
     trainer.save_model(config.output_dir)
     tokenizer.save_pretrained(config.output_dir)
+
 

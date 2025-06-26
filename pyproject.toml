@@ -12,6 +12,7 @@ dependencies = [
     "bitsandbytes-cuda117",
     "auto-gptq",
     "trl",
+
 ]
 
 [project.scripts]
