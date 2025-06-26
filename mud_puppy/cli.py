@@ -20,6 +20,27 @@ def main():
         choices=["fp16", "bf16", "fp8"],
         help="training precision",
     )
+    parser.add_argument(
+        "--compile",
+        dest="compile",
+        action="store_true",
+        help="enable torch.compile for extra speed",
+    )
+    parser.add_argument(
+        "--num-workers",
+        dest="num_workers",
+        type=int,
+        default=0,
+        help="dataloader workers",
+    )
+    parser.add_argument(
+        "--preprocess-workers",
+        dest="preprocess_workers",
+        type=int,
+        default=1,
+        help="dataset preprocessing workers",
+    )
+
     args = parser.parse_args()
 
     config = TrainingConfig(
@@ -29,6 +50,9 @@ def main():
         finetuning_method=args.method,
         precision=args.precision,
         preference=args.preference,
+        compile=args.compile,
+        dataloader_workers=args.num_workers,
+        preprocessing_workers=args.preprocess_workers,
     )
 
     if config.finetuning_method == "preference":

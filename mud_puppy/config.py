@@ -20,11 +20,14 @@ class TrainingConfig:
     preference: Optional[str] = None
     multimodal: bool = False
     reward_modeling: bool = False
+    dataloader_workers: int = 0
+    preprocessing_workers: int = 1
+    compile: bool = False
 
     def __post_init__(self):
         supported = {
             "full", "lora", "qlora", "gptq", "qat",
-            "preference", "rl", "multimodal", "rm"
+            "preference", "rl", "multimodal", "rm", "prm"
         }
         if self.finetuning_method not in supported:
             raise ValueError(

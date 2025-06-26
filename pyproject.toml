@@ -9,6 +9,10 @@ dependencies = [
     "transformers",
     "datasets",
     "peft",
+    "bitsandbytes-cuda117",
+    "auto-gptq",
+    "trl",
+
 ]
 
 [project.scripts]
