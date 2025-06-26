@@ -61,6 +61,57 @@ def main():
         dest="lora_targets",
         help="comma separated list of LoRA target modules",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        dest="resume",
+        help="resume training from the last checkpoint",
+    )
+    parser.add_argument(
+        "--log-with",
+        dest="log_with",
+        default="tensorboard",
+        choices=["tensorboard", "wandb"],
+        help="logging backend",
+    )
+    parser.add_argument(
+        "--tokens-per-batch",
+        dest="tokens_per_batch",
+        type=int,
+        default=0,
+        help="enable dynamic batching with this many tokens",
+    )
+    parser.add_argument(
+        "--lr-scheduler",
+        dest="lr_scheduler",
+        default="linear",
+        help="learning rate scheduler type",
+    )
+    parser.add_argument(
+        "--early-stopping",
+        dest="early_stopping",
+        type=int,
+        default=0,
+        help="stop training if no improvement for N evals",
+    )
+    parser.add_argument(
+        "--device-map",
+        dest="device_map",
+        default="auto",
+        help="model device map for model parallelism",
+    )
+    parser.add_argument(
+        "--stream",
+        dest="stream",
+        action="store_true",
+        help="load model into swap and stream layers to the GPU",
+    )
+    parser.add_argument(
+        "--zero-offload",
+        dest="zero_offload",
+        action="store_true",
+        help="offload optimizer states to CPU memory",
+    )
 
     args = parser.parse_args()
 
@@ -76,6 +127,14 @@ def main():
         preprocessing_workers=args.preprocess_workers,
         trust_remote_code=args.trust_remote_code,
         use_chat_template=not args.no_chat_template,
+        resume=args.resume,
+        log_with=args.log_with,
+        tokens_per_batch=args.tokens_per_batch,
+        lr_scheduler=args.lr_scheduler,
+        early_stopping_patience=args.early_stopping,
+        device_map=args.device_map,
+        stream=args.stream,
+        zero_offload=args.zero_offload,
     )
     if args.lora_targets:
         config_kwargs["lora_target_modules"] = args.lora_targets.split(",")

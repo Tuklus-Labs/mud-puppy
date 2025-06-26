@@ -37,6 +37,14 @@ class TrainingConfig:
     dataloader_workers: int = 0
     preprocessing_workers: int = 1
     compile: bool = False
+    resume: bool = False
+    log_with: str = "tensorboard"
+    tokens_per_batch: int = 0
+    lr_scheduler: str = "linear"
+    early_stopping_patience: int = 0
+    device_map: str = "auto"
+    stream: bool = False
+    zero_offload: bool = False
 
     def __post_init__(self):
         supported = {
@@ -56,3 +64,7 @@ class TrainingConfig:
 
         if self.precision not in {"fp16", "bf16", "fp8"}:
             raise ValueError(f"Unsupported precision: {self.precision}")
+
+        schedulers = {"linear", "cosine", "cosine_with_restarts", "polynomial"}
+        if self.lr_scheduler not in schedulers:
+            raise ValueError(f"Unsupported lr_scheduler: {self.lr_scheduler}")

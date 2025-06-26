@@ -19,6 +19,14 @@ mud-puppy is a ROCm-first LLM fine‑tuning framework inspired by [Axolotl](http
 
 mud-puppy currently expects datasets in JSONL chat format. By default it applies a chat template if the tokenizer supports it, but this can be disabled with `--no-chat-template`.
 
+### New features
+
+Version 0.3 expands on this with early stopping, dynamic batching and model parallelism. You can train huge models with `--device-map auto`, keep batches to a token budget via `--tokens-per-batch`, choose a scheduler with `--lr-scheduler`, and stop early using `--early-stopping`.
+
+Streaming mode is available with `--stream` to offload layers to CPU swap and move them to the GPU one at a time.
+
+Optimizer states can be offloaded to CPU with `--zero-offload` to further reduce GPU memory usage.
+
 The framework is still experimental but includes working implementations of the major algorithms described above.
 
 
