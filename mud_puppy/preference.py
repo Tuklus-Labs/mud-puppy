@@ -10,7 +10,7 @@ from trl import DPOTrainer
 from .config import TrainingConfig
 
 
-SUPPORTED_PREFERENCES = {"dpo", "ipo", "kto", "orpo"}
+SUPPORTED_PREFERENCES = {"dpo"}
 
 
 def run_preference_training(config: TrainingConfig):
@@ -18,10 +18,19 @@ def run_preference_training(config: TrainingConfig):
     if config.preference not in SUPPORTED_PREFERENCES:
         raise ValueError(f"Unsupported preference method: {config.preference}")
 
-    tokenizer = AutoTokenizer.from_pretrained(config.model_name_or_path)
-    model = AutoModelForCausalLM.from_pretrained(config.model_name_or_path)
+    tokenizer = AutoTokenizer.from_pretrained(
+        config.model_name_or_path, trust_remote_code=config.trust_remote_code
+    )
+    model = AutoModelForCausalLM.from_pretrained(
+        config.model_name_or_path, trust_remote_code=config.trust_remote_code
+    )
 
     dataset = load_dataset("json", data_files=config.dataset_path)["train"]
+
+    required_columns = {"prompt", "chosen", "rejected"}
+    missing = required_columns.difference(dataset.column_names)
+    if missing:
+        raise ValueError(f"Dataset missing columns: {', '.join(sorted(missing))}")
 
     def preprocess(batch: Dict[str, str]):
         return {
@@ -54,5 +63,3 @@ def run_preference_training(config: TrainingConfig):
     trainer.train()
     trainer.save_model(config.output_dir)
     tokenizer.save_pretrained(config.output_dir)
-
-

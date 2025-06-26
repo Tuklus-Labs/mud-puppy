@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, List
+
 
 @dataclass
 class TrainingConfig:
@@ -15,25 +16,43 @@ class TrainingConfig:
     use_gradient_checkpointing: bool = True
     lora_r: int = 8
     lora_alpha: int = 16
+    lora_target_modules: Optional[List[str]] = field(
+        default_factory=lambda: [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ]
+    )
     qat: bool = False
     grpo: bool = False
     preference: Optional[str] = None
     multimodal: bool = False
     reward_modeling: bool = False
+    use_chat_template: bool = True
+    trust_remote_code: bool = False
     dataloader_workers: int = 0
     preprocessing_workers: int = 1
     compile: bool = False
 
     def __post_init__(self):
         supported = {
-            "full", "lora", "qlora", "gptq", "qat",
-            "preference", "rl", "multimodal", "rm", "prm"
+            "full",
+            "lora",
+            "qlora",
+            "gptq",
+            "qat",
+            "preference",
+            "rl",
+            "multimodal",
+            "rm",
+            "prm",
         }
         if self.finetuning_method not in supported:
-            raise ValueError(
-                f"Unsupported finetuning method: {self.finetuning_method}"
-            )
+            raise ValueError(f"Unsupported finetuning method: {self.finetuning_method}")
 
         if self.precision not in {"fp16", "bf16", "fp8"}:
             raise ValueError(f"Unsupported precision: {self.precision}")
-

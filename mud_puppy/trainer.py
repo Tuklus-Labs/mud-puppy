@@ -1,7 +1,8 @@
 import os
+
 os.environ.setdefault("PYTORCH_HIP_ALLOC_CONF", "max_split_size_mb:128")
 
-from typing import Optional, Dict, List
+from typing import Dict, List
 
 import torch
 from transformers import (
@@ -10,8 +11,6 @@ from transformers import (
     Trainer,
     TrainingArguments,
     DataCollatorForLanguageModeling,
-    BitsAndBytesConfig,
-
 )
 
 from .config import TrainingConfig
@@ -25,35 +24,53 @@ def get_device() -> torch.device:
 
 def load_model(config: TrainingConfig):
     """Load the base model and tokenizer with optional quantization."""
-    tokenizer = AutoTokenizer.from_pretrained(config.model_name_or_path)
+    tokenizer = AutoTokenizer.from_pretrained(
+        config.model_name_or_path, trust_remote_code=config.trust_remote_code
+    )
 
     if config.finetuning_method == "qlora":
-        try:
-            bnb_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.bfloat16 if config.precision == "bf16" else torch.float16,
-            )
-        except Exception as e:  # pragma: no cover - bitsandbytes may be missing
-            raise RuntimeError("bitsandbytes is required for QLoRA") from e
+        from .bnb_rocm import quantize_model_4bit
+
         model = AutoModelForCausalLM.from_pretrained(
             config.model_name_or_path,
-            quantization_config=bnb_config,
-            device_map="auto",
+            torch_dtype=(
+                torch.bfloat16 if config.precision == "bf16" else torch.float16
+            ),
+            trust_remote_code=config.trust_remote_code,
         )
-    elif config.finetuning_method == "gptq":
-        try:  # pragma: no cover - auto_gptq optional
-            from auto_gptq import AutoGPTQForCausalLM
-        except ImportError as e:  # pragma: no cover - dependency missing
-            raise RuntimeError("auto-gptq is required for GPTQ mode") from e
-        model = AutoGPTQForCausalLM.from_quantized(
-            config.model_name_or_path,
-            device="cuda" if torch.cuda.is_available() else "cpu",
+        model = quantize_model_4bit(
+            model,
+            dtype=torch.bfloat16 if config.precision == "bf16" else torch.float16,
         )
-    else:
-        model = AutoModelForCausalLM.from_pretrained(config.model_name_or_path)
+        try:
+            from peft import prepare_model_for_kbit_training
 
+            model = prepare_model_for_kbit_training(model)
+        except Exception:
+            pass
+    elif config.finetuning_method == "gptq":
+        if torch.version.hip is not None:
+            from .gptq_rocm import load_quantized
+
+            model = load_quantized(
+                AutoModelForCausalLM,
+                config.model_name_or_path,
+                trust_remote_code=config.trust_remote_code,
+            )
+        else:
+            try:  # pragma: no cover - auto_gptq optional
+                from auto_gptq import AutoGPTQForCausalLM
+            except ImportError as e:  # pragma: no cover - dependency missing
+                raise RuntimeError("auto-gptq is required for GPTQ mode") from e
+            model = AutoGPTQForCausalLM.from_quantized(
+                config.model_name_or_path,
+                device="cuda" if torch.cuda.is_available() else "cpu",
+                trust_remote_code=config.trust_remote_code,
+            )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            config.model_name_or_path, trust_remote_code=config.trust_remote_code
+        )
 
     if config.precision == "fp8":
         if not hasattr(torch, "float8_e4m3fn"):
@@ -72,15 +89,7 @@ def prepare_lora(model, config: TrainingConfig):
     lora_config = LoraConfig(
         r=config.lora_r,
         lora_alpha=config.lora_alpha,
-        target_modules=[
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-        ],
+        target_modules=config.lora_target_modules,
     )
     model = get_peft_model(model, lora_config)
     return model
@@ -101,7 +110,6 @@ def create_training_args(config: TrainingConfig) -> TrainingArguments:
         gradient_checkpointing=config.use_gradient_checkpointing,
         dataloader_num_workers=config.dataloader_workers,
         dataloader_pin_memory=True,
-
         optim="adamw_torch",
     )
 
@@ -121,9 +129,13 @@ def configure_rocm():
 
 
 def apply_chat_template(examples: Dict[str, List[Dict[str, str]]], tokenizer):
-    text = tokenizer.apply_chat_template(
-        examples["messages"], tokenize=False, add_generation_prompt=False
-    )
+    if hasattr(tokenizer, "apply_chat_template"):
+        text = tokenizer.apply_chat_template(
+            examples["messages"], tokenize=False, add_generation_prompt=False
+        )
+    else:
+        # Fallback: concatenate messages
+        text = "\n".join(m["content"] for m in examples["messages"])
     return {"text": text}
 
 
@@ -133,13 +145,18 @@ def load_and_preprocess_dataset(config: TrainingConfig, tokenizer):
 
     dataset = load_dataset("json", data_files=config.dataset_path)["train"]
 
-    # Apply chat template to get plain text
-    dataset = dataset.map(
-        lambda ex: apply_chat_template(ex, tokenizer),
-        remove_columns=dataset.column_names,
-        num_proc=config.preprocessing_workers,
-
-    )
+    if config.use_chat_template:
+        dataset = dataset.map(
+            lambda ex: apply_chat_template(ex, tokenizer),
+            remove_columns=dataset.column_names,
+            num_proc=config.preprocessing_workers,
+        )
+    else:
+        dataset = dataset.map(
+            lambda ex: {"text": "\n".join(m["content"] for m in ex["messages"])},
+            remove_columns=dataset.column_names,
+            num_proc=config.preprocessing_workers,
+        )
 
     # Tokenize WITHOUT return_tensors="pt" in batched mode
     def tokenize_function(examples):
@@ -155,7 +172,6 @@ def load_and_preprocess_dataset(config: TrainingConfig, tokenizer):
         batched=True,
         remove_columns=["text"],
         num_proc=config.preprocessing_workers,
-
     )
 
     return dataset
@@ -172,11 +188,10 @@ def run_training(config: TrainingConfig):
     if config.finetuning_method in {"lora", "qlora"}:
         model = prepare_lora(model, config)
 
-    if config.finetuning_method == "qat":  # pragma: no cover - qat optional
-        from torch.ao.quantization import get_default_qat_qconfig, prepare_qat, convert
-        model.qconfig = get_default_qat_qconfig("fbgemm")
-        model = prepare_qat(model)
+    if config.finetuning_method == "qat":
+        from .qat_rocm import apply_qat
 
+        model = apply_qat(model)
 
     if config.use_gradient_checkpointing:
         # Enable checkpointing and ensure inputs require grad so backward works
@@ -184,14 +199,11 @@ def run_training(config: TrainingConfig):
         model.enable_input_require_grads()
         model.config.use_cache = False
 
-
     training_args = create_training_args(config)
 
     dataset = load_and_preprocess_dataset(config, tokenizer)
 
-    data_collator = DataCollatorForLanguageModeling(
-        tokenizer=tokenizer, mlm=False
-    )
+    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
     trainer_cls = FP8Trainer if config.precision == "fp8" else Trainer
     trainer = trainer_cls(
@@ -205,22 +217,37 @@ def run_training(config: TrainingConfig):
     trainer.train()
 
     if config.finetuning_method == "gptq":  # pragma: no cover - auto_gptq optional
-        try:
-            from auto_gptq import AutoGPTQForCausalLM
-            quantized_model = AutoGPTQForCausalLM.from_pretrained(model.config._name_or_path)
-            quantized_model.quantize(
-                tokenizer,
-                dataset,
-                use_triton=False,
+        if torch.version.hip is not None:
+            from .gptq_rocm import quantize_model_gptq, save_quantized
+
+            quantized_model = quantize_model_gptq(trainer.model)
+            os.makedirs(os.path.join(config.output_dir, "gptq"), exist_ok=True)
+            save_quantized(
+                quantized_model, os.path.join(config.output_dir, "gptq", "model.pt")
             )
-            quantized_model.save_quantized(config.output_dir)
-        except Exception as e:
-            raise RuntimeError("GPTQ quantization failed") from e
+        else:
+            try:
+                from auto_gptq import AutoGPTQForCausalLM
 
-    if config.finetuning_method == "qat":  # pragma: no cover - qat optional
-        model = convert(model)
+                quantized_model = AutoGPTQForCausalLM.from_pretrained(
+                    config.output_dir, trust_remote_code=config.trust_remote_code
+                )
+                quantized_model.quantize(
+                    tokenizer,
+                    dataset,
+                    use_triton=False,
+                )
+                quantized_model.save_quantized(
+                    os.path.join(config.output_dir, "gptq")
+                )
+            except Exception:
+                print("Warning: GPTQ quantization failed")
 
+    if config.finetuning_method == "qat":
+        from .qat_rocm import convert_qat
+
+        trainer.model = convert_qat(trainer.model)
+
+    # Save fine-tuned (and possibly quantized) model
     trainer.save_model(config.output_dir)
     tokenizer.save_pretrained(config.output_dir)
-
-
