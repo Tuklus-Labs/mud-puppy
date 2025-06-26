@@ -20,10 +20,11 @@ class Linear4bit(nn.Module):
 
         self.register_buffer("qweight", qweight)
         self.register_buffer("scale", scale)
+        dequant = (self.qweight.to(torch.float32) - 8) * self.scale
+        self.register_buffer("dequant_weight", dequant.to(dtype))
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        weight = (self.qweight.to(torch.float32) - 8) * self.scale
-        return F.linear(input.to(weight.dtype), weight.to(self.dtype), self.bias)
+        return F.linear(input.to(self.dtype), self.dequant_weight, self.bias)
 
 
 def _set_module(model: nn.Module, name: str, module: nn.Module):

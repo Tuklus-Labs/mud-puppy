@@ -8,6 +8,8 @@ from torch.utils.data import Sampler, DataLoader
 
 import torch
 import torch.nn as nn
+import torch.distributed as dist
+from torch.distributed.pipeline.sync import Pipe
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -29,21 +31,31 @@ def get_device() -> torch.device:
 
 def load_model(config: TrainingConfig):
     """Load the base model and tokenizer with optional quantization."""
-    tokenizer = AutoTokenizer.from_pretrained(
-        config.model_name_or_path, trust_remote_code=config.trust_remote_code
-    )
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            config.model_name_or_path, trust_remote_code=config.trust_remote_code
+        )
+    except OSError as e:
+        raise RuntimeError(
+            f"Failed to load tokenizer from {config.model_name_or_path}"
+        ) from e
 
     if config.finetuning_method == "qlora":
         from .bnb_rocm import quantize_model_4bit
 
-        model = AutoModelForCausalLM.from_pretrained(
-            config.model_name_or_path,
-            torch_dtype=(
-                torch.bfloat16 if config.precision == "bf16" else torch.float16
-            ),
-            trust_remote_code=config.trust_remote_code,
-            device_map=config.device_map,
-        )
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                config.model_name_or_path,
+                torch_dtype=(
+                    torch.bfloat16 if config.precision == "bf16" else torch.float16
+                ),
+                trust_remote_code=config.trust_remote_code,
+                device_map=config.device_map,
+            )
+        except OSError as e:
+            raise RuntimeError(
+                f"Failed to load model from {config.model_name_or_path}"
+            ) from e
         model = quantize_model_4bit(
             model,
             dtype=torch.bfloat16 if config.precision == "bf16" else torch.float16,
@@ -74,11 +86,16 @@ def load_model(config: TrainingConfig):
                 trust_remote_code=config.trust_remote_code,
             )
     else:
-        model = AutoModelForCausalLM.from_pretrained(
-            config.model_name_or_path,
-            trust_remote_code=config.trust_remote_code,
-            device_map=None if config.stream else config.device_map,
-        )
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                config.model_name_or_path,
+                trust_remote_code=config.trust_remote_code,
+                device_map=None if config.stream else config.device_map,
+            )
+        except OSError as e:
+            raise RuntimeError(
+                f"Failed to load model from {config.model_name_or_path}"
+            ) from e
 
     if config.stream:
         model.to("cpu")
@@ -132,6 +149,9 @@ def create_training_args(config: TrainingConfig) -> TrainingArguments:
         save_total_limit=2,
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
+        max_grad_norm=config.max_grad_norm,
+        local_rank=config.local_rank,
+        ddp_find_unused_parameters=False,
     )
 
 
@@ -194,6 +214,22 @@ class TokenBucketSampler(Sampler[List[int]]):
         return len(self.lengths)
 
 
+class DistributedBatchSampler(Sampler[List[int]]):
+    """Distribute batches across multiple processes."""
+
+    def __init__(self, batch_sampler: Sampler[List[int]]):
+        self.batches = list(batch_sampler)
+        self.num_replicas = dist.get_world_size()
+        self.rank = dist.get_rank()
+
+    def __iter__(self):
+        for i in range(self.rank, len(self.batches), self.num_replicas):
+            yield self.batches[i]
+
+    def __len__(self):
+        return (len(self.batches) + self.num_replicas - 1) // self.num_replicas
+
+
 class DynamicBatchTrainer(Trainer):
     """Trainer with dynamic batching via TokenBucketSampler."""
 
@@ -205,6 +241,8 @@ class DynamicBatchTrainer(Trainer):
         if self.tokens_per_batch > 0:
             lengths = self.train_dataset["length"]
             sampler = TokenBucketSampler(lengths, self.tokens_per_batch, shuffle=True)
+            if dist.is_initialized():
+                sampler = DistributedBatchSampler(sampler)
             return DataLoader(
                 self.train_dataset,
                 batch_sampler=sampler,
@@ -286,10 +324,32 @@ class StreamWrapper(nn.Module):
         return super().eval()
 
 
+def init_distributed(config: TrainingConfig):
+    """Initialize torch.distributed if requested."""
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if config.distributed or world_size > 1:
+        if not dist.is_initialized():
+            dist.init_process_group("nccl")
+        torch.cuda.set_device(config.local_rank)
+    return dist.get_rank() if dist.is_initialized() else 0, world_size
+
+
 def configure_rocm():
     """Apply ROCm-specific environment settings."""
     os.environ.setdefault("PYTORCH_HIP_ALLOC_CONF", "max_split_size_mb:128")
     torch.backends.cuda.matmul.allow_tf32 = True
+
+
+def apply_pipeline_parallel(model: nn.Module, devices: List[int]) -> nn.Module:
+    """Naively split a Sequential model across GPUs using Pipe."""
+    if not isinstance(model, nn.Sequential):
+        return model
+    splits = torch.linspace(0, len(model), len(devices) + 1, dtype=torch.int64)
+    stages = []
+    for i, dev in enumerate(devices):
+        start, end = int(splits[i]), int(splits[i + 1])
+        stages.append(nn.Sequential(*model[start:end]).to(f"cuda:{dev}"))
+    return Pipe(nn.Sequential(*stages))
 
 
 def apply_chat_template(examples: Dict[str, List[Dict[str, str]]], tokenizer):
@@ -308,6 +368,20 @@ def load_and_preprocess_dataset(config: TrainingConfig, tokenizer):
     from datasets import load_dataset
 
     dataset = load_dataset("json", data_files=config.dataset_path)["train"]
+    if len(dataset) == 0:
+        raise ValueError("Dataset is empty")
+    if "messages" not in dataset.column_names:
+        raise ValueError("Dataset must contain a 'messages' column")
+
+    def _validate(example):
+        if not isinstance(example["messages"], list):
+            raise ValueError("'messages' must be a list")
+        for m in example["messages"]:
+            if "content" not in m:
+                raise ValueError("All messages must contain a 'content' field")
+        return example
+
+    dataset = dataset.map(_validate, num_proc=config.preprocessing_workers)
 
     if config.use_chat_template:
         dataset = dataset.map(
@@ -338,7 +412,10 @@ def load_and_preprocess_dataset(config: TrainingConfig, tokenizer):
         num_proc=config.preprocessing_workers,
     )
 
-    dataset = dataset.map(lambda ex: {"length": len(ex["input_ids"])}, num_proc=config.preprocessing_workers)
+    dataset = dataset.map(
+        lambda ex: {"length": len(ex["input_ids"])},
+        num_proc=config.preprocessing_workers,
+    )
 
     # Split off 10% of data for evaluation
     split = int(0.1 * len(dataset))
@@ -350,7 +427,19 @@ def load_and_preprocess_dataset(config: TrainingConfig, tokenizer):
 
 def run_training(config: TrainingConfig):
     configure_rocm()
+    rank, world_size = init_distributed(config)
     model, tokenizer = load_model(config)
+
+    if config.device_map == "pipeline" and world_size > 1:
+        model = apply_pipeline_parallel(model, list(range(world_size)))
+    elif world_size > 1 and not config.stream:
+        model.to(f"cuda:{config.local_rank}")
+        model = nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[config.local_rank],
+            output_device=config.local_rank,
+            find_unused_parameters=False,
+        )
 
     if config.compile:
         model = torch.compile(model)
@@ -378,13 +467,18 @@ def run_training(config: TrainingConfig):
     base_cls = FP8Trainer if config.precision == "fp8" else DynamicBatchTrainer
     trainer_cls = base_cls
     if config.zero_offload:
+
         class ZeroTrainer(ZeroOffloadTrainer, base_cls):
             pass
 
         trainer_cls = ZeroTrainer
     callbacks = [MemoryCallback()]
     if config.early_stopping_patience > 0:
-        callbacks.append(EarlyStoppingCallback(early_stopping_patience=config.early_stopping_patience))
+        callbacks.append(
+            EarlyStoppingCallback(
+                early_stopping_patience=config.early_stopping_patience
+            )
+        )
     trainer = trainer_cls(
         model=model,
         args=training_args,
@@ -439,9 +533,7 @@ def run_training(config: TrainingConfig):
                     train_dataset,
                     use_triton=False,
                 )
-                quantized_model.save_quantized(
-                    os.path.join(config.output_dir, "gptq")
-                )
+                quantized_model.save_quantized(os.path.join(config.output_dir, "gptq"))
             except Exception:
                 print("Warning: GPTQ quantization failed")
 
@@ -450,6 +542,8 @@ def run_training(config: TrainingConfig):
 
         trainer.model = convert_qat(trainer.model)
 
-    # Save fine-tuned (and possibly quantized) model
-    trainer.save_model(config.output_dir)
-    tokenizer.save_pretrained(config.output_dir)
+    if not dist.is_initialized() or rank == 0:
+        trainer.save_model(config.output_dir)
+        tokenizer.save_pretrained(config.output_dir)
+    if dist.is_initialized():
+        dist.destroy_process_group()

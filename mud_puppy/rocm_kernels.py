@@ -10,11 +10,12 @@ def quantize(tensor: torch.Tensor, bits: int = 8):
     scale = tensor.abs().max() / qmax if tensor.numel() > 0 else 1.0
     scale = scale + 1e-8
     qt = torch.clamp((tensor / scale).round(), qmin, qmax).to(torch.int8)
-    return qt, scale
+    zero_point = 0
+    return qt, scale, zero_point
 
 
-def dequantize(qtensor: torch.Tensor, scale: float) -> torch.Tensor:
-    return qtensor.float() * scale
+def dequantize(qtensor: torch.Tensor, scale: float, zero_point: float = 0.0) -> torch.Tensor:
+    return (qtensor.float() - zero_point) * scale
 
 
 def qgemm(a_q: torch.Tensor, a_scale: float, b_q: torch.Tensor, b_scale: float):
@@ -48,5 +49,5 @@ def quantized_layernorm(
 ):
     x = dequantize(x_q, x_scale)
     y = F.layer_norm(x, weight.shape, weight, bias, eps)
-    y_q, y_scale = quantize(y, bits=8)
+    y_q, y_scale, y_zero = quantize(y, bits=8)
     return y_q, y_scale
