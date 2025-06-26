@@ -12,6 +12,7 @@ mud-puppy is a ROCm-first LLM fine‑tuning framework inspired by [Axolotl](http
 - **Multimodal support** (placeholder)
 - **Reward Modelling** / **Process Reward Modelling** (placeholder)
 
+
 mud-puppy currently expects datasets in JSONL chat format. Conversations are converted using the Qwen3 chat template and tokenized with HuggingFace tokenizers.
 
 The framework is still experimental and many advanced algorithms are yet to be implemented.
@@ -31,4 +32,5 @@ mud-puppy your-model your-dataset --method lora --output ./finetuned
 mud-puppy is designed to run efficiently on AMD GPUs. It defaults to `bf16` precision and enables gradient checkpointing to keep memory usage low on `GFX1100` cards. You can also opt into experimental `fp8` training by passing `--precision fp8` if your hardware supports it.
 The trainer configures ROCm with `PYTORCH_HIP_ALLOC_CONF=max_split_size_mb:128` and
 enables TF32 matrix multiply for additional speed when available.
+
 
