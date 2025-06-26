@@ -16,12 +16,15 @@ class GPTQLinear(nn.Module):
         self.in_features = linear.in_features
         self.out_features = linear.out_features
         self.bias = linear.bias
-        qweight, scale = quantize(linear.weight.detach().to(torch.float32), bits=4)
+        qweight, scale, zero_point = quantize(
+            linear.weight.detach().to(torch.float32), bits=4
+        )
         self.register_buffer("qweight", qweight)
         self.register_buffer("scale", torch.tensor(scale))
+        self.register_buffer("zero_point", torch.tensor(zero_point))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        weight = dequantize(self.qweight, float(self.scale))
+        weight = dequantize(self.qweight, float(self.scale), float(self.zero_point))
         return F.linear(x, weight, self.bias)
 
 

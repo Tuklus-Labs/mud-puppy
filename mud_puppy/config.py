@@ -1,5 +1,7 @@
 from dataclasses import dataclass, field
+import os
 from typing import Optional, List
+import torch
 
 
 @dataclass
@@ -45,6 +47,19 @@ class TrainingConfig:
     device_map: str = "auto"
     stream: bool = False
     zero_offload: bool = False
+    max_grad_norm: float = 1.0
+    distributed: bool = False
+    local_rank: int = int(os.environ.get("LOCAL_RANK", 0))
+
+    def _validate_paths(self):
+        if not os.path.exists(self.dataset_path):
+            raise FileNotFoundError(f"Dataset not found: {self.dataset_path}")
+
+    def _validate_combinations(self):
+        if self.finetuning_method == "qlora" and self.stream:
+            raise ValueError("Streaming is not supported with QLoRA")
+        if self.tokens_per_batch < 0:
+            raise ValueError("tokens_per_batch must be non-negative")
 
     def __post_init__(self):
         supported = {
@@ -68,3 +83,9 @@ class TrainingConfig:
         schedulers = {"linear", "cosine", "cosine_with_restarts", "polynomial"}
         if self.lr_scheduler not in schedulers:
             raise ValueError(f"Unsupported lr_scheduler: {self.lr_scheduler}")
+
+        self._validate_paths()
+        self._validate_combinations()
+
+        if self.distributed and torch.cuda.device_count() < 2:
+            raise ValueError("Distributed training requires at least 2 GPUs")

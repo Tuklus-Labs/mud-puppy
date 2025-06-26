@@ -1,4 +1,5 @@
 import argparse
+import os
 from .config import TrainingConfig
 from .trainer import run_training
 from .preference import run_preference_training
@@ -112,6 +113,19 @@ def main():
         action="store_true",
         help="offload optimizer states to CPU memory",
     )
+    parser.add_argument(
+        "--distributed",
+        dest="distributed",
+        action="store_true",
+        help="enable torch.distributed training",
+    )
+    parser.add_argument(
+        "--local-rank",
+        dest="local_rank",
+        type=int,
+        default=int(os.environ.get("LOCAL_RANK", 0)),
+        help="rank of this process for distributed training",
+    )
 
     args = parser.parse_args()
 
@@ -135,6 +149,8 @@ def main():
         device_map=args.device_map,
         stream=args.stream,
         zero_offload=args.zero_offload,
+        distributed=args.distributed,
+        local_rank=args.local_rank,
     )
     if args.lora_targets:
         config_kwargs["lora_target_modules"] = args.lora_targets.split(",")
