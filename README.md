@@ -5,14 +5,19 @@ mud-puppy is a ROCm-first LLM fine‑tuning framework inspired by [Axolotl](http
 ## Features
 
 - **Full fine‑tuning** using the HuggingFace `Trainer` API
-- **LoRA** and **QLoRA** via the `peft` library
-- **GPTQ** post-training quantization and **QAT** via `torch.ao.quantization`
-- **Preference tuning** with DPO/IPO/KTO/ORPO using the `trl` library
+- **LoRA** via the `peft` library and **QLoRA** with a built-in 4-bit quantizer
+  - A lightweight module handles 4-bit quantization on all GPUs, so no `bitsandbytes` dependency is required
+- **Flash Attention** via the `rocm_attn` helpers (`flash_attention` and `FlashMHA`)
+- **GPTQ** post-training quantization and **QAT**
+  - GPTQ models are saved to the `gptq/` folder and use `auto-gptq` on CUDA or a simple ROCm implementation when running on AMD GPUs
+  - QAT uses a simple ROCm module and saves an int8 model for CPU inference
+- **ROCm kernels** including qgemm/fbgemm, quantization helpers, and a quantized layernorm
+- **Preference tuning** with DPO using the `trl` library
 - **Reinforcement Learning** through GRPO on top of PPOTrainer
 - **Multimodal support** (experimental)
 - **Reward Modelling** / **Process Reward Modelling** for ranking models
 
-mud-puppy currently expects datasets in JSONL chat format. Conversations are converted using the Qwen3 chat template and tokenized with HuggingFace tokenizers.
+mud-puppy currently expects datasets in JSONL chat format. By default it applies a chat template if the tokenizer supports it, but this can be disabled with `--no-chat-template`.
 
 The framework is still experimental but includes working implementations of the major algorithms described above.
 
@@ -26,6 +31,8 @@ pip install -e .
 
 mud-puppy your-model your-dataset --method lora --output ./finetuned
 ```
+Add `--trust-remote-code` if the model requires custom code from the Hub, and
+use `--no-chat-template` to skip template formatting during preprocessing.
 
 ## ROCm optimization
 

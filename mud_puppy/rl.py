@@ -14,8 +14,15 @@ from .config import TrainingConfig
 
 def run_grpo_training(config: TrainingConfig):
     """Run a simplified Guided Reinforcement Policy Optimization loop."""
-    tokenizer = AutoTokenizer.from_pretrained(config.model_name_or_path)
-    model = AutoModelForCausalLMWithValueHead.from_pretrained(config.model_name_or_path)
+    tokenizer = AutoTokenizer.from_pretrained(
+        config.model_name_or_path, trust_remote_code=config.trust_remote_code
+    )
+    model = AutoModelForCausalLMWithValueHead.from_pretrained(
+        config.model_name_or_path, trust_remote_code=config.trust_remote_code
+    )
+    ref_model = AutoModelForCausalLMWithValueHead.from_pretrained(
+        config.model_name_or_path, trust_remote_code=config.trust_remote_code
+    )
 
     dataset = load_dataset("json", data_files=config.dataset_path)["train"]
 
@@ -37,7 +44,7 @@ def run_grpo_training(config: TrainingConfig):
     trainer = PPOTrainer(
         config=ppo_config,
         model=model,
-        ref_model=None,
+        ref_model=ref_model,
         args=training_args,
         tokenizer=tokenizer,
         train_dataset=dataset,
