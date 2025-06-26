@@ -3,14 +3,19 @@ import os
 os.environ.setdefault("PYTORCH_HIP_ALLOC_CONF", "max_split_size_mb:128")
 
 from typing import Dict, List
+import random
+from torch.utils.data import Sampler, DataLoader
 
 import torch
+import torch.nn as nn
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     Trainer,
     TrainingArguments,
     DataCollatorForLanguageModeling,
+    TrainerCallback,
+    EarlyStoppingCallback,
 )
 
 from .config import TrainingConfig
@@ -37,6 +42,7 @@ def load_model(config: TrainingConfig):
                 torch.bfloat16 if config.precision == "bf16" else torch.float16
             ),
             trust_remote_code=config.trust_remote_code,
+            device_map=config.device_map,
         )
         model = quantize_model_4bit(
             model,
@@ -69,8 +75,14 @@ def load_model(config: TrainingConfig):
             )
     else:
         model = AutoModelForCausalLM.from_pretrained(
-            config.model_name_or_path, trust_remote_code=config.trust_remote_code
+            config.model_name_or_path,
+            trust_remote_code=config.trust_remote_code,
+            device_map=None if config.stream else config.device_map,
         )
+
+    if config.stream:
+        model.to("cpu")
+        model = StreamWrapper(model)
 
     if config.precision == "fp8":
         if not hasattr(torch, "float8_e4m3fn"):
@@ -111,15 +123,167 @@ def create_training_args(config: TrainingConfig) -> TrainingArguments:
         dataloader_num_workers=config.dataloader_workers,
         dataloader_pin_memory=True,
         optim="adamw_torch",
+        lr_scheduler_type=config.lr_scheduler,
+        evaluation_strategy="epoch",
+        save_strategy="epoch",
+        logging_strategy="steps",
+        logging_steps=10,
+        report_to=[config.log_with],
+        save_total_limit=2,
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
     )
 
 
-class FP8Trainer(Trainer):
+class FP8Trainer(DynamicBatchTrainer):
     """Trainer subclass enabling FP8 autocast."""
 
     def training_step(self, model, inputs):
         with torch.autocast("cuda", dtype=torch.float8_e4m3fn):
             return super().training_step(model, inputs)
+
+
+def compute_metrics(eval_pred):
+    """Compute evaluation loss and perplexity."""
+    logits, labels = eval_pred
+    logits = torch.tensor(logits)
+    labels = torch.tensor(labels)
+    shift_logits = logits[..., :-1, :].contiguous().view(-1, logits.size(-1))
+    shift_labels = labels[..., 1:].contiguous().view(-1)
+    loss_fct = torch.nn.CrossEntropyLoss()
+    loss = loss_fct(shift_logits, shift_labels)
+    perplexity = torch.exp(loss)
+    return {"eval_loss": loss.item(), "perplexity": perplexity.item()}
+
+
+class MemoryCallback(TrainerCallback):
+    """Log GPU memory usage after each step."""
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if torch.cuda.is_available():
+            mem = torch.cuda.memory_allocated() / 1e9
+            print(f"[memory] step {state.global_step}: {mem:.2f} GB")
+
+
+class TokenBucketSampler(Sampler[List[int]]):
+    """Batch sampler that groups sequences by a token budget."""
+
+    def __init__(self, lengths: List[int], tokens_per_batch: int, shuffle: bool = True):
+        self.lengths = lengths
+        self.tokens_per_batch = tokens_per_batch
+        self.shuffle = shuffle
+
+    def __iter__(self):
+        indices = list(range(len(self.lengths)))
+        if self.shuffle:
+            random.shuffle(indices)
+        batch = []
+        total = 0
+        for idx in indices:
+            l = int(self.lengths[idx])
+            if batch and total + l > self.tokens_per_batch:
+                yield batch
+                batch = []
+                total = 0
+            batch.append(idx)
+            total += l
+        if batch:
+            yield batch
+
+    def __len__(self):
+        return len(self.lengths)
+
+
+class DynamicBatchTrainer(Trainer):
+    """Trainer with dynamic batching via TokenBucketSampler."""
+
+    def __init__(self, *args, tokens_per_batch: int = 0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.tokens_per_batch = tokens_per_batch
+
+    def get_train_dataloader(self) -> DataLoader:
+        if self.tokens_per_batch > 0:
+            lengths = self.train_dataset["length"]
+            sampler = TokenBucketSampler(lengths, self.tokens_per_batch, shuffle=True)
+            return DataLoader(
+                self.train_dataset,
+                batch_sampler=sampler,
+                collate_fn=self.data_collator,
+                num_workers=self.args.dataloader_num_workers,
+                pin_memory=self.args.dataloader_pin_memory,
+            )
+        return super().get_train_dataloader()
+
+
+class ZeroOffloadOptimizer(torch.optim.AdamW):
+    """AdamW variant that keeps optimizer states on the CPU."""
+
+    def step(self, closure=None):  # pragma: no cover - simple device moves
+        orig_devices = []
+        for group in self.param_groups:
+            for p in group["params"]:
+                orig_devices.append(p.device)
+                if p.grad is not None and p.grad.device != torch.device("cpu"):
+                    p.grad = p.grad.cpu()
+                if p.device != torch.device("cpu"):
+                    p.data = p.data.cpu()
+        loss = super().step(closure)
+        idx = 0
+        for group in self.param_groups:
+            for p in group["params"]:
+                device = orig_devices[idx]
+                if device != torch.device("cpu"):
+                    p.data = p.data.to(device)
+                idx += 1
+        return loss
+
+
+class ZeroOffloadTrainer(DynamicBatchTrainer):
+    """Trainer that uses the ZeroOffloadOptimizer."""
+
+    def create_optimizer(self):
+        if self.optimizer is None:
+            self.optimizer = ZeroOffloadOptimizer(
+                self.model.parameters(),
+                lr=self.args.learning_rate,
+                betas=(self.args.adam_beta1, self.args.adam_beta2),
+                eps=self.args.adam_epsilon,
+                weight_decay=self.args.weight_decay,
+            )
+        return self.optimizer
+
+
+class StreamWrapper(nn.Module):
+    """Wrapper that streams individual modules from CPU to GPU."""
+
+    def __init__(self, model: nn.Module):
+        super().__init__()
+        self.model = model
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        def pre_hook(mod, inp):
+            mod.to(self.device)
+
+        def post_hook(mod, inp, out):
+            mod.to("cpu")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        for m in self.model.modules():
+            if len(list(m.children())) == 0:
+                m.register_forward_pre_hook(pre_hook)
+                m.register_forward_hook(post_hook)
+
+    def forward(self, *args, **kwargs):
+        return self.model(*args, **kwargs)
+
+    def train(self, mode: bool = True):  # pragma: no cover - passthrough
+        self.model.train(mode)
+        return super().train(mode)
+
+    def eval(self):  # pragma: no cover - passthrough
+        self.model.eval()
+        return super().eval()
 
 
 def configure_rocm():
@@ -174,12 +338,18 @@ def load_and_preprocess_dataset(config: TrainingConfig, tokenizer):
         num_proc=config.preprocessing_workers,
     )
 
-    return dataset
+    dataset = dataset.map(lambda ex: {"length": len(ex["input_ids"])}, num_proc=config.preprocessing_workers)
+
+    # Split off 10% of data for evaluation
+    split = int(0.1 * len(dataset))
+    eval_dataset = dataset.select(range(split))
+    train_dataset = dataset.select(range(split, len(dataset)))
+
+    return train_dataset, eval_dataset
 
 
 def run_training(config: TrainingConfig):
     configure_rocm()
-    device = get_device()
     model, tokenizer = load_model(config)
 
     if config.compile:
@@ -201,20 +371,52 @@ def run_training(config: TrainingConfig):
 
     training_args = create_training_args(config)
 
-    dataset = load_and_preprocess_dataset(config, tokenizer)
+    train_dataset, eval_dataset = load_and_preprocess_dataset(config, tokenizer)
 
     data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
-    trainer_cls = FP8Trainer if config.precision == "fp8" else Trainer
+    base_cls = FP8Trainer if config.precision == "fp8" else DynamicBatchTrainer
+    trainer_cls = base_cls
+    if config.zero_offload:
+        class ZeroTrainer(ZeroOffloadTrainer, base_cls):
+            pass
+
+        trainer_cls = ZeroTrainer
+    callbacks = [MemoryCallback()]
+    if config.early_stopping_patience > 0:
+        callbacks.append(EarlyStoppingCallback(early_stopping_patience=config.early_stopping_patience))
     trainer = trainer_cls(
         model=model,
         args=training_args,
-        train_dataset=dataset,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
         data_collator=data_collator,
         tokenizer=tokenizer,
+        compute_metrics=compute_metrics,
+        callbacks=callbacks,
+        tokens_per_batch=config.tokens_per_batch,
     )
 
-    trainer.train()
+    checkpoint = None
+    if config.resume:
+        from transformers.trainer_utils import get_last_checkpoint
+
+        checkpoint = get_last_checkpoint(config.output_dir)
+
+    try:
+        trainer.train(resume_from_checkpoint=checkpoint)
+    except RuntimeError as e:
+        if "out of memory" in str(e).lower() and torch.cuda.is_available():
+            print(
+                f"CUDA OOM at step {trainer.state.global_step}."
+                f" Max memory {torch.cuda.max_memory_reserved() / 1e9:.2f} GB"
+            )
+            raise
+        else:
+            raise
+
+    metrics = trainer.evaluate()
+    print(metrics)
 
     if config.finetuning_method == "gptq":  # pragma: no cover - auto_gptq optional
         if torch.version.hip is not None:
@@ -234,7 +436,7 @@ def run_training(config: TrainingConfig):
                 )
                 quantized_model.quantize(
                     tokenizer,
-                    dataset,
+                    train_dataset,
                     use_triton=False,
                 )
                 quantized_model.save_quantized(
