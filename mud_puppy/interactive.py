@@ -11,10 +11,6 @@ BANNER = (
 
 
 from .config import TrainingConfig
-from .trainer import run_training
-from .preference import run_preference_training
-from .rl import run_grpo_training
-from .reward import train_reward_model
 
 
 def prompt(message: str, default: str | None = None) -> str:
@@ -49,13 +45,22 @@ def configure_training() -> TrainingConfig:
 def run(config: TrainingConfig):
     """Dispatch to the correct training routine based on method."""
     if config.finetuning_method == "preference":
+        from .preference import run_preference_training
+
         config.preference = prompt("Preference method", "dpo")
         run_preference_training(config)
     elif config.finetuning_method == "rl":
+        from .rl import run_grpo_training
+
         run_grpo_training(config)
     elif config.finetuning_method in {"rm", "prm"}:
+        from .reward import train_reward_model
+
         train_reward_model(config)
     else:
+        from .trainer import run_training
+
+
         run_training(config)
 
 
