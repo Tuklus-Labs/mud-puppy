@@ -60,6 +60,7 @@ def run(config: TrainingConfig):
     else:
         from .trainer import run_training
 
+
         run_training(config)
 
 
