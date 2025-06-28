@@ -16,4 +16,5 @@ dependencies = [
 
 [project.scripts]
 mud-puppy = "mud_puppy.cli:main"
+mud-puppy-interactive = "mud_puppy.interactive:main"
 
