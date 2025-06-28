@@ -9,7 +9,7 @@ dependencies = [
     "transformers",
     "datasets",
     "peft",
-    "auto-gptq",
+#    "auto-gptq",
     "trl",
 
 ]
