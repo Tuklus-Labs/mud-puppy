@@ -33,12 +33,16 @@ def configure_training() -> TrainingConfig:
         "full",
     )
     precision = prompt("Precision (fp16, bf16, fp8)", "bf16")
+    merge = prompt("Merge LoRA weights on completion? (y/n)", "n").lower().startswith("y")
+    merge_precision = prompt("Merged model precision (fp16, bf16, fp32)", "bf16")
     return TrainingConfig(
         model_name_or_path=model,
         dataset_path=dataset,
         output_dir=output,
         finetuning_method=method,
         precision=precision,
+        merge_lora=merge,
+        merge_precision=merge_precision,
     )
 
 

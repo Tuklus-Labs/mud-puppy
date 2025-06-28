@@ -50,6 +50,8 @@ class TrainingConfig:
     max_grad_norm: float = 1.0
     distributed: bool = False
     local_rank: int = int(os.environ.get("LOCAL_RANK", 0))
+    merge_lora: bool = False
+    merge_precision: str = "bf16"
 
     def _validate_paths(self):
         if not os.path.exists(self.dataset_path):
@@ -83,6 +85,11 @@ class TrainingConfig:
         schedulers = {"linear", "cosine", "cosine_with_restarts", "polynomial"}
         if self.lr_scheduler not in schedulers:
             raise ValueError(f"Unsupported lr_scheduler: {self.lr_scheduler}")
+
+        if self.merge_precision not in {"fp16", "bf16", "fp32"}:
+            raise ValueError(
+                f"Unsupported merge_precision: {self.merge_precision}"
+            )
 
         self._validate_paths()
         self._validate_combinations()

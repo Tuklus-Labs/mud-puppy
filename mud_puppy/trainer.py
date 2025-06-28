@@ -9,7 +9,10 @@ from torch.utils.data import Sampler, DataLoader
 import torch
 import torch.nn as nn
 import torch.distributed as dist
-from torch.distributed.pipeline.sync import Pipe
+try:
+    from torch.distributed.pipeline.sync import Pipe
+except Exception:  # pragma: no cover - optional dependency
+    Pipe = None
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -355,6 +358,11 @@ def configure_rocm():
 
 def apply_pipeline_parallel(model: nn.Module, devices: List[int]) -> nn.Module:
     """Naively split a Sequential model across GPUs using Pipe."""
+    if Pipe is None:
+        raise RuntimeError(
+            "torch.distributed.pipeline is unavailable. "
+            "Install a PyTorch build with pipeline parallelism support."
+        )
     if not isinstance(model, nn.Sequential):
         return model
     splits = torch.linspace(0, len(model), len(devices) + 1, dtype=torch.int64)
@@ -558,5 +566,28 @@ def run_training(config: TrainingConfig):
     if not dist.is_initialized() or rank == 0:
         trainer.save_model(config.output_dir)
         tokenizer.save_pretrained(config.output_dir)
+
+        if config.merge_lora and config.finetuning_method in {"lora", "qlora"}:
+            try:
+                from peft import PeftModel
+            except Exception as e:  # pragma: no cover - optional dependency
+                raise RuntimeError("peft is required to merge LoRA weights") from e
+
+            dtype_map = {
+                "fp16": torch.float16,
+                "bf16": torch.bfloat16,
+                "fp32": torch.float32,
+            }
+            dtype = dtype_map.get(config.merge_precision, torch.float16)
+
+            if hasattr(trainer.model, "merge_and_unload"):
+                merged = trainer.model.merge_and_unload()
+            else:
+                merged = trainer.model
+            merged = merged.to(dtype)
+            merge_dir = os.path.join(config.output_dir, "merged")
+            os.makedirs(merge_dir, exist_ok=True)
+            merged.save_pretrained(merge_dir)
+            tokenizer.save_pretrained(merge_dir)
     if dist.is_initialized():
         dist.destroy_process_group()

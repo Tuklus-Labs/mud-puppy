@@ -114,6 +114,19 @@ def main():
         help="offload optimizer states to CPU memory",
     )
     parser.add_argument(
+        "--merge-lora",
+        dest="merge_lora",
+        action="store_true",
+        help="merge LoRA weights into the base model when training completes",
+    )
+    parser.add_argument(
+        "--merge-precision",
+        dest="merge_precision",
+        default="bf16",
+        choices=["fp16", "bf16", "fp32"],
+        help="precision for the merged model weights",
+    )
+    parser.add_argument(
         "--distributed",
         dest="distributed",
         action="store_true",
@@ -149,6 +162,8 @@ def main():
         device_map=args.device_map,
         stream=args.stream,
         zero_offload=args.zero_offload,
+        merge_lora=args.merge_lora,
+        merge_precision=args.merge_precision,
         distributed=args.distributed,
         local_rank=args.local_rank,
     )
