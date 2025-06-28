@@ -185,6 +185,19 @@ class MemoryCallback(TrainerCallback):
             print(f"[memory] step {state.global_step}: {mem:.2f} GB")
 
 
+class GradientClipCallback(TrainerCallback):
+    """Clip gradients to avoid exploding values."""
+
+    def __init__(self, max_norm: float):
+        self.max_norm = max_norm
+
+    def on_pre_optimizer_step(self, args, state, control, model=None, **kwargs):
+        if self.max_norm > 0 and model is not None:
+            norm = torch.nn.utils.clip_grad_norm_(model.parameters(), self.max_norm)
+            if state.is_local_process_zero:
+                print(f"[grad_norm] step {state.global_step}: {norm:.2f}")
+
+
 class TokenBucketSampler(Sampler[List[int]]):
     """Batch sampler that groups sequences by a token budget."""
 
@@ -472,7 +485,7 @@ def run_training(config: TrainingConfig):
             pass
 
         trainer_cls = ZeroTrainer
-    callbacks = [MemoryCallback()]
+    callbacks = [MemoryCallback(), GradientClipCallback(config.max_grad_norm)]
     if config.early_stopping_patience > 0:
         callbacks.append(
             EarlyStoppingCallback(
