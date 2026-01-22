@@ -352,10 +352,41 @@ def prepare_lora(model: nn.Module, config: TrainingConfig) -> nn.Module:
     except ImportError as e:
         raise RuntimeError("peft is required for LoRA training") from e
 
+    # Auto-detect target modules based on model architecture
+    target_modules = config.lora_target_modules
+
+    # Get all module names to check what's available
+    module_names = [name for name, _ in model.named_modules()]
+    module_names_str = " ".join(module_names)
+
+    # Check if default LLaMA-style modules exist
+    if "q_proj" not in module_names_str:
+        # GPT-2 style: c_attn, c_proj, c_fc
+        if "c_attn" in module_names_str:
+            target_modules = ["c_attn", "c_proj"]
+            print(f"[mud-puppy] Auto-detected GPT-2 style model, using targets: {target_modules}")
+        # GPT-Neo/J style: q_proj exists but different structure
+        elif "attn.attention" in module_names_str:
+            target_modules = ["q_proj", "v_proj", "k_proj", "out_proj"]
+            print(f"[mud-puppy] Auto-detected GPT-Neo style model, using targets: {target_modules}")
+        else:
+            # Fall back to finding any Linear layers with common attention names
+            linear_modules = []
+            for name, module in model.named_modules():
+                if isinstance(module, nn.Linear):
+                    short_name = name.split(".")[-1]
+                    if short_name not in linear_modules and any(
+                        kw in name.lower() for kw in ["attn", "query", "key", "value", "proj"]
+                    ):
+                        linear_modules.append(short_name)
+            if linear_modules:
+                target_modules = list(set(linear_modules))[:4]
+                print(f"[mud-puppy] Auto-detected target modules: {target_modules}")
+
     lora_config = LoraConfig(
         r=config.lora_r,
         lora_alpha=config.lora_alpha,
-        target_modules=config.lora_target_modules,
+        target_modules=target_modules,
         lora_dropout=0.05,
         bias="none",
         task_type="CAUSAL_LM",
@@ -457,10 +488,21 @@ def load_and_preprocess_dataset(
             # Try to extract messages in various formats
             if "messages" in columns:
                 messages = examples["messages"][i]
-                if config.use_chat_template and hasattr(tokenizer, "apply_chat_template"):
-                    text = tokenizer.apply_chat_template(
-                        messages, tokenize=False, add_generation_prompt=False
-                    )
+                if (
+                    config.use_chat_template
+                    and hasattr(tokenizer, "apply_chat_template")
+                    and tokenizer.chat_template is not None
+                ):
+                    try:
+                        text = tokenizer.apply_chat_template(
+                            messages, tokenize=False, add_generation_prompt=False
+                        )
+                    except Exception:
+                        # Fallback if chat template fails
+                        text = "\n".join(
+                            f"{m.get('role', 'user')}: {m.get('content', '')}"
+                            for m in messages
+                        )
                 else:
                     # Fallback: concatenate message contents
                     text = "\n".join(
@@ -483,12 +525,21 @@ def load_and_preprocess_dataset(
 
             texts.append(text)
 
-        # Tokenize
+        # Tokenize - use model's max length if available
+        max_len = min(
+            getattr(tokenizer, "model_max_length", 2048),
+            2048
+        )
+        # GPT-2 and similar models have 1024 max positions
+        if max_len > 1024 and hasattr(tokenizer, "name_or_path"):
+            if "gpt2" in tokenizer.name_or_path.lower():
+                max_len = 1024
+
         tokenized = tokenizer(
             texts,
             truncation=True,
             padding="max_length",
-            max_length=2048,
+            max_length=max_len,
             return_tensors=None,
         )
 

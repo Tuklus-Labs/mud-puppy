@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: mud-puppy
+Version: 0.3.0
+Summary: A ROCm-first LLM fine-tuning framework
+Author: LLM
+Requires-Python: >=3.9
+Requires-Dist: torch
+Requires-Dist: transformers
+Requires-Dist: datasets
+Requires-Dist: peft
+Requires-Dist: trl
+Provides-Extra: cuda
+Requires-Dist: auto-gptq; extra == "cuda"
