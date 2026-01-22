@@ -1,6 +1,6 @@
 [project]
 name = "mud-puppy"
-version = "0.2.0"
+version = "0.3.0"
 description = "A ROCm-first LLM fine-tuning framework"
 authors = [ { name = "LLM" } ]
 requires-python = ">=3.9"
@@ -9,12 +9,15 @@ dependencies = [
     "transformers",
     "datasets",
     "peft",
-#    "auto-gptq",
     "trl",
+]
 
+[project.optional-dependencies]
+# CUDA-specific extras (not required on ROCm)
+cuda = [
+    "auto-gptq",
 ]
 
 [project.scripts]
 mud-puppy = "mud_puppy.cli:main"
 mud-puppy-interactive = "mud_puppy.interactive:main"
-

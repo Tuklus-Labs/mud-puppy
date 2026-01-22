@@ -1,23 +1,35 @@
 import argparse
 import os
+
 from .config import TrainingConfig
 from .trainer import run_training
-from .preference import run_preference_training
-from .rl import run_grpo_training
-from .reward import train_reward_model
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
+    """Build the mud-puppy CLI argument parser.
+
+    This is factored out so it can be reused in tests or tooling.
+    """
     parser = argparse.ArgumentParser(description="mud-puppy: ROCm-first fine tuning")
     parser.add_argument("model", help="base model name or path")
-    parser.add_argument("dataset", help="dataset path")
+    parser.add_argument("dataset", help="dataset path (JSONL file)")
     parser.add_argument(
-        "--method", default="full", dest="method", help="finetuning method"
+        "--method",
+        default="full",
+        dest="method",
+        help=(
+            "finetuning method: full, lora, qlora, gptq, qat, "
+            "preference, rl, multimodal, rm, prm"
+        ),
     )
     parser.add_argument(
         "--output", default="./outputs", dest="output", help="output directory"
     )
-    parser.add_argument("--preference", dest="preference", help="preference method")
+    parser.add_argument(
+        "--preference",
+        dest="preference",
+        help="preference method (e.g. dpo, ipo, kto, orpo)",
+    )
     parser.add_argument(
         "--precision",
         dest="precision",
@@ -71,8 +83,8 @@ def main():
     parser.add_argument(
         "--log-with",
         dest="log_with",
-        default="tensorboard",
-        choices=["tensorboard", "wandb"],
+        default="none",
+        choices=["none", "tensorboard", "wandb"],
         help="logging backend",
     )
     parser.add_argument(
@@ -99,7 +111,7 @@ def main():
         "--device-map",
         dest="device_map",
         default="auto",
-        help="model device map for model parallelism",
+        help="model device map for model parallelism (auto, pipeline, or map)",
     )
     parser.add_argument(
         "--stream",
@@ -140,6 +152,37 @@ def main():
         help="rank of this process for distributed training",
     )
 
+    # Optional training hyperparameters
+    parser.add_argument(
+        "--batch-size",
+        dest="batch_size",
+        type=int,
+        help="per-device batch size (overrides config default)",
+    )
+    parser.add_argument(
+        "--gradient-accumulation",
+        dest="gradient_accumulation",
+        type=int,
+        help="gradient accumulation steps (overrides config default)",
+    )
+    parser.add_argument(
+        "--learning-rate",
+        dest="learning_rate",
+        type=float,
+        help="learning rate (overrides config default)",
+    )
+    parser.add_argument(
+        "--epochs",
+        dest="num_epochs",
+        type=int,
+        help="number of training epochs (overrides config default)",
+    )
+
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
     args = parser.parse_args()
 
     config_kwargs = dict(
@@ -167,16 +210,33 @@ def main():
         distributed=args.distributed,
         local_rank=args.local_rank,
     )
+
+    # Optional training hyperparameters from CLI override dataclass defaults
+    if args.batch_size is not None:
+        config_kwargs["batch_size"] = args.batch_size
+    if args.gradient_accumulation is not None:
+        config_kwargs["gradient_accumulation"] = args.gradient_accumulation
+    if args.learning_rate is not None:
+        config_kwargs["learning_rate"] = args.learning_rate
+    if args.num_epochs is not None:
+        config_kwargs["num_epochs"] = args.num_epochs
+
     if args.lora_targets:
         config_kwargs["lora_target_modules"] = args.lora_targets.split(",")
 
     config = TrainingConfig(**config_kwargs)
 
     if config.finetuning_method == "preference":
+        from .preference import run_preference_training
+
         run_preference_training(config)
     elif config.finetuning_method == "rl":
+        from .rl import run_grpo_training
+
         run_grpo_training(config)
     elif config.finetuning_method in {"rm", "prm"}:
+        from .reward import train_reward_model
+
         train_reward_model(config)
     else:
         run_training(config)

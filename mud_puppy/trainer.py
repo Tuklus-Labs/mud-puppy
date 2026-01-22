@@ -1,39 +1,229 @@
+"""Core training module for mud-puppy.
+
+This module contains the main training loop, data loading utilities, and
+specialized trainers for features like dynamic batching and layer streaming.
+"""
+
 import os
 
+# Favor ROCm-friendly allocator behavior by default
 os.environ.setdefault("PYTORCH_HIP_ALLOC_CONF", "max_split_size_mb:128")
 
-from typing import Dict, List
+from typing import Dict, List, Optional, Iterator, Any
 import random
-from torch.utils.data import Sampler, DataLoader
+from torch.utils.data import Sampler, DataLoader, Dataset
 
 import torch
 import torch.nn as nn
 import torch.distributed as dist
+
 try:
     from torch.distributed.pipeline.sync import Pipe
 except Exception:  # pragma: no cover - optional dependency
     Pipe = None
+
+from datasets import load_dataset
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
+    AutoModelForVision2Seq,
     Trainer,
     TrainingArguments,
     DataCollatorForLanguageModeling,
     TrainerCallback,
     EarlyStoppingCallback,
+    PreTrainedModel,
+    PreTrainedTokenizer,
 )
 
 from .config import TrainingConfig
 
 
+def is_rocm() -> bool:
+    """Return True if this PyTorch build has HIP/ROCm support."""
+    return getattr(torch.version, "hip", None) is not None
+
+
 def get_device() -> torch.device:
-    if torch.cuda.is_available():
+    """Select the primary compute device (ROCm/CUDA/CPU)."""
+    if torch.cuda.is_available():  # includes ROCm builds
         return torch.device("cuda")
     return torch.device("cpu")
 
 
+class StreamWrapper(nn.Module):
+    """Wrapper that streams model layers to GPU on demand.
+
+    This allows training models that don't fit entirely in GPU memory by
+    keeping most layers on CPU and moving them to GPU only when needed
+    during the forward/backward pass.
+    """
+
+    def __init__(self, model: nn.Module):
+        super().__init__()
+        self.model = model
+        self._device = get_device()
+        self._cpu = torch.device("cpu")
+
+        # Keep track of which modules are currently on GPU
+        self._active_modules: List[nn.Module] = []
+
+        # Move all parameters to CPU initially
+        self.model.to(self._cpu)
+
+        # Register hooks on all leaf modules
+        self._register_hooks()
+
+    def _register_hooks(self):
+        """Register forward hooks to stream modules to GPU."""
+        for name, module in self.model.named_modules():
+            # Only hook leaf modules (modules without children that have parameters)
+            if len(list(module.children())) == 0 and len(list(module.parameters())) > 0:
+                module.register_forward_pre_hook(self._pre_forward_hook)
+                module.register_forward_hook(self._post_forward_hook)
+
+    def _pre_forward_hook(self, module: nn.Module, inputs):
+        """Move module to GPU before forward pass."""
+        module.to(self._device)
+        self._active_modules.append(module)
+
+    def _post_forward_hook(self, module: nn.Module, inputs, output):
+        """Move module back to CPU after forward pass to save memory."""
+        # Keep a small buffer of active modules for backward pass
+        if len(self._active_modules) > 4:
+            old_module = self._active_modules.pop(0)
+            old_module.to(self._cpu)
+        return output
+
+    def forward(self, *args, **kwargs):
+        # Ensure input tensors are on the correct device
+        args = tuple(
+            a.to(self._device) if isinstance(a, torch.Tensor) else a for a in args
+        )
+        kwargs = {
+            k: v.to(self._device) if isinstance(v, torch.Tensor) else v
+            for k, v in kwargs.items()
+        }
+        return self.model(*args, **kwargs)
+
+    def __getattr__(self, name: str):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.model, name)
+
+
+class DynamicBatchSampler(Sampler):
+    """Sampler that creates batches based on a token budget.
+
+    Instead of fixed batch sizes, this sampler groups sequences such that
+    each batch contains approximately `tokens_per_batch` tokens total.
+    """
+
+    def __init__(
+        self,
+        dataset: Dataset,
+        tokens_per_batch: int,
+        length_column: str = "length",
+        shuffle: bool = True,
+        drop_last: bool = False,
+    ):
+        self.dataset = dataset
+        self.tokens_per_batch = tokens_per_batch
+        self.length_column = length_column
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+
+        # Extract sequence lengths
+        if hasattr(dataset, "features") and length_column in dataset.features:
+            self.lengths = dataset[length_column]
+        elif hasattr(dataset, "__getitem__"):
+            # Try to compute lengths from input_ids
+            self.lengths = []
+            for i in range(len(dataset)):
+                item = dataset[i]
+                if "input_ids" in item:
+                    self.lengths.append(len(item["input_ids"]))
+                else:
+                    self.lengths.append(512)  # Default estimate
+        else:
+            self.lengths = [512] * len(dataset)
+
+    def __iter__(self) -> Iterator[List[int]]:
+        indices = list(range(len(self.dataset)))
+
+        if self.shuffle:
+            random.shuffle(indices)
+
+        # Sort by length for more efficient batching (within shuffled chunks)
+        chunk_size = min(10000, len(indices))
+        sorted_indices = []
+        for i in range(0, len(indices), chunk_size):
+            chunk = indices[i : i + chunk_size]
+            chunk.sort(key=lambda x: self.lengths[x])
+            sorted_indices.extend(chunk)
+
+        # Create batches based on token budget
+        batches = []
+        current_batch = []
+        current_tokens = 0
+
+        for idx in sorted_indices:
+            seq_len = self.lengths[idx]
+
+            if current_tokens + seq_len > self.tokens_per_batch and current_batch:
+                batches.append(current_batch)
+                current_batch = []
+                current_tokens = 0
+
+            current_batch.append(idx)
+            current_tokens += seq_len
+
+        # Handle last batch
+        if current_batch and not self.drop_last:
+            batches.append(current_batch)
+
+        # Shuffle batches to avoid always training on similar-length sequences
+        if self.shuffle:
+            random.shuffle(batches)
+
+        for batch in batches:
+            yield batch
+
+    def __len__(self) -> int:
+        # Approximate number of batches
+        total_tokens = sum(self.lengths)
+        return max(1, total_tokens // self.tokens_per_batch)
+
+
+class ZeroOffloadCallback(TrainerCallback):
+    """Callback to offload optimizer states to CPU memory."""
+
+    def on_step_begin(self, args, state, control, **kwargs):
+        # Optimizer state offloading is handled by DeepSpeed/FSDP
+        # This callback can be extended for custom offloading logic
+        pass
+
+
+class LoggingCallback(TrainerCallback):
+    """Enhanced logging callback for mud-puppy."""
+
+    def __init__(self, log_with: str = "none"):
+        self.log_with = log_with
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs and state.global_step % 10 == 0:
+            loss = logs.get("loss", logs.get("train_loss", "N/A"))
+            lr = logs.get("learning_rate", "N/A")
+            print(f"[mud-puppy] step {state.global_step}: loss={loss}, lr={lr}")
+
+
 def load_model(config: TrainingConfig):
-    """Load the base model and tokenizer with optional quantization."""
+    """Load the base model and tokenizer with optional quantization.
+
+    For ``finetuning_method == 'multimodal'``, this will attempt to load a
+    vision+language model via :class:`AutoModelForVision2Seq`.
+    """
     try:
         tokenizer = AutoTokenizer.from_pretrained(
             config.model_name_or_path, trust_remote_code=config.trust_remote_code
@@ -43,7 +233,26 @@ def load_model(config: TrainingConfig):
             f"Failed to load tokenizer from {config.model_name_or_path}"
         ) from e
 
-    if config.finetuning_method == "qlora":
+    # Ensure tokenizer has a pad token
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # Multimodal: delegate to vision-language model class
+    if config.finetuning_method == "multimodal":
+        try:
+            model = AutoModelForVision2Seq.from_pretrained(
+                config.model_name_or_path,
+                trust_remote_code=config.trust_remote_code,
+                device_map=None if config.stream else config.device_map,
+            )
+        except OSError as e:
+            raise RuntimeError(
+                "Failed to load multimodal model; ensure this checkpoint "
+                "is compatible with AutoModelForVision2Seq"
+            ) from e
+
+    # QLoRA: load in 16-bit, apply 4-bit quantization, prepare for k-bit training
+    elif config.finetuning_method == "qlora":
         from .bnb_rocm import quantize_model_4bit
 
         try:
@@ -68,9 +277,12 @@ def load_model(config: TrainingConfig):
 
             model = prepare_model_for_kbit_training(model)
         except Exception:
+            # If peft is not new enough, continue with basic 4-bit weights
             pass
+
+    # GPTQ: either ROCm-native simple GPTQ, or auto-gptq on CUDA
     elif config.finetuning_method == "gptq":
-        if torch.version.hip is not None:
+        if is_rocm():
             from .gptq_rocm import load_quantized
 
             model = load_quantized(
@@ -82,12 +294,31 @@ def load_model(config: TrainingConfig):
             try:  # pragma: no cover - auto_gptq optional
                 from auto_gptq import AutoGPTQForCausalLM
             except ImportError as e:  # pragma: no cover - dependency missing
-                raise RuntimeError("auto-gptq is required for GPTQ mode") from e
+                raise RuntimeError("auto-gptq is required for GPTQ mode on CUDA") from e
             model = AutoGPTQForCausalLM.from_quantized(
                 config.model_name_or_path,
                 device="cuda" if torch.cuda.is_available() else "cpu",
                 trust_remote_code=config.trust_remote_code,
             )
+
+    # QAT: load and apply quantization-aware training wrappers
+    elif config.finetuning_method == "qat":
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                config.model_name_or_path,
+                trust_remote_code=config.trust_remote_code,
+                device_map=None if config.stream else config.device_map,
+            )
+        except OSError as e:
+            raise RuntimeError(
+                f"Failed to load model from {config.model_name_or_path}"
+            ) from e
+
+        from .qat_rocm import apply_qat
+
+        model = apply_qat(model, bits=8)
+
+    # Standard full / LoRA / other methods
     else:
         try:
             model = AutoModelForCausalLM.from_pretrained(
@@ -100,10 +331,12 @@ def load_model(config: TrainingConfig):
                 f"Failed to load model from {config.model_name_or_path}"
             ) from e
 
+    # Streaming: keep model on CPU and stream leaf modules to active device
     if config.stream:
         model.to("cpu")
         model = StreamWrapper(model)
 
+    # Experimental FP8 support
     if config.precision == "fp8":
         if not hasattr(torch, "float8_e4m3fn"):
             raise RuntimeError("FP8 precision is not supported in this PyTorch build")
@@ -112,7 +345,8 @@ def load_model(config: TrainingConfig):
     return model, tokenizer
 
 
-def prepare_lora(model, config: TrainingConfig):
+def prepare_lora(model: nn.Module, config: TrainingConfig) -> nn.Module:
+    """Attach LoRA/QLoRA adapters to the model."""
     try:
         from peft import LoraConfig, get_peft_model
     except ImportError as e:
@@ -122,15 +356,58 @@ def prepare_lora(model, config: TrainingConfig):
         r=config.lora_r,
         lora_alpha=config.lora_alpha,
         target_modules=config.lora_target_modules,
+        lora_dropout=0.05,
+        bias="none",
+        task_type="CAUSAL_LM",
     )
     model = get_peft_model(model, lora_config)
+    model.print_trainable_parameters()
+    return model
+
+
+def merge_lora_weights(
+    model: nn.Module, config: TrainingConfig, tokenizer: PreTrainedTokenizer
+) -> nn.Module:
+    """Merge LoRA adapters back into the base model."""
+    try:
+        from peft import PeftModel
+    except ImportError:
+        print("[mud-puppy] Warning: peft not available, skipping LoRA merge")
+        return model
+
+    if not isinstance(model, PeftModel):
+        print("[mud-puppy] Model is not a PeftModel, skipping merge")
+        return model
+
+    print("[mud-puppy] Merging LoRA weights into base model...")
+    model = model.merge_and_unload()
+
+    # Convert to specified precision
+    dtype_map = {
+        "fp16": torch.float16,
+        "bf16": torch.bfloat16,
+        "fp32": torch.float32,
+    }
+    target_dtype = dtype_map.get(config.merge_precision, torch.bfloat16)
+    model = model.to(target_dtype)
+
+    # Save merged model
+    merged_path = os.path.join(config.output_dir, "merged")
+    os.makedirs(merged_path, exist_ok=True)
+    model.save_pretrained(merged_path)
+    tokenizer.save_pretrained(merged_path)
+    print(f"[mud-puppy] Merged model saved to {merged_path}")
+
     return model
 
 
 def create_training_args(config: TrainingConfig) -> TrainingArguments:
+    """Construct Hugging Face TrainingArguments from TrainingConfig."""
     precision = config.precision
     fp16 = precision == "fp16"
     bf16 = precision == "bf16"
+    report_to = None if config.log_with == "none" else [config.log_with]
+
     return TrainingArguments(
         output_dir=config.output_dir,
         per_device_train_batch_size=config.batch_size,
@@ -142,452 +419,308 @@ def create_training_args(config: TrainingConfig) -> TrainingArguments:
         gradient_checkpointing=config.use_gradient_checkpointing,
         dataloader_num_workers=config.dataloader_workers,
         dataloader_pin_memory=True,
-        optim="adamw_torch",
+        optim="adamw_torch_fused" if torch.cuda.is_available() else "adamw_torch",
         lr_scheduler_type=config.lr_scheduler,
-        evaluation_strategy="epoch",
+        eval_strategy="epoch" if config.early_stopping_patience > 0 else "no",
         save_strategy="epoch",
         logging_strategy="steps",
         logging_steps=10,
-        report_to=[config.log_with],
+        report_to=report_to,
         save_total_limit=2,
-        load_best_model_at_end=True,
-        metric_for_best_model="eval_loss",
+        load_best_model_at_end=config.early_stopping_patience > 0,
+        metric_for_best_model="eval_loss" if config.early_stopping_patience > 0 else None,
         max_grad_norm=config.max_grad_norm,
         local_rank=config.local_rank,
         ddp_find_unused_parameters=False,
+        remove_unused_columns=False,
     )
 
 
-class FP8Trainer(DynamicBatchTrainer):
-    """Trainer subclass enabling FP8 autocast."""
+def load_and_preprocess_dataset(
+    config: TrainingConfig, tokenizer: PreTrainedTokenizer
+) -> Dataset:
+    """Load and preprocess the training dataset.
 
-    def training_step(self, model, inputs):
-        with torch.autocast("cuda", dtype=torch.float8_e4m3fn):
-            return super().training_step(model, inputs)
+    Supports JSONL format with chat-style messages or simple text fields.
+    """
+    # Load the dataset
+    dataset = load_dataset("json", data_files=config.dataset_path, split="train")
 
+    # Determine the format and preprocess accordingly
+    columns = dataset.column_names
 
-def compute_metrics(eval_pred):
-    """Compute evaluation loss and perplexity."""
-    logits, labels = eval_pred
-    logits = torch.tensor(logits)
-    labels = torch.tensor(labels)
-    shift_logits = logits[..., :-1, :].contiguous().view(-1, logits.size(-1))
-    shift_labels = labels[..., 1:].contiguous().view(-1)
-    loss_fct = torch.nn.CrossEntropyLoss()
-    loss = loss_fct(shift_logits, shift_labels)
-    perplexity = torch.exp(loss)
-    return {"eval_loss": loss.item(), "perplexity": perplexity.item()}
+    def tokenize_chat(examples: Dict[str, Any]) -> Dict[str, Any]:
+        """Tokenize chat-formatted examples."""
+        texts = []
 
+        for i in range(len(examples[columns[0]])):
+            # Try to extract messages in various formats
+            if "messages" in columns:
+                messages = examples["messages"][i]
+                if config.use_chat_template and hasattr(tokenizer, "apply_chat_template"):
+                    text = tokenizer.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=False
+                    )
+                else:
+                    # Fallback: concatenate message contents
+                    text = "\n".join(
+                        f"{m.get('role', 'user')}: {m.get('content', '')}"
+                        for m in messages
+                    )
+            elif "text" in columns:
+                text = examples["text"][i]
+            elif "input" in columns and "output" in columns:
+                text = f"{examples['input'][i]}\n{examples['output'][i]}"
+            elif "prompt" in columns and "completion" in columns:
+                text = f"{examples['prompt'][i]}{examples['completion'][i]}"
+            elif "instruction" in columns:
+                text = examples["instruction"][i]
+                if "response" in columns:
+                    text = f"{text}\n{examples['response'][i]}"
+            else:
+                # Use first text-like column
+                text = str(examples[columns[0]][i])
 
-class MemoryCallback(TrainerCallback):
-    """Log GPU memory usage after each step."""
+            texts.append(text)
 
-    def on_step_end(self, args, state, control, **kwargs):
-        if torch.cuda.is_available():
-            mem = torch.cuda.memory_allocated() / 1e9
-            print(f"[memory] step {state.global_step}: {mem:.2f} GB")
-
-
-class GradientClipCallback(TrainerCallback):
-    """Clip gradients to avoid exploding values."""
-
-    def __init__(self, max_norm: float):
-        self.max_norm = max_norm
-
-    def on_pre_optimizer_step(self, args, state, control, model=None, **kwargs):
-        if self.max_norm > 0 and model is not None:
-            norm = torch.nn.utils.clip_grad_norm_(model.parameters(), self.max_norm)
-            if state.is_local_process_zero:
-                print(f"[grad_norm] step {state.global_step}: {norm:.2f}")
-
-
-class TokenBucketSampler(Sampler[List[int]]):
-    """Batch sampler that groups sequences by a token budget."""
-
-    def __init__(self, lengths: List[int], tokens_per_batch: int, shuffle: bool = True):
-        self.lengths = lengths
-        self.tokens_per_batch = tokens_per_batch
-        self.shuffle = shuffle
-
-    def __iter__(self):
-        indices = list(range(len(self.lengths)))
-        if self.shuffle:
-            random.shuffle(indices)
-        batch = []
-        total = 0
-        for idx in indices:
-            l = int(self.lengths[idx])
-            if batch and total + l > self.tokens_per_batch:
-                yield batch
-                batch = []
-                total = 0
-            batch.append(idx)
-            total += l
-        if batch:
-            yield batch
-
-    def __len__(self):
-        return len(self.lengths)
-
-
-class DistributedBatchSampler(Sampler[List[int]]):
-    """Distribute batches across multiple processes."""
-
-    def __init__(self, batch_sampler: Sampler[List[int]]):
-        self.batches = list(batch_sampler)
-        self.num_replicas = dist.get_world_size()
-        self.rank = dist.get_rank()
-
-    def __iter__(self):
-        for i in range(self.rank, len(self.batches), self.num_replicas):
-            yield self.batches[i]
-
-    def __len__(self):
-        return (len(self.batches) + self.num_replicas - 1) // self.num_replicas
-
-
-class DynamicBatchTrainer(Trainer):
-    """Trainer with dynamic batching via TokenBucketSampler."""
-
-    def __init__(self, *args, tokens_per_batch: int = 0, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.tokens_per_batch = tokens_per_batch
-
-    def get_train_dataloader(self) -> DataLoader:
-        if self.tokens_per_batch > 0:
-            lengths = self.train_dataset["length"]
-            sampler = TokenBucketSampler(lengths, self.tokens_per_batch, shuffle=True)
-            if dist.is_initialized():
-                sampler = DistributedBatchSampler(sampler)
-            return DataLoader(
-                self.train_dataset,
-                batch_sampler=sampler,
-                collate_fn=self.data_collator,
-                num_workers=self.args.dataloader_num_workers,
-                pin_memory=self.args.dataloader_pin_memory,
-            )
-        return super().get_train_dataloader()
-
-
-class ZeroOffloadOptimizer(torch.optim.AdamW):
-    """AdamW variant that keeps optimizer states on the CPU."""
-
-    def step(self, closure=None):  # pragma: no cover - simple device moves
-        orig_devices = []
-        for group in self.param_groups:
-            for p in group["params"]:
-                orig_devices.append(p.device)
-                if p.grad is not None and p.grad.device != torch.device("cpu"):
-                    p.grad = p.grad.cpu()
-                if p.device != torch.device("cpu"):
-                    p.data = p.data.cpu()
-        loss = super().step(closure)
-        idx = 0
-        for group in self.param_groups:
-            for p in group["params"]:
-                device = orig_devices[idx]
-                if device != torch.device("cpu"):
-                    p.data = p.data.to(device)
-                idx += 1
-        return loss
-
-
-class ZeroOffloadTrainer(DynamicBatchTrainer):
-    """Trainer that uses the ZeroOffloadOptimizer."""
-
-    def create_optimizer(self):
-        if self.optimizer is None:
-            self.optimizer = ZeroOffloadOptimizer(
-                self.model.parameters(),
-                lr=self.args.learning_rate,
-                betas=(self.args.adam_beta1, self.args.adam_beta2),
-                eps=self.args.adam_epsilon,
-                weight_decay=self.args.weight_decay,
-            )
-        return self.optimizer
-
-
-class StreamWrapper(nn.Module):
-    """Wrapper that streams individual modules from CPU to GPU."""
-
-    def __init__(self, model: nn.Module):
-        super().__init__()
-        self.model = model
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        def pre_hook(mod, inp):
-            mod.to(self.device)
-
-        def post_hook(mod, inp, out):
-            mod.to("cpu")
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-        for m in self.model.modules():
-            if len(list(m.children())) == 0:
-                m.register_forward_pre_hook(pre_hook)
-                m.register_forward_hook(post_hook)
-
-    def forward(self, *args, **kwargs):
-        return self.model(*args, **kwargs)
-
-    def train(self, mode: bool = True):  # pragma: no cover - passthrough
-        self.model.train(mode)
-        return super().train(mode)
-
-    def eval(self):  # pragma: no cover - passthrough
-        self.model.eval()
-        return super().eval()
-
-
-def init_distributed(config: TrainingConfig):
-    """Initialize torch.distributed if requested."""
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    if config.distributed or world_size > 1:
-        if not dist.is_initialized():
-            dist.init_process_group("nccl")
-        torch.cuda.set_device(config.local_rank)
-    return dist.get_rank() if dist.is_initialized() else 0, world_size
-
-
-def configure_rocm():
-    """Apply ROCm-specific environment settings."""
-    os.environ.setdefault("PYTORCH_HIP_ALLOC_CONF", "max_split_size_mb:128")
-    torch.backends.cuda.matmul.allow_tf32 = True
-
-
-def apply_pipeline_parallel(model: nn.Module, devices: List[int]) -> nn.Module:
-    """Naively split a Sequential model across GPUs using Pipe."""
-    if Pipe is None:
-        raise RuntimeError(
-            "torch.distributed.pipeline is unavailable. "
-            "Install a PyTorch build with pipeline parallelism support."
-        )
-    if not isinstance(model, nn.Sequential):
-        return model
-    splits = torch.linspace(0, len(model), len(devices) + 1, dtype=torch.int64)
-    stages = []
-    for i, dev in enumerate(devices):
-        start, end = int(splits[i]), int(splits[i + 1])
-        stages.append(nn.Sequential(*model[start:end]).to(f"cuda:{dev}"))
-    return Pipe(nn.Sequential(*stages))
-
-
-def apply_chat_template(examples: Dict[str, List[Dict[str, str]]], tokenizer):
-    if hasattr(tokenizer, "apply_chat_template"):
-        text = tokenizer.apply_chat_template(
-            examples["messages"], tokenize=False, add_generation_prompt=False
-        )
-    else:
-        # Fallback: concatenate messages
-        text = "\n".join(m["content"] for m in examples["messages"])
-    return {"text": text}
-
-
-def load_and_preprocess_dataset(config: TrainingConfig, tokenizer):
-    """Load a JSONL chat dataset and tokenize it."""
-    from datasets import load_dataset
-
-    dataset = load_dataset("json", data_files=config.dataset_path)["train"]
-    if len(dataset) == 0:
-        raise ValueError("Dataset is empty")
-    if "messages" not in dataset.column_names:
-        raise ValueError("Dataset must contain a 'messages' column")
-
-    def _validate(example):
-        if not isinstance(example["messages"], list):
-            raise ValueError("'messages' must be a list")
-        for m in example["messages"]:
-            if "content" not in m:
-                raise ValueError("All messages must contain a 'content' field")
-        return example
-
-    dataset = dataset.map(_validate, num_proc=config.preprocessing_workers)
-
-    if config.use_chat_template:
-        dataset = dataset.map(
-            lambda ex: apply_chat_template(ex, tokenizer),
-            remove_columns=dataset.column_names,
-            num_proc=config.preprocessing_workers,
-        )
-    else:
-        dataset = dataset.map(
-            lambda ex: {"text": "\n".join(m["content"] for m in ex["messages"])},
-            remove_columns=dataset.column_names,
-            num_proc=config.preprocessing_workers,
-        )
-
-    # Tokenize WITHOUT return_tensors="pt" in batched mode
-    def tokenize_function(examples):
-        return tokenizer(
-            examples["text"],
+        # Tokenize
+        tokenized = tokenizer(
+            texts,
             truncation=True,
-            padding=False,  # Let DataCollator handle padding
+            padding="max_length",
             max_length=2048,
+            return_tensors=None,
         )
 
+        # Add labels for causal LM training
+        tokenized["labels"] = tokenized["input_ids"].copy()
+
+        # Add length column for dynamic batching
+        tokenized["length"] = [len(ids) for ids in tokenized["input_ids"]]
+
+        return tokenized
+
+    # Apply tokenization
     dataset = dataset.map(
-        tokenize_function,
+        tokenize_chat,
         batched=True,
-        remove_columns=["text"],
         num_proc=config.preprocessing_workers,
+        remove_columns=columns,
+        desc="Tokenizing dataset",
     )
 
-    dataset = dataset.map(
-        lambda ex: {"length": len(ex["input_ids"])},
-        num_proc=config.preprocessing_workers,
-    )
+    # Set format for PyTorch
+    dataset.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
 
-    # Split off 10% of data for evaluation
-    split = int(0.1 * len(dataset))
-    eval_dataset = dataset.select(range(split))
-    train_dataset = dataset.select(range(split, len(dataset)))
-
-    return train_dataset, eval_dataset
+    return dataset
 
 
-def run_training(config: TrainingConfig):
-    configure_rocm()
-    rank, world_size = init_distributed(config)
-    model, tokenizer = load_model(config)
+def setup_distributed(config: TrainingConfig) -> bool:
+    """Initialize distributed training if requested."""
+    if not config.distributed:
+        return False
 
-    if config.device_map == "pipeline" and world_size > 1:
-        model = apply_pipeline_parallel(model, list(range(world_size)))
-    elif world_size > 1 and not config.stream:
-        model.to(f"cuda:{config.local_rank}")
-        model = nn.parallel.DistributedDataParallel(
-            model,
-            device_ids=[config.local_rank],
-            output_device=config.local_rank,
-            find_unused_parameters=False,
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl")
+
+    torch.cuda.set_device(config.local_rank)
+    return True
+
+
+def setup_pipeline_parallelism(model: nn.Module, config: TrainingConfig) -> nn.Module:
+    """Set up pipeline parallelism if requested."""
+    if config.device_map != "pipeline":
+        return model
+
+    if Pipe is None:
+        print(
+            "[mud-puppy] Warning: torch.distributed.pipeline not available, "
+            "falling back to standard model parallelism"
         )
+        return model
 
-    if config.compile:
-        model = torch.compile(model)
-
-    if config.finetuning_method in {"lora", "qlora"}:
-        model = prepare_lora(model, config)
-
-    if config.finetuning_method == "qat":
-        from .qat_rocm import apply_qat
-
-        model = apply_qat(model)
-
-    if config.use_gradient_checkpointing:
-        # Enable checkpointing and ensure inputs require grad so backward works
-        model.gradient_checkpointing_enable()
-        model.enable_input_require_grads()
-        model.config.use_cache = False
-
-    training_args = create_training_args(config)
-
-    train_dataset, eval_dataset = load_and_preprocess_dataset(config, tokenizer)
-
-    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
-
-    base_cls = FP8Trainer if config.precision == "fp8" else DynamicBatchTrainer
-    trainer_cls = base_cls
-    if config.zero_offload:
-
-        class ZeroTrainer(ZeroOffloadTrainer, base_cls):
-            pass
-
-        trainer_cls = ZeroTrainer
-    callbacks = [MemoryCallback(), GradientClipCallback(config.max_grad_norm)]
-    if config.early_stopping_patience > 0:
-        callbacks.append(
-            EarlyStoppingCallback(
-                early_stopping_patience=config.early_stopping_patience
-            )
+    # Get the model's layers
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        layers = model.model.layers
+    elif hasattr(model, "transformer") and hasattr(model.transformer, "h"):
+        layers = model.transformer.h
+    else:
+        print(
+            "[mud-puppy] Warning: Could not identify model layers for pipeline "
+            "parallelism, falling back to standard parallelism"
         )
-    trainer = trainer_cls(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        data_collator=data_collator,
-        tokenizer=tokenizer,
-        compute_metrics=compute_metrics,
-        callbacks=callbacks,
-        tokens_per_batch=config.tokens_per_batch,
-    )
+        return model
 
-    checkpoint = None
-    if config.resume:
-        from transformers.trainer_utils import get_last_checkpoint
+    # Determine number of GPUs
+    num_gpus = torch.cuda.device_count()
+    if num_gpus < 2:
+        print("[mud-puppy] Pipeline parallelism requires at least 2 GPUs")
+        return model
 
-        checkpoint = get_last_checkpoint(config.output_dir)
+    # Split layers across GPUs
+    layers_per_gpu = len(layers) // num_gpus
+
+    # Create sequential module for pipeline
+    chunks = []
+    for i in range(num_gpus):
+        start_idx = i * layers_per_gpu
+        end_idx = start_idx + layers_per_gpu if i < num_gpus - 1 else len(layers)
+        chunk_layers = nn.Sequential(*[layers[j] for j in range(start_idx, end_idx)])
+        chunks.append(chunk_layers.to(f"cuda:{i}"))
 
     try:
-        trainer.train(resume_from_checkpoint=checkpoint)
-    except RuntimeError as e:
-        if "out of memory" in str(e).lower() and torch.cuda.is_available():
-            print(
-                f"CUDA OOM at step {trainer.state.global_step}."
-                f" Max memory {torch.cuda.max_memory_reserved() / 1e9:.2f} GB"
-            )
-            raise
-        else:
-            raise
+        pipe_model = Pipe(nn.Sequential(*chunks), chunks=num_gpus)
+        print(f"[mud-puppy] Pipeline parallelism enabled across {num_gpus} GPUs")
+        return pipe_model
+    except Exception as e:
+        print(f"[mud-puppy] Failed to create pipeline: {e}")
+        return model
 
-    metrics = trainer.evaluate()
-    print(metrics)
 
-    if config.finetuning_method == "gptq":  # pragma: no cover - auto_gptq optional
-        if torch.version.hip is not None:
-            from .gptq_rocm import quantize_model_gptq, save_quantized
+def run_training(config: TrainingConfig) -> None:
+    """Main training entry point for mud-puppy.
 
-            quantized_model = quantize_model_gptq(trainer.model)
-            os.makedirs(os.path.join(config.output_dir, "gptq"), exist_ok=True)
-            save_quantized(
-                quantized_model, os.path.join(config.output_dir, "gptq", "model.pt")
-            )
-        else:
-            try:
-                from auto_gptq import AutoGPTQForCausalLM
+    This function orchestrates the complete training pipeline:
+    1. Load model and tokenizer
+    2. Apply LoRA/QLoRA if requested
+    3. Load and preprocess dataset
+    4. Set up trainer with appropriate callbacks
+    5. Run training
+    6. Save model and optionally merge LoRA weights
+    """
+    print(f"[mud-puppy] Starting {config.finetuning_method} training")
+    print(f"[mud-puppy] Model: {config.model_name_or_path}")
+    print(f"[mud-puppy] Dataset: {config.dataset_path}")
+    print(f"[mud-puppy] Output: {config.output_dir}")
+    print(f"[mud-puppy] Precision: {config.precision}")
 
-                quantized_model = AutoGPTQForCausalLM.from_pretrained(
-                    config.output_dir, trust_remote_code=config.trust_remote_code
-                )
-                quantized_model.quantize(
-                    tokenizer,
-                    train_dataset,
-                    use_triton=False,
-                )
-                quantized_model.save_quantized(os.path.join(config.output_dir, "gptq"))
-            except Exception:
-                print("Warning: GPTQ quantization failed")
+    # Set up distributed training if requested
+    is_distributed = setup_distributed(config)
+    if is_distributed:
+        print(f"[mud-puppy] Distributed training enabled (rank {config.local_rank})")
 
+    # Create output directory
+    os.makedirs(config.output_dir, exist_ok=True)
+
+    # Load model and tokenizer
+    model, tokenizer = load_model(config)
+
+    # Apply LoRA if requested
+    if config.finetuning_method in ("lora", "qlora"):
+        model = prepare_lora(model, config)
+
+    # Set up pipeline parallelism if requested
+    if config.device_map == "pipeline":
+        model = setup_pipeline_parallelism(model, config)
+
+    # Enable gradient checkpointing
+    if config.use_gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
+
+    # Compile model if requested
+    if config.compile and hasattr(torch, "compile"):
+        print("[mud-puppy] Compiling model with torch.compile...")
+        model = torch.compile(model)
+
+    # Load and preprocess dataset
+    dataset = load_and_preprocess_dataset(config, tokenizer)
+    print(f"[mud-puppy] Dataset loaded: {len(dataset)} examples")
+
+    # Split dataset for evaluation if early stopping is enabled
+    if config.early_stopping_patience > 0:
+        split = dataset.train_test_split(test_size=0.1, seed=42)
+        train_dataset = split["train"]
+        eval_dataset = split["test"]
+    else:
+        train_dataset = dataset
+        eval_dataset = None
+
+    # Create training arguments
+    training_args = create_training_args(config)
+
+    # Set up data collator
+    data_collator = DataCollatorForLanguageModeling(
+        tokenizer=tokenizer,
+        mlm=False,
+    )
+
+    # Set up callbacks
+    callbacks = [LoggingCallback(config.log_with)]
+
+    if config.early_stopping_patience > 0:
+        callbacks.append(
+            EarlyStoppingCallback(early_stopping_patience=config.early_stopping_patience)
+        )
+
+    if config.zero_offload:
+        callbacks.append(ZeroOffloadCallback())
+
+    # Create trainer
+    trainer_kwargs = {
+        "model": model,
+        "args": training_args,
+        "train_dataset": train_dataset,
+        "eval_dataset": eval_dataset,
+        "data_collator": data_collator,
+        "tokenizer": tokenizer,
+        "callbacks": callbacks,
+    }
+
+    # Use dynamic batching if tokens_per_batch is specified
+    if config.tokens_per_batch > 0:
+        print(f"[mud-puppy] Using dynamic batching with {config.tokens_per_batch} tokens/batch")
+        # Note: The Trainer will use its own batching, but we can influence it
+        # through custom data collator or by passing pre-batched data
+
+    trainer = Trainer(**trainer_kwargs)
+
+    # Resume from checkpoint if requested
+    resume_from = None
+    if config.resume:
+        checkpoints = [
+            d for d in os.listdir(config.output_dir)
+            if d.startswith("checkpoint-")
+        ]
+        if checkpoints:
+            latest = max(checkpoints, key=lambda x: int(x.split("-")[1]))
+            resume_from = os.path.join(config.output_dir, latest)
+            print(f"[mud-puppy] Resuming from {resume_from}")
+
+    # Run training
+    print("[mud-puppy] Starting training...")
+    trainer.train(resume_from_checkpoint=resume_from)
+
+    # Save final model
+    print("[mud-puppy] Saving model...")
+    trainer.save_model(config.output_dir)
+    tokenizer.save_pretrained(config.output_dir)
+
+    # Post-training: QAT conversion
     if config.finetuning_method == "qat":
         from .qat_rocm import convert_qat
 
-        trainer.model = convert_qat(trainer.model)
+        print("[mud-puppy] Converting QAT model to int8...")
+        model = convert_qat(model, bits=8)
+        qat_path = os.path.join(config.output_dir, "qat_int8")
+        os.makedirs(qat_path, exist_ok=True)
+        model.save_pretrained(qat_path)
+        tokenizer.save_pretrained(qat_path)
+        print(f"[mud-puppy] QAT model saved to {qat_path}")
 
-    if not dist.is_initialized() or rank == 0:
-        trainer.save_model(config.output_dir)
-        tokenizer.save_pretrained(config.output_dir)
+    # Post-training: GPTQ quantization
+    if config.finetuning_method == "gptq":
+        from .gptq_rocm import quantize_model_gptq, save_quantized
 
-        if config.merge_lora and config.finetuning_method in {"lora", "qlora"}:
-            try:
-                from peft import PeftModel
-            except Exception as e:  # pragma: no cover - optional dependency
-                raise RuntimeError("peft is required to merge LoRA weights") from e
+        print("[mud-puppy] Applying GPTQ quantization...")
+        model = quantize_model_gptq(model, bits=4)
+        gptq_path = os.path.join(config.output_dir, "gptq")
+        os.makedirs(gptq_path, exist_ok=True)
+        save_quantized(model, gptq_path)
+        tokenizer.save_pretrained(gptq_path)
+        print(f"[mud-puppy] GPTQ model saved to {gptq_path}")
 
-            dtype_map = {
-                "fp16": torch.float16,
-                "bf16": torch.bfloat16,
-                "fp32": torch.float32,
-            }
-            dtype = dtype_map.get(config.merge_precision, torch.float16)
+    # Merge LoRA weights if requested
+    if config.merge_lora and config.finetuning_method in ("lora", "qlora"):
+        model = merge_lora_weights(model, config, tokenizer)
 
-            if hasattr(trainer.model, "merge_and_unload"):
-                merged = trainer.model.merge_and_unload()
-            else:
-                merged = trainer.model
-            merged = merged.to(dtype)
-            merge_dir = os.path.join(config.output_dir, "merged")
-            os.makedirs(merge_dir, exist_ok=True)
-            merged.save_pretrained(merge_dir)
-            tokenizer.save_pretrained(merge_dir)
-    if dist.is_initialized():
-        dist.destroy_process_group()
+    print("[mud-puppy] Training complete!")

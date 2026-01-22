@@ -1,52 +1,366 @@
 # mud-puppy
 
-mud-puppy is a ROCm-first LLM fine‑tuning framework inspired by [Axolotl](https://github.com/OpenAccess-AI-Collective/axolotl). It targets AMD GPUs and is optimized for the `GFX1100` architecture.
+mud-puppy is a ROCm-first LLM fine-tuning framework inspired by [Axolotl](https://github.com/OpenAccess-AI-Collective/axolotl). It targets AMD GPUs and is optimized for the `GFX1100` architecture, but should run on any recent ROCm-capable GPU.
 
 ## Features
 
-- **Full fine‑tuning** using the HuggingFace `Trainer` API
+- **Full fine-tuning** using the HuggingFace `Trainer` API
 - **LoRA** via the `peft` library and **QLoRA** with a built-in 4-bit quantizer
   - A lightweight module handles 4-bit quantization on all GPUs, so no `bitsandbytes` dependency is required
-- **Flash Attention** via the `rocm_attn` helpers (`flash_attention` and `FlashMHA`)
+- **Flash Attention** via the `rocm_attn` helpers (`flash_attention` and `FlashMHA`), backed by PyTorch's `scaled_dot_product_attention` on ROCm
 - **GPTQ** post-training quantization and **QAT**
-  - GPTQ models are saved to the `gptq/` folder and use `auto-gptq` on CUDA or a simple ROCm implementation when running on AMD GPUs
-  - QAT uses a simple ROCm module and saves an int8 model for CPU inference
-- **ROCm kernels** including qgemm/fbgemm, quantization helpers, and a quantized layernorm
-- **Preference tuning** with DPO using the `trl` library
-- **Reinforcement Learning** through GRPO on top of PPOTrainer
-- **Multimodal support** (experimental)
+  - GPTQ models are saved to the `gptq/` folder and use a simple ROCm-friendly int4 implementation, or `auto-gptq` on CUDA if available
+  - QAT uses a simple ROCm module and saves an int8-ish model for CPU/ROCm inference
+- **ROCm kernels** including qgemm/fbgemm, quantization helpers, and a quantized layernorm (naive but portable implementations)
+- **Preference tuning** with DPO, IPO, KTO, and ORPO using the `trl` library
+- **Reinforcement Learning** through native `GRPOTrainer` (with PPO fallback)
+- **Multimodal support** (experimental flag; currently routes through the standard trainer)
 - **Reward Modelling** / **Process Reward Modelling** for ranking models
 
-mud-puppy currently expects datasets in JSONL chat format. By default it applies a chat template if the tokenizer supports it, but this can be disabled with `--no-chat-template`.
-
-### New features
-
-Version 0.3 expands on this with early stopping, dynamic batching and model parallelism. You can train huge models with `--device-map auto`, keep batches to a token budget via `--tokens-per-batch`, choose a scheduler with `--lr-scheduler`, and stop early using `--early-stopping`.
-Pipeline parallelism can be enabled with `--device-map pipeline` when your PyTorch build includes `torch.distributed.pipeline`.
-
-Streaming mode is available with `--stream` to offload layers to CPU swap and move them to the GPU one at a time.
-
-Optimizer states can be offloaded to CPU with `--zero-offload` to further reduce GPU memory usage.
-Adapters from LoRA or QLoRA runs can be merged back into the base model using `--merge-lora` and saved in your choice of precision with `--merge-precision`.
-
-The framework is still experimental but includes working implementations of the major algorithms described above.
-
-
-### Quick start
-
-Install from source and launch a run:
+## Installation
 
 ```bash
+# Clone the repository
+git clone https://github.com/your-org/mud-puppy.git
+cd mud-puppy
+
+# Install in development mode
 pip install -e .
 
-mud-puppy your-model your-dataset --method lora --output ./finetuned
+# Or install with CUDA extras (for auto-gptq support)
+pip install -e ".[cuda]"
 ```
-Add `--trust-remote-code` if the model requires custom code from the Hub, and
-use `--no-chat-template` to skip template formatting during preprocessing.
 
-## ROCm optimization
+### Dependencies
 
-mud-puppy is designed to run efficiently on AMD GPUs. It defaults to `bf16` precision and enables gradient checkpointing to keep memory usage low on `GFX1100` cards. You can also opt into experimental `fp8` training by passing `--precision fp8` if your hardware supports it. Set `--compile` to enable `torch.compile` for additional speed.
-The trainer configures ROCm with `PYTORCH_HIP_ALLOC_CONF=max_split_size_mb:128` at import time and enables TF32 matrix multiply for additional speed when available. Use `--num-workers` and `--preprocess-workers` to increase dataloader and tokenization parallelism.
+- Python >= 3.9
+- PyTorch (ROCm or CUDA build)
+- transformers
+- datasets
+- peft
+- trl
 
+## Quick Start
 
+### Supervised Fine-Tuning (SFT)
+
+```bash
+# Full fine-tuning
+mud-puppy meta-llama/Llama-3-8B data.jsonl --method full --output ./outputs
+
+# LoRA fine-tuning
+mud-puppy meta-llama/Llama-3-8B data.jsonl --method lora --output ./lora-outputs
+
+# QLoRA (4-bit quantized base + LoRA)
+mud-puppy meta-llama/Llama-3-8B data.jsonl --method qlora --output ./qlora-outputs
+```
+
+### Preference Tuning
+
+```bash
+# DPO (Direct Preference Optimization)
+mud-puppy your-model prefs.jsonl --method preference --preference dpo --output ./dpo
+
+# IPO (Identity Preference Optimization)
+mud-puppy your-model prefs.jsonl --method preference --preference ipo --output ./ipo
+
+# KTO (Kahneman-Tversky Optimization)
+mud-puppy your-model prefs.jsonl --method preference --preference kto --output ./kto
+
+# ORPO (Odds Ratio Preference Optimization)
+mud-puppy your-model prefs.jsonl --method preference --preference orpo --output ./orpo
+```
+
+### Reinforcement Learning
+
+```bash
+# GRPO training
+mud-puppy your-model prompts.jsonl --method rl --output ./grpo
+```
+
+### Reward Modeling
+
+```bash
+# Standard reward model
+mud-puppy your-model rewards.jsonl --method rm --output ./reward-model
+
+# Process reward model
+mud-puppy your-model prm_data.jsonl --method prm --output ./prm-model
+```
+
+### Quantization
+
+```bash
+# GPTQ post-training quantization
+mud-puppy your-model data.jsonl --method gptq --output ./gptq-model
+
+# QAT (Quantization-Aware Training)
+mud-puppy your-model data.jsonl --method qat --output ./qat-model
+```
+
+## Dataset Formats
+
+mud-puppy supports several JSONL dataset formats:
+
+### Chat Format (recommended for SFT)
+
+```json
+{"messages": [{"role": "user", "content": "Hello"}, {"role": "assistant", "content": "Hi there!"}]}
+{"messages": [{"role": "user", "content": "What is 2+2?"}, {"role": "assistant", "content": "4"}]}
+```
+
+### Simple Text Format
+
+```json
+{"text": "This is a training example."}
+{"text": "Another example for fine-tuning."}
+```
+
+### Instruction/Response Format
+
+```json
+{"instruction": "Explain quantum computing", "response": "Quantum computing uses..."}
+{"input": "Translate to French: Hello", "output": "Bonjour"}
+```
+
+### Prompt/Completion Format
+
+```json
+{"prompt": "The capital of France is", "completion": " Paris."}
+```
+
+### Preference Format (for DPO/IPO/KTO/ORPO)
+
+```json
+{"prompt": "What is 2+2?", "chosen": "The answer is 4.", "rejected": "I don't know."}
+```
+
+### Reward Format
+
+```json
+{"text": "This is a good response", "label": 0.95}
+{"prompt": "Question", "chosen": "Good answer", "rejected": "Bad answer"}
+```
+
+### RL Format (for GRPO)
+
+```json
+{"prompt": "Write a haiku about coding"}
+{"prompt": "Explain machine learning briefly"}
+```
+
+## CLI Reference
+
+```
+mud-puppy MODEL DATASET [OPTIONS]
+
+Positional Arguments:
+  MODEL                     Model name or path (HuggingFace hub or local)
+  DATASET                   Dataset path (JSONL file)
+
+Training Method:
+  --method METHOD           Training method: full, lora, qlora, gptq, qat,
+                           preference, rl, multimodal, rm, prm (default: full)
+  --preference PREF         Preference algorithm: dpo, ipo, kto, orpo
+
+Output:
+  --output DIR              Output directory (default: ./outputs)
+
+Precision:
+  --precision {fp16,bf16,fp8}   Training precision (default: bf16)
+  --compile                     Enable torch.compile for speed
+
+Hyperparameters:
+  --batch-size N            Per-device batch size
+  --gradient-accumulation N Gradient accumulation steps
+  --learning-rate LR        Learning rate
+  --epochs N                Number of training epochs
+  --lr-scheduler TYPE       Scheduler: linear, cosine, cosine_with_restarts, polynomial
+
+LoRA Options:
+  --lora-targets MODULES    Comma-separated list of target modules
+  --merge-lora              Merge LoRA weights after training
+  --merge-precision PREC    Precision for merged model: fp16, bf16, fp32
+
+Memory Optimization:
+  --device-map MAP          Device map: auto, pipeline, or custom
+  --stream                  Stream layers from CPU to GPU on demand
+  --zero-offload            Offload optimizer states to CPU
+  --tokens-per-batch N      Dynamic batching by token count
+
+Data Processing:
+  --no-chat-template        Disable chat template application
+  --trust-remote-code       Allow custom model code from Hub
+  --num-workers N           Dataloader workers
+  --preprocess-workers N    Dataset preprocessing workers
+
+Training Control:
+  --resume                  Resume from last checkpoint
+  --early-stopping N        Stop if no improvement for N evaluations
+  --log-with BACKEND        Logging: none, tensorboard, wandb
+
+Distributed:
+  --distributed             Enable distributed training
+  --local-rank N            Process rank for distributed training
+```
+
+## Python API
+
+```python
+from mud_puppy import TrainingConfig, run_training
+
+# Configure training
+config = TrainingConfig(
+    model_name_or_path="meta-llama/Llama-3-8B",
+    dataset_path="./data/chat.jsonl",
+    output_dir="./outputs",
+    finetuning_method="lora",  # full, lora, qlora, gptq, qat, preference, rl, rm, prm
+    precision="bf16",
+    batch_size=4,
+    gradient_accumulation=4,
+    learning_rate=2e-5,
+    num_epochs=3,
+    lora_r=8,
+    lora_alpha=16,
+    use_gradient_checkpointing=True,
+)
+
+# Run training
+run_training(config)
+```
+
+### Quantization API
+
+```python
+from mud_puppy import quantize_model_4bit, quantize_model_gptq, apply_qat, convert_qat
+
+# 4-bit quantization (for QLoRA)
+model = quantize_model_4bit(model, dtype=torch.bfloat16)
+
+# GPTQ quantization
+model = quantize_model_gptq(model, bits=4)
+
+# QAT
+model = apply_qat(model, bits=8)  # Enable QAT during training
+model = convert_qat(model, bits=8)  # Convert to quantized after training
+```
+
+### Flash Attention API
+
+```python
+from mud_puppy import flash_attention, FlashMHA
+
+# Functional API
+output = flash_attention(q, k, v, causal=True, dropout_p=0.1)
+
+# Module API
+mha = FlashMHA(embed_dim=768, num_heads=12, dropout=0.1)
+output = mha(x, attention_mask=mask, causal=True)
+```
+
+### ROCm Kernels
+
+```python
+from mud_puppy.rocm_kernels import (
+    quantize_per_tensor,
+    quantize_per_channel,
+    dequantize,
+    qgemm,
+    fbgemm,
+    quantized_layernorm,
+)
+
+# Quantize a tensor
+qtensor, scale, zero_point = quantize_per_tensor(tensor, bits=8)
+
+# Dequantize
+tensor = dequantize(qtensor, scale, zero_point)
+
+# Quantized matrix multiply
+result = qgemm(a_q, a_scale, b_q, b_scale)
+
+# Fused GEMM + bias + activation
+result = fbgemm(a_q, a_scale, b_q, b_scale, bias=bias, activation="relu")
+```
+
+## Interactive Mode
+
+mud-puppy includes an interactive CLI for guided configuration:
+
+```bash
+mud-puppy-interactive
+```
+
+This launches a REPL where you can type `start` to configure a training run interactively.
+
+## Memory Optimization
+
+### For Large Models
+
+```bash
+# Use streaming to train models larger than GPU memory
+mud-puppy large-model data.jsonl --stream --method lora
+
+# Combine with optimizer offloading
+mud-puppy large-model data.jsonl --stream --zero-offload --method lora
+
+# Use device_map for automatic model parallelism
+mud-puppy large-model data.jsonl --device-map auto --method full
+```
+
+### For Limited VRAM
+
+```bash
+# Use QLoRA with gradient checkpointing (enabled by default)
+mud-puppy model data.jsonl --method qlora --batch-size 1 --gradient-accumulation 16
+
+# Dynamic batching to maximize GPU utilization
+mud-puppy model data.jsonl --tokens-per-batch 4096 --method lora
+```
+
+## ROCm Optimization
+
+mud-puppy is designed to run efficiently on AMD GPUs:
+
+- Defaults to `bf16` precision with gradient checkpointing
+- Sets `PYTORCH_HIP_ALLOC_CONF=max_split_size_mb:128` for better memory allocation
+- Uses `torch.nn.functional.scaled_dot_product_attention` for flash attention on ROCm
+- All quantization kernels are pure PyTorch, no vendor-specific code required
+
+For CUDA users, mud-puppy works seamlessly and can use `auto-gptq` for GPTQ if installed.
+
+### Experimental FP8 Support
+
+```bash
+mud-puppy model data.jsonl --precision fp8 --method full
+```
+
+Requires PyTorch with FP8 support.
+
+## Version History
+
+### v0.3.0
+
+- Native `GRPOTrainer` support for reinforcement learning
+- `RewardTrainer` and `PRMTrainer` integration
+- `StreamWrapper` for layer-by-layer GPU streaming
+- `DynamicBatchSampler` for token-budget batching
+- Pipeline parallelism with `--device-map pipeline`
+- Early stopping with `--early-stopping`
+- LoRA weight merging with `--merge-lora`
+- IPO support via DPO loss variant
+- Improved dataset format detection
+
+## License
+
+MIT License - see LICENSE file for details.
+
+## Contributing
+
+Contributions are welcome! Please open an issue or submit a pull request.
+
+## Acknowledgments
+
+- [Axolotl](https://github.com/OpenAccess-AI-Collective/axolotl) for inspiration
+- [HuggingFace](https://huggingface.co/) for transformers, datasets, peft, and trl
+- AMD for ROCm and continued open-source GPU compute support
