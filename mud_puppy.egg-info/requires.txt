@@ -1,8 +1,0 @@
-torch
-transformers
-datasets
-peft
-trl
-
-[cuda]
-auto-gptq
