@@ -1,0 +1,175 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mud-puppy-jax"
+version = "0.3.0"
+description = "A JAX/Flax LLM fine-tuning framework for TPU"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+keywords = ["jax", "flax", "tpu", "fine-tuning", "llm", "lora", "qlora"]
+authors = [
+    {name = "LLM"}
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    # Core JAX ecosystem
+    "jax>=0.9.0",
+    "jaxlib>=0.9.0",
+    "flax>=0.12.2",
+    "optax>=0.2.6",
+    "orbax-checkpoint>=0.11.32",
+    "chex>=0.1.88",
+
+    # Data loading & datasets
+    "grain>=0.2.12",
+    "datasets>=4.5.0",
+    "tensorflow-datasets>=4.9.0",
+
+    # HuggingFace ecosystem
+    "transformers>=4.48.0",
+    "tokenizers>=0.21.0",
+    "huggingface-hub>=0.28.0",
+    "safetensors>=0.5.0",
+    "accelerate>=1.3.0",
+
+    # Numerical/scientific
+    "numpy>=1.26.0",
+    "scipy>=1.14.0",
+    "ml-dtypes>=0.5.0",
+
+    # Utilities
+    "tqdm>=4.67.0",
+    "rich>=13.9.0",
+    "pyyaml>=6.0.0",
+    "einops>=0.8.0",
+    "wandb>=0.19.0",
+]
+
+[project.optional-dependencies]
+# TPU support (Google Cloud TPU)
+tpu = [
+    "jax[tpu]>=0.9.0",
+    "libtpu-nightly",
+]
+
+# GPU support (NVIDIA CUDA)
+cuda = [
+    "jax[cuda12]>=0.9.0",
+]
+
+# ROCm support (AMD GPUs)
+rocm = [
+    "jax[rocm]>=0.9.0",
+]
+
+# Quantization with Qwix
+quantization = [
+    # Qwix is not on PyPI yet - install via:
+    # pip install git+https://github.com/google/qwix.git
+]
+
+# Advanced optimizers and schedulers
+advanced-optim = [
+    "optax-shampoo>=0.0.6",
+]
+
+# Reinforcement learning from human feedback
+rlhf = [
+    "grain>=0.2.12",
+]
+
+# Profiling and debugging
+profiling = [
+    "xprof>=0.9.0",
+    "tensorboard>=2.18.0",
+    "tensorboard-plugin-profile>=2.18.0",
+]
+
+# Development
+dev = [
+    "pytest>=8.3.0",
+    "pytest-xdist>=3.6.0",
+    "black>=24.10.0",
+    "ruff>=0.8.0",
+    "mypy>=1.13.0",
+]
+
+# All extras (except hardware-specific)
+all = [
+    "mud-puppy-jax[quantization,advanced-optim,rlhf,profiling,dev]",
+]
+
+[project.scripts]
+mud-puppy-jax = "mud_puppy.jax_cli:main"
+
+[tool.setuptools.packages.find]
+include = ["mud_puppy*"]
+exclude = ["tests", "tests.*", "outputs*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --tb=short"
+
+[tool.black]
+line-length = 100
+target-version = ["py311", "py312", "py313"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+select = ["E", "F", "W", "I", "UP"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+
+# ==============================================================================
+# OPTAX SCHEDULER EXAMPLES FOR FINE-TUNING
+# ==============================================================================
+# Common learning rate schedules available in optax:
+#
+# optax.warmup_cosine_decay_schedule(
+#     init_value=0.0,
+#     peak_value=2e-5,
+#     warmup_steps=100,
+#     decay_steps=1000,
+#     end_value=1e-6
+# )
+#
+# optax.warmup_exponential_decay_schedule(
+#     init_value=0.0,
+#     peak_value=5e-5,
+#     warmup_steps=50,
+#     transition_steps=500,
+#     decay_rate=0.9
+# )
+#
+# optax.linear_schedule(
+#     init_value=1e-4,
+#     end_value=1e-6,
+#     transition_steps=2000
+# )
+#
+# For LoRA fine-tuning, combine with:
+# optax.chain(
+#     optax.clip_by_global_norm(1.0),
+#     optax.adamw(learning_rate=schedule, weight_decay=0.01)
+# )

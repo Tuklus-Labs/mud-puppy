@@ -18,6 +18,30 @@ cuda = [
     "auto-gptq",
 ]
 
+# JAX/Flax backend (for TPU or JAX-based training)
+jax = [
+    "jax[cpu]",
+    "flax",
+    "optax",
+    "orbax-checkpoint",
+]
+
+# JAX with CUDA support
+jax-cuda = [
+    "jax[cuda12]",
+    "flax",
+    "optax",
+    "orbax-checkpoint",
+]
+
+# JAX with TPU support
+jax-tpu = [
+    "jax[tpu]",
+    "flax",
+    "optax",
+    "orbax-checkpoint",
+]
+
 [project.scripts]
 mud-puppy = "mud_puppy.cli:main"
 mud-puppy-interactive = "mud_puppy.interactive:main"

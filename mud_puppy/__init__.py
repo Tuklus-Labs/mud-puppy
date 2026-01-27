@@ -39,6 +39,18 @@ __all__ = [
     "quantize_model_gptq",
     "save_quantized",
     "load_quantized",
+    # JAX/Flax RL
+    "GRPOTrainer",
+    "GRPOConfig",
+    "run_jax_grpo_training",
+    # JAX/Flax LoRA
+    "LoRAConfig",
+    "QLoRAConfig",
+    "LoRADense",
+    "LoRAAdapter",
+    "QLoRADense",
+    "merge_lora_params",
+    "init_lora_from_pretrained",
 ]
 
 from .config import TrainingConfig
@@ -140,3 +152,128 @@ def load_quantized(*args, **kwargs):
     from .gptq_rocm import load_quantized as _load_quantized
 
     return _load_quantized(*args, **kwargs)
+
+
+# JAX/Flax RL exports (lazy imports to avoid heavy dependencies)
+
+
+def GRPOTrainer(*args, **kwargs):
+    """JAX/Flax GRPO (Group Relative Policy Optimization) trainer.
+
+    GRPO is a reinforcement learning algorithm similar to PPO but with
+    group-level relative rewards - generating multiple completions per prompt
+    and computing advantages relative to the group mean.
+
+    See :class:`mud_puppy.jax_rl.GRPOTrainer` for full documentation.
+    """
+
+    from .jax_rl import GRPOTrainer as _GRPOTrainer
+
+    return _GRPOTrainer(*args, **kwargs)
+
+
+def GRPOConfig(*args, **kwargs):
+    """Configuration for GRPO training.
+
+    See :class:`mud_puppy.jax_rl.GRPOConfig` for full documentation.
+    """
+
+    from .jax_rl import GRPOConfig as _GRPOConfig
+
+    return _GRPOConfig(*args, **kwargs)
+
+
+def run_jax_grpo_training(*args, **kwargs):
+    """Run GRPO training using JAX backend.
+
+    This is the JAX equivalent of :func:`run_training` for reinforcement
+    learning with GRPO.
+
+    See :func:`mud_puppy.jax_rl.run_jax_grpo_training` for full documentation.
+    """
+
+    from .jax_rl import run_jax_grpo_training as _run_jax_grpo_training
+
+    return _run_jax_grpo_training(*args, **kwargs)
+
+
+# JAX/Flax LoRA exports (lazy imports to avoid heavy dependencies)
+
+
+def LoRAConfig(*args, **kwargs):
+    """Configuration for LoRA (Low-Rank Adaptation) fine-tuning.
+
+    See :class:`mud_puppy.jax_lora.LoRAConfig` for full documentation.
+    """
+
+    from .jax_lora import LoRAConfig as _LoRAConfig
+
+    return _LoRAConfig(*args, **kwargs)
+
+
+def QLoRAConfig(*args, **kwargs):
+    """Configuration for QLoRA (quantized LoRA) fine-tuning.
+
+    Extends LoRAConfig with INT4 base weight quantization settings.
+
+    See :class:`mud_puppy.jax_lora.QLoRAConfig` for full documentation.
+    """
+
+    from .jax_lora import QLoRAConfig as _QLoRAConfig
+
+    return _QLoRAConfig(*args, **kwargs)
+
+
+def LoRADense(*args, **kwargs):
+    """JAX/Flax Dense layer with LoRA adaptation.
+
+    See :class:`mud_puppy.jax_lora.LoRADense` for full documentation.
+    """
+
+    from .jax_lora import LoRADense as _LoRADense
+
+    return _LoRADense(*args, **kwargs)
+
+
+def LoRAAdapter(*args, **kwargs):
+    """Standalone LoRA adapter for adding to existing layers.
+
+    See :class:`mud_puppy.jax_lora.LoRAAdapter` for full documentation.
+    """
+
+    from .jax_lora import LoRAAdapter as _LoRAAdapter
+
+    return _LoRAAdapter(*args, **kwargs)
+
+
+def QLoRADense(*args, **kwargs):
+    """Combined QLoRA layer: quantized base + LoRA adapters.
+
+    See :class:`mud_puppy.jax_lora.QLoRADense` for full documentation.
+    """
+
+    from .jax_lora import QLoRADense as _QLoRADense
+
+    return _QLoRADense(*args, **kwargs)
+
+
+def merge_lora_params(*args, **kwargs):
+    """Merge LoRA weights back into base model weights.
+
+    See :func:`mud_puppy.jax_lora.merge_lora_params` for full documentation.
+    """
+
+    from .jax_lora import merge_lora_params as _merge_lora_params
+
+    return _merge_lora_params(*args, **kwargs)
+
+
+def init_lora_from_pretrained(*args, **kwargs):
+    """Initialize LoRA parameters for a pretrained model.
+
+    See :func:`mud_puppy.jax_lora.init_lora_from_pretrained` for full documentation.
+    """
+
+    from .jax_lora import init_lora_from_pretrained as _init_lora_from_pretrained
+
+    return _init_lora_from_pretrained(*args, **kwargs)
