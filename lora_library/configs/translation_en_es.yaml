@@ -1,0 +1,48 @@
+# English to Spanish Translation Adapter Configuration
+# Specialized for translation tasks
+
+name: translation_en_es
+task: translation
+description: |
+  English to Spanish translation adapter trained on parallel corpora.
+  Optimized for accurate, fluent translations with cultural context awareness.
+
+# LoRA Configuration
+r: 24
+alpha: 48.0
+dropout: 0.1
+target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+use_rslora: false
+bias: none
+
+# Training Hyperparameters
+hyperparameters:
+  learning_rate: 1e-4
+  batch_size: 8
+  gradient_accumulation: 4
+  num_epochs: 3
+  warmup_ratio: 0.1
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  lr_scheduler: cosine
+  precision: bf16
+  seed: 42
+
+# Dataset Configuration
+dataset:
+  path: /path/to/translation_en_es.jsonl
+  format: jsonl
+  max_length: 1024
+  preprocessing_workers: 4
+  streaming: false
+  input_column: en
+  output_column: es
+
+enabled: true

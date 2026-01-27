@@ -1,0 +1,47 @@
+# General Assistant Adapter Configuration
+# Balanced adapter for general-purpose assistance
+
+name: assistant
+task: instruction
+description: |
+  General-purpose assistant adapter trained on instruction-following data.
+  Balanced configuration for helpfulness, accuracy, and safety.
+
+# LoRA Configuration
+r: 16
+alpha: 32.0
+dropout: 0.05
+target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+use_rslora: false
+bias: none
+
+# Training Hyperparameters
+hyperparameters:
+  learning_rate: 1e-4
+  batch_size: 4
+  gradient_accumulation: 8
+  num_epochs: 3
+  warmup_ratio: 0.1
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  lr_scheduler: cosine
+  precision: bf16
+  seed: 42
+
+# Dataset Configuration
+dataset:
+  path: /path/to/assistant_dataset.jsonl
+  format: openai  # OpenAI chat format
+  max_length: 2048
+  preprocessing_workers: 4
+  streaming: false
+  messages_column: messages
+
+enabled: true

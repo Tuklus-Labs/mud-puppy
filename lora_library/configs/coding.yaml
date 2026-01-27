@@ -1,0 +1,49 @@
+# Coding Adapter Configuration
+# Specialized for code generation and completion tasks
+
+name: coding
+task: code
+description: |
+  Code generation adapter optimized for Python, JavaScript, and general
+  programming tasks. Trained on a mix of code completion, documentation
+  generation, and code explanation tasks.
+
+# LoRA Configuration
+r: 32
+alpha: 64.0
+dropout: 0.05
+target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+use_rslora: false
+bias: none
+
+# Training Hyperparameters
+hyperparameters:
+  learning_rate: 1e-4
+  batch_size: 4
+  gradient_accumulation: 8
+  num_epochs: 3
+  warmup_ratio: 0.1
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  lr_scheduler: cosine
+  precision: bf16
+  seed: 42
+
+# Dataset Configuration
+dataset:
+  path: /path/to/code_dataset.jsonl
+  format: jsonl
+  max_length: 4096
+  preprocessing_workers: 4
+  streaming: false
+  input_column: prompt
+  output_column: code
+
+enabled: true

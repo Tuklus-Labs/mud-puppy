@@ -1,0 +1,46 @@
+# Math Adapter Configuration
+# Specialized for mathematical reasoning and problem solving
+
+name: math
+task: math
+description: |
+  Mathematical reasoning adapter trained on GSM8K and MATH datasets.
+  Optimized for step-by-step problem solving with chain-of-thought reasoning.
+
+# LoRA Configuration
+r: 16
+alpha: 32.0
+dropout: 0.1
+target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+use_rslora: true  # RSLoRA for better stability on reasoning tasks
+bias: none
+
+# Training Hyperparameters
+hyperparameters:
+  learning_rate: 2e-4
+  batch_size: 8
+  gradient_accumulation: 4
+  num_epochs: 5
+  warmup_ratio: 0.05
+  weight_decay: 0.01
+  max_grad_norm: 0.5
+  lr_scheduler: cosine
+  precision: bf16
+  seed: 42
+
+# Dataset Configuration
+dataset:
+  path: /path/to/math_dataset.jsonl
+  format: gsm8k
+  max_length: 2048
+  preprocessing_workers: 4
+  streaming: false
+
+enabled: true

@@ -1,0 +1,44 @@
+# Creative Writing Adapter Configuration
+# Specialized for creative writing, storytelling, and roleplay
+
+name: creative
+task: instruction
+description: |
+  Creative writing adapter trained on fiction, poetry, and roleplay datasets.
+  Optimized for engaging, imaginative, and stylistically varied outputs.
+  Lower rank to preserve model creativity while adapting style.
+
+# LoRA Configuration
+r: 8
+alpha: 16.0
+dropout: 0.0  # No dropout to preserve expressiveness
+target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+use_rslora: false
+bias: none
+
+# Training Hyperparameters
+hyperparameters:
+  learning_rate: 5e-5  # Lower LR to avoid overfitting
+  batch_size: 2
+  gradient_accumulation: 16
+  num_epochs: 2
+  warmup_ratio: 0.1
+  weight_decay: 0.0  # No weight decay for creative tasks
+  max_grad_norm: 1.0
+  lr_scheduler: cosine
+  precision: bf16
+  seed: 42
+
+# Dataset Configuration
+dataset:
+  path: /path/to/creative_dataset.jsonl
+  format: sharegpt
+  max_length: 4096
+  preprocessing_workers: 4
+  streaming: false
+
+enabled: true
