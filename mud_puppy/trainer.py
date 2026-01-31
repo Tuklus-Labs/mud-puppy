@@ -26,7 +26,6 @@ from datasets import load_dataset
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    AutoModelForVision2Seq,
     Trainer,
     TrainingArguments,
     DataCollatorForLanguageModeling,
@@ -35,6 +34,12 @@ from transformers import (
     PreTrainedModel,
     PreTrainedTokenizer,
 )
+
+# Optional vision import (not available in all transformers versions)
+try:
+    from transformers import AutoModelForVision2Seq
+except ImportError:
+    AutoModelForVision2Seq = None
 
 from .config import TrainingConfig
 
@@ -239,6 +244,11 @@ def load_model(config: TrainingConfig):
 
     # Multimodal: delegate to vision-language model class
     if config.finetuning_method == "multimodal":
+        if AutoModelForVision2Seq is None:
+            raise RuntimeError(
+                "Multimodal training requires AutoModelForVision2Seq, "
+                "which is not available in this version of transformers"
+            )
         try:
             model = AutoModelForVision2Seq.from_pretrained(
                 config.model_name_or_path,
@@ -320,16 +330,32 @@ def load_model(config: TrainingConfig):
 
     # Standard full / LoRA / other methods
     else:
+        # ROCm fix: Load to CPU first, then move to GPU
+        # Transformers' automatic device_map causes segfaults on ROCm
+        dtype_map = {
+            "fp16": torch.float16,
+            "bf16": torch.bfloat16,
+            "fp32": torch.float32,
+        }
+        model_dtype = dtype_map.get(config.precision, torch.float16)
+
         try:
             model = AutoModelForCausalLM.from_pretrained(
                 config.model_name_or_path,
                 trust_remote_code=config.trust_remote_code,
-                device_map=None if config.stream else config.device_map,
+                dtype=model_dtype,
+                device_map=None,  # Load to CPU
+                low_cpu_mem_usage=True,
             )
         except OSError as e:
             raise RuntimeError(
                 f"Failed to load model from {config.model_name_or_path}"
             ) from e
+
+        # Move to GPU if available and not streaming
+        if not config.stream and torch.cuda.is_available():
+            print("[mud-puppy] Moving model to GPU...")
+            model = model.to("cuda")
 
     # Streaming: keep model on CPU and stream leaf modules to active device
     if config.stream:
@@ -437,7 +463,25 @@ def create_training_args(config: TrainingConfig) -> TrainingArguments:
     precision = config.precision
     fp16 = precision == "fp16"
     bf16 = precision == "bf16"
-    report_to = None if config.log_with == "none" else [config.log_with]
+
+    # ROCm bf16 detection fix: HF TrainingArguments doesn't properly detect ROCm support
+    if bf16 and torch.cuda.is_available():
+        # Check if bf16 is actually supported on this GPU
+        try:
+            # Try to create a bf16 tensor on GPU - this will fail if not supported
+            test_tensor = torch.zeros(1, dtype=torch.bfloat16, device="cuda")
+            del test_tensor
+            print("[mud-puppy] bf16 support verified on GPU")
+        except (RuntimeError, AssertionError):
+            print("[mud-puppy] bf16 not supported on this GPU, falling back to fp16")
+            bf16 = False
+            fp16 = True
+    elif bf16 and not torch.cuda.is_available():
+        print("[mud-puppy] No GPU available, disabling bf16")
+        bf16 = False
+
+    # transformers 5.0 changed report_to behavior - empty list means no reporting
+    report_to = [] if config.log_with == "none" else [config.log_with]
 
     return TrainingArguments(
         output_dir=config.output_dir,
@@ -713,7 +757,7 @@ def run_training(config: TrainingConfig) -> None:
         "train_dataset": train_dataset,
         "eval_dataset": eval_dataset,
         "data_collator": data_collator,
-        "tokenizer": tokenizer,
+        "processing_class": tokenizer,  # transformers 5.0 renamed tokenizer to processing_class
         "callbacks": callbacks,
     }
 
