@@ -26,6 +26,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--output", default="./outputs", dest="output", help="output directory"
     )
     parser.add_argument(
+        "--quant-backend",
+        dest="quant_backend",
+        default="int4",
+        choices=["int4", "mxfp4"],
+        help="quantization backend for qlora: int4 (row-wise) or mxfp4 (block-wise)",
+    )
+    parser.add_argument(
         "--preference",
         dest="preference",
         help="preference method (e.g. dpo, ipo, kto, orpo)",
@@ -209,6 +216,7 @@ def main() -> None:
         merge_precision=args.merge_precision,
         distributed=args.distributed,
         local_rank=args.local_rank,
+        quant_backend=args.quant_backend,
     )
 
     # Optional training hyperparameters from CLI override dataclass defaults

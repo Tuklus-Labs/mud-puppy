@@ -53,6 +53,9 @@ mud-puppy meta-llama/Llama-3-8B data.jsonl --method lora --output ./lora-outputs
 
 # QLoRA (4-bit quantized base + LoRA)
 mud-puppy meta-llama/Llama-3-8B data.jsonl --method qlora --output ./qlora-outputs
+
+# QLoRA with MXFP4 (block-wise 4-bit, better for varying weight distributions)
+mud-puppy meta-llama/Llama-3-8B data.jsonl --method qlora --quant-backend mxfp4 --output ./qlora-mxfp4
 ```
 
 ### Preference Tuning
@@ -181,6 +184,7 @@ LoRA Options:
   --lora-targets MODULES    Comma-separated list of target modules
   --merge-lora              Merge LoRA weights after training
   --merge-precision PREC    Precision for merged model: fp16, bf16, fp32
+  --quant-backend BACKEND   Quantization backend for QLoRA: int4 (default) or mxfp4
 
 Memory Optimization:
   --device-map MAP          Device map: auto, pipeline, or custom
@@ -233,9 +237,13 @@ run_training(config)
 
 ```python
 from mud_puppy import quantize_model_4bit, quantize_model_gptq, apply_qat, convert_qat
+from mud_puppy.mxfp4_rocm import quantize_model_mx4
 
-# 4-bit quantization (for QLoRA)
+# 4-bit quantization (for QLoRA) - row-wise scales
 model = quantize_model_4bit(model, dtype=torch.bfloat16)
+
+# MXFP4 quantization (for QLoRA) - block-wise scales, better for varying weight distributions
+model = quantize_model_mx4(model, block_size=32)
 
 # GPTQ quantization
 model = quantize_model_gptq(model, bits=4)

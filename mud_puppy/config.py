@@ -44,6 +44,10 @@ class TrainingConfig:
         ]
     )
 
+    # Quantization backend for QLoRA
+    quant_backend: str = "int4"  # int4 (bnb_rocm) or mxfp4 (block-scaled)
+    quant_block_size: int = 32   # Block size for mxfp4 quantization
+
     # Method-specific switches (currently mostly informational)
     qat: bool = False
     grpo: bool = False

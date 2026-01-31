@@ -74,14 +74,23 @@ def _prepare_model_for_kbit_training_rocm(model: nn.Module) -> None:
         if isinstance(module, nn.Embedding):
             module.float()
 
-    # Ensure quantized weights are frozen (Linear4bit already does this, but be safe)
+    # Ensure quantized weights are frozen (Linear4bit/LinearMX4 already do this, but be safe)
     from .bnb_rocm import Linear4bit
+    try:
+        from .mxfp4_rocm import LinearMX4
+    except ImportError:
+        LinearMX4 = None
+
     for module in model.modules():
         if isinstance(module, Linear4bit):
             # Base weight should be frozen, LoRA adapters will be trainable
             module.weight.requires_grad = False
             if module.bias is not None:
                 module.bias.requires_grad = False
+        elif LinearMX4 is not None and isinstance(module, LinearMX4):
+            # MXFP4: packed weights are buffers (already frozen), bias is trainable
+            if module.bias is not None:
+                module.bias.requires_grad = False  # Will be enabled by LoRA if needed
 
     # Enable input gradients so LoRA can receive gradients
     if hasattr(model, 'enable_input_require_grads'):
@@ -411,8 +420,6 @@ def load_model(config: TrainingConfig):
 
     # QLoRA: load in 16-bit, apply 4-bit quantization, prepare for k-bit training
     elif config.finetuning_method == "qlora":
-        from .bnb_rocm import quantize_model_4bit
-
         model_dtype = torch.bfloat16 if config.precision == "bf16" else torch.float16
 
         # ROCm fix: Load to CPU first, then move to GPU (avoid device_map segfaults)
@@ -429,9 +436,17 @@ def load_model(config: TrainingConfig):
                 f"Failed to load model from {config.model_name_or_path}"
             ) from e
 
-        # Apply 4-bit quantization (ROCm-native, no bitsandbytes needed)
-        print("[mud-puppy] Applying 4-bit quantization (ROCm-native)...")
-        model = quantize_model_4bit(model, dtype=model_dtype)
+        # Apply 4-bit quantization based on backend choice
+        quant_backend = getattr(config, "quant_backend", "int4")
+        if quant_backend == "mxfp4":
+            from .mxfp4_rocm import quantize_model_mx4
+            block_size = getattr(config, "quant_block_size", 32)
+            print(f"[mud-puppy] Applying MXFP4 quantization (block_size={block_size})...")
+            model = quantize_model_mx4(model, block_size=block_size)
+        else:
+            from .bnb_rocm import quantize_model_4bit
+            print("[mud-puppy] Applying INT4 quantization (ROCm-native)...")
+            model = quantize_model_4bit(model, dtype=model_dtype)
 
         # Move to GPU
         if torch.cuda.is_available():

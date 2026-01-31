@@ -55,6 +55,9 @@ __all__ = [
     "CPUOffloadOptimizer",
     "OffloadConfig",
     "wrap_optimizer_for_offload",
+    # MXFP4 (block-wise 4-bit quantization)
+    "quantize_model_mx4",
+    "LinearMX4",
 ]
 
 from .config import TrainingConfig
@@ -313,3 +316,30 @@ def wrap_optimizer_for_offload(*args, **kwargs):
     """
     from .zero_offload import wrap_optimizer_for_offload as _wrap
     return _wrap(*args, **kwargs)
+
+
+def quantize_model_mx4(*args, **kwargs):
+    """Quantize a model's linear layers to MXFP4 (block-wise 4-bit).
+
+    MXFP4 uses block-wise scales instead of row-wise, which can better
+    adapt to varying weight distributions within layers. Compatible with
+    PEFT/LoRA for QLoRA-style fine-tuning.
+
+    Args:
+        model: The model to quantize
+        block_size: Block size for quantization (default 32)
+        skip_modules: List of module name patterns to skip
+        min_size: Minimum number of elements to quantize
+    """
+    from .mxfp4_rocm import quantize_model_mx4 as _quantize_model_mx4
+    return _quantize_model_mx4(*args, **kwargs)
+
+
+def LinearMX4(*args, **kwargs):
+    """MXFP4 quantized linear layer.
+
+    Block-wise 4-bit quantization with shared exponents per block.
+    Inherits from nn.Linear for PEFT/LoRA compatibility.
+    """
+    from .mxfp4_rocm import LinearMX4 as _LinearMX4
+    return _LinearMX4(*args, **kwargs)
