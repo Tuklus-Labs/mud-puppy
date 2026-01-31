@@ -281,12 +281,81 @@ class DynamicBatchSampler(Sampler):
 
 
 class ZeroOffloadCallback(TrainerCallback):
-    """Callback to offload optimizer states to CPU memory."""
+    """Callback to offload optimizer states to CPU memory.
 
-    def on_step_begin(self, args, state, control, **kwargs):
-        # Optimizer state offloading is handled by DeepSpeed/FSDP
-        # This callback can be extended for custom offloading logic
-        pass
+    This is a ROCm-native implementation of ZeRO-Offload that doesn't
+    require DeepSpeed (which is CUDA-only).
+
+    The approach:
+    - After each optimizer step, move optimizer states to CPU
+    - Before each step, states are automatically moved back as needed
+    - This saves VRAM between steps (optimizer states are 2x model size for Adam)
+    """
+
+    def __init__(self):
+        self._optimizer_wrapped = False
+        self._cpu_states = {}
+        self._cpu = torch.device("cpu")
+        self._gpu = torch.device("cuda") if torch.cuda.is_available() else self._cpu
+
+    def on_train_begin(self, args, state, control, model=None, **kwargs):
+        """Initialize CPU offload structures."""
+        print("[mud-puppy] ZeRO-Offload enabled (ROCm-native)")
+
+    def on_step_end(self, args, state, control, model=None, optimizer=None, **kwargs):
+        """After optimizer step, offload states to CPU."""
+        if optimizer is None:
+            return
+
+        # Move optimizer states to CPU to free VRAM
+        for group in optimizer.param_groups:
+            for param in group["params"]:
+                if param not in optimizer.state:
+                    continue
+
+                opt_state = optimizer.state[param]
+                pid = id(param)
+
+                # Initialize CPU storage for this param
+                if pid not in self._cpu_states:
+                    self._cpu_states[pid] = {}
+
+                # Move each state tensor to CPU
+                for key, val in opt_state.items():
+                    if isinstance(val, torch.Tensor) and val.device.type == "cuda":
+                        # Move to CPU (pinned memory for faster transfer back)
+                        if pid not in self._cpu_states or key not in self._cpu_states[pid]:
+                            cpu_tensor = torch.empty(
+                                val.shape, dtype=val.dtype, device=self._cpu,
+                                pin_memory=True
+                            )
+                            self._cpu_states[pid][key] = cpu_tensor
+
+                        self._cpu_states[pid][key].copy_(val, non_blocking=True)
+                        opt_state[key] = self._cpu_states[pid][key]
+
+        # Clear CUDA cache
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def on_step_begin(self, args, state, control, model=None, optimizer=None, **kwargs):
+        """Before optimizer step, move states back to GPU."""
+        if optimizer is None:
+            return
+
+        # Move optimizer states back to GPU for the step
+        for group in optimizer.param_groups:
+            for param in group["params"]:
+                if param not in optimizer.state:
+                    continue
+
+                opt_state = optimizer.state[param]
+
+                for key, val in opt_state.items():
+                    if isinstance(val, torch.Tensor) and val.device.type == "cpu":
+                        # Move back to GPU
+                        gpu_tensor = val.to(self._gpu, non_blocking=True)
+                        opt_state[key] = gpu_tensor
 
 
 class LoggingCallback(TrainerCallback):

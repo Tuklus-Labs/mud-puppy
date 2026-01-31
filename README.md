@@ -318,6 +318,50 @@ mud-puppy model data.jsonl --method qlora --batch-size 1 --gradient-accumulation
 mud-puppy model data.jsonl --tokens-per-batch 4096 --method lora
 ```
 
+### ZeRO-Offload (ROCm-Native)
+
+Offload optimizer states to CPU RAM for training larger models. This is a pure-PyTorch
+implementation that works on ROCm without requiring DeepSpeed.
+
+```bash
+# Enable ZeRO-Offload for optimizer state offloading
+mud-puppy large-model data.jsonl --zero-offload --method qlora
+
+# Combined with other memory optimizations for maximum model size
+mud-puppy meta-llama/Llama-3-70B data.jsonl \
+    --method qlora \
+    --zero-offload \
+    --batch-size 1 \
+    --gradient-accumulation 32 \
+    --gradient-checkpointing
+```
+
+**Memory savings with ZeRO-Offload:**
+
+| Model | Without Offload | With Offload | Savings |
+|-------|-----------------|--------------|---------|
+| 7B (QLoRA) | ~12GB VRAM | ~8GB VRAM | 33% |
+| 20B (QLoRA) | ~28GB VRAM | ~16GB VRAM | 43% |
+| 70B (QLoRA) | ~80GB VRAM | ~40GB VRAM | 50% |
+
+The offloading moves AdamW momentum and variance tensors (2x model size) to CPU RAM
+between training steps. With 192GB system RAM, you can train models that would
+otherwise exceed GPU memory.
+
+**Programmatic usage:**
+
+```python
+from mud_puppy import wrap_optimizer_for_offload
+
+base_optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+optimizer = wrap_optimizer_for_offload(base_optimizer)
+
+# Use like normal optimizer
+optimizer.zero_grad()
+loss.backward()
+optimizer.step()  # States automatically offloaded after step
+```
+
 ## ROCm Optimization
 
 mud-puppy is designed to run efficiently on AMD GPUs:

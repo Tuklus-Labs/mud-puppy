@@ -51,6 +51,10 @@ __all__ = [
     "QLoRADense",
     "merge_lora_params",
     "init_lora_from_pretrained",
+    # ZeRO-Offload (ROCm-native)
+    "CPUOffloadOptimizer",
+    "OffloadConfig",
+    "wrap_optimizer_for_offload",
 ]
 
 from .config import TrainingConfig
@@ -277,3 +281,35 @@ def init_lora_from_pretrained(*args, **kwargs):
     from .jax_lora import init_lora_from_pretrained as _init_lora_from_pretrained
 
     return _init_lora_from_pretrained(*args, **kwargs)
+
+
+def CPUOffloadOptimizer(*args, **kwargs):
+    """CPU offload optimizer for ZeRO-style memory savings.
+
+    Offloads optimizer states to CPU RAM, enabling training of
+    larger models on limited VRAM.
+    """
+    from .zero_offload import CPUOffloadOptimizer as _CPUOffloadOptimizer
+    return _CPUOffloadOptimizer(*args, **kwargs)
+
+
+def OffloadConfig(*args, **kwargs):
+    """Configuration for CPU offloading."""
+    from .zero_offload import OffloadConfig as _OffloadConfig
+    return _OffloadConfig(*args, **kwargs)
+
+
+def wrap_optimizer_for_offload(*args, **kwargs):
+    """Wrap any optimizer with CPU offloading.
+
+    Args:
+        optimizer: Base PyTorch optimizer
+        offload_optimizer: Offload optimizer states to CPU
+        offload_gradients: Accumulate gradients on CPU
+        pin_memory: Use pinned memory for transfers
+
+    Returns:
+        Wrapped optimizer with CPU offloading
+    """
+    from .zero_offload import wrap_optimizer_for_offload as _wrap
+    return _wrap(*args, **kwargs)
