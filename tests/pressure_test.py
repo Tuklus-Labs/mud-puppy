@@ -192,25 +192,20 @@ def main():
             )
         ))
 
-        # Test 5: QLoRA (if bitsandbytes available)
-        try:
-            import bitsandbytes
-            results.append(test_config(
-                "QLoRA (4-bit)",
-                TrainingConfig(
-                    model_name_or_path=TEST_MODEL,
-                    dataset_path=str(data_path),
-                    output_dir=str(output_dir / "qlora"),
-                    finetuning_method="qlora",
-                    precision="fp16",
-                    batch_size=1,
-                    lora_r=8,
-                    lora_alpha=16,
-                )
-            ))
-        except ImportError:
-            results.append({"name": "QLoRA (4-bit)", "status": "SKIP", "error": "bitsandbytes not installed"})
-            print("\n[QLoRA] SKIPPED - bitsandbytes not installed")
+        # Test 5: QLoRA (ROCm-native 4-bit quantization, no bitsandbytes needed)
+        results.append(test_config(
+            "QLoRA (4-bit ROCm-native)",
+            TrainingConfig(
+                model_name_or_path=TEST_MODEL,
+                dataset_path=str(data_path),
+                output_dir=str(output_dir / "qlora"),
+                finetuning_method="qlora",
+                precision="fp16",
+                batch_size=1,
+                lora_r=8,
+                lora_alpha=16,
+            )
+        ))
 
         # Test 6: Higher LoRA rank
         results.append(test_config(
@@ -253,9 +248,18 @@ def main():
                 results.append({"name": "LoRA + streaming validation", "status": "FAIL", "error": str(e)})
 
         # Test 7b: Streaming + full fine-tuning
-        # NOTE: Streaming mode has known device handling issues on ROCm - skipping for now
-        results.append({"name": "Full fine-tuning + streaming", "status": "SKIP",
-                       "error": "Streaming mode has known device issues (experimental feature)"})
+        results.append(test_config(
+            "Full fine-tuning + streaming",
+            TrainingConfig(
+                model_name_or_path=TEST_MODEL,
+                dataset_path=str(data_path),
+                output_dir=str(output_dir / "full_stream"),
+                finetuning_method="full",
+                precision="fp16",
+                batch_size=1,
+                stream=True,
+            )
+        ))
 
         # Test 8: Different learning rate scheduler
         results.append(test_config(

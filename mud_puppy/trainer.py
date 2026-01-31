@@ -56,12 +56,58 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 
+def _prepare_model_for_kbit_training_rocm(model: nn.Module) -> None:
+    """Prepare a quantized model for k-bit training (ROCm-native).
+
+    This replaces peft's prepare_model_for_kbit_training which requires bitsandbytes.
+    It performs the following:
+    1. Casts LayerNorm and embedding layers to float32 for training stability
+    2. Ensures quantized base weights are frozen
+    3. Enables input gradients for LoRA to work
+    """
+    # Cast normalization layers to float32 for stability
+    for name, module in model.named_modules():
+        if isinstance(module, (nn.LayerNorm, nn.BatchNorm1d, nn.BatchNorm2d)):
+            module.float()
+
+        # Also cast embedding layers
+        if isinstance(module, nn.Embedding):
+            module.float()
+
+    # Ensure quantized weights are frozen (Linear4bit already does this, but be safe)
+    from .bnb_rocm import Linear4bit
+    for module in model.modules():
+        if isinstance(module, Linear4bit):
+            # Base weight should be frozen, LoRA adapters will be trainable
+            module.weight.requires_grad = False
+            if module.bias is not None:
+                module.bias.requires_grad = False
+
+    # Enable input gradients so LoRA can receive gradients
+    if hasattr(model, 'enable_input_require_grads'):
+        model.enable_input_require_grads()
+    else:
+        # Manual fallback
+        def make_inputs_require_grad(module, input, output):
+            output.requires_grad_(True)
+        model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
+
+
 class StreamWrapper(nn.Module):
     """Wrapper that streams model layers to GPU on demand.
 
     This allows training models that don't fit entirely in GPU memory by
-    keeping most layers on CPU and moving them to GPU only when needed
-    during the forward/backward pass.
+    keeping most layers on CPU and moving them to GPU only when needed.
+
+    Strategy:
+    - Keep embedding/lm_head on GPU always (small, always needed)
+    - Move transformer layers to GPU for forward pass
+    - Keep layers on GPU through backward pass
+    - Offload to CPU after optimizer step (via offload_to_cpu method)
+
+    Note: This provides memory savings between training steps, not during
+    the forward/backward pass itself. For true streaming during forward/backward,
+    use gradient checkpointing with this wrapper.
     """
 
     def __init__(self, model: nn.Module):
@@ -69,39 +115,71 @@ class StreamWrapper(nn.Module):
         self.model = model
         self._device = get_device()
         self._cpu = torch.device("cpu")
+        self._on_gpu = False
 
-        # Keep track of which modules are currently on GPU
-        self._active_modules: List[nn.Module] = []
+        # Find the transformer layers (supports LLaMA, GPT-2, etc.)
+        self._layers = self._find_layers()
 
-        # Move all parameters to CPU initially
+        # Move everything to CPU initially
         self.model.to(self._cpu)
 
-        # Register hooks on all leaf modules
-        self._register_hooks()
+        # Keep embedding and output layers on GPU (small and always needed)
+        self._move_endpoints_to_gpu()
 
-    def _register_hooks(self):
-        """Register forward hooks to stream modules to GPU."""
-        for name, module in self.model.named_modules():
-            # Only hook leaf modules (modules without children that have parameters)
-            if len(list(module.children())) == 0 and len(list(module.parameters())) > 0:
-                module.register_forward_pre_hook(self._pre_forward_hook)
-                module.register_forward_hook(self._post_forward_hook)
+    def _find_layers(self) -> List[nn.Module]:
+        """Find the main transformer layers that can be streamed."""
+        # LLaMA-style: model.layers
+        if hasattr(self.model, 'model') and hasattr(self.model.model, 'layers'):
+            return list(self.model.model.layers)
+        # GPT-2 style: transformer.h
+        if hasattr(self.model, 'transformer') and hasattr(self.model.transformer, 'h'):
+            return list(self.model.transformer.h)
+        # Fallback: no streaming possible
+        return []
 
-    def _pre_forward_hook(self, module: nn.Module, inputs):
-        """Move module to GPU before forward pass."""
-        module.to(self._device)
-        self._active_modules.append(module)
+    def _move_endpoints_to_gpu(self):
+        """Move embedding and output projection to GPU (always needed)."""
+        # Move embeddings
+        if hasattr(self.model, 'get_input_embeddings'):
+            emb = self.model.get_input_embeddings()
+            if emb is not None:
+                emb.to(self._device)
 
-    def _post_forward_hook(self, module: nn.Module, inputs, output):
-        """Move module back to CPU after forward pass to save memory."""
-        # Keep a small buffer of active modules for backward pass
-        if len(self._active_modules) > 4:
-            old_module = self._active_modules.pop(0)
-            old_module.to(self._cpu)
-        return output
+        # Move output projection (lm_head)
+        if hasattr(self.model, 'lm_head'):
+            self.model.lm_head.to(self._device)
+
+        # Move final layer norm
+        if hasattr(self.model, 'model') and hasattr(self.model.model, 'norm'):
+            self.model.model.norm.to(self._device)
+        if hasattr(self.model, 'transformer') and hasattr(self.model.transformer, 'ln_f'):
+            self.model.transformer.ln_f.to(self._device)
+
+    def _ensure_on_gpu(self):
+        """Move all layers to GPU for forward/backward pass."""
+        if not self._on_gpu:
+            for layer in self._layers:
+                layer.to(self._device)
+            self._on_gpu = True
+
+    def offload_to_cpu(self):
+        """Move transformer layers back to CPU to free VRAM.
+
+        Call this after optimizer.step() to free memory between training steps.
+        """
+        if self._on_gpu:
+            for layer in self._layers:
+                layer.to(self._cpu)
+            self._on_gpu = False
+            # Clear CUDA cache
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     def forward(self, *args, **kwargs):
-        # Ensure input tensors are on the correct device
+        # Ensure all layers are on GPU for forward pass
+        self._ensure_on_gpu()
+
+        # Move inputs to GPU
         args = tuple(
             a.to(self._device) if isinstance(a, torch.Tensor) else a for a in args
         )
@@ -109,6 +187,7 @@ class StreamWrapper(nn.Module):
             k: v.to(self._device) if isinstance(v, torch.Tensor) else v
             for k, v in kwargs.items()
         }
+
         return self.model(*args, **kwargs)
 
     def __getattr__(self, name: str):
@@ -265,30 +344,35 @@ def load_model(config: TrainingConfig):
     elif config.finetuning_method == "qlora":
         from .bnb_rocm import quantize_model_4bit
 
+        model_dtype = torch.bfloat16 if config.precision == "bf16" else torch.float16
+
+        # ROCm fix: Load to CPU first, then move to GPU (avoid device_map segfaults)
         try:
             model = AutoModelForCausalLM.from_pretrained(
                 config.model_name_or_path,
-                torch_dtype=(
-                    torch.bfloat16 if config.precision == "bf16" else torch.float16
-                ),
+                dtype=model_dtype,
                 trust_remote_code=config.trust_remote_code,
-                device_map=config.device_map,
+                device_map=None,  # Load to CPU
+                low_cpu_mem_usage=True,
             )
         except OSError as e:
             raise RuntimeError(
                 f"Failed to load model from {config.model_name_or_path}"
             ) from e
-        model = quantize_model_4bit(
-            model,
-            dtype=torch.bfloat16 if config.precision == "bf16" else torch.float16,
-        )
-        try:
-            from peft import prepare_model_for_kbit_training
 
-            model = prepare_model_for_kbit_training(model)
-        except Exception:
-            # If peft is not new enough, continue with basic 4-bit weights
-            pass
+        # Apply 4-bit quantization (ROCm-native, no bitsandbytes needed)
+        print("[mud-puppy] Applying 4-bit quantization (ROCm-native)...")
+        model = quantize_model_4bit(model, dtype=model_dtype)
+
+        # Move to GPU
+        if torch.cuda.is_available():
+            print("[mud-puppy] Moving quantized model to GPU...")
+            model = model.to("cuda")
+
+        # Prepare model for k-bit training (ROCm-native implementation)
+        # This replaces peft's prepare_model_for_kbit_training which requires bitsandbytes
+        print("[mud-puppy] Preparing model for k-bit training...")
+        _prepare_model_for_kbit_training_rocm(model)
 
     # GPTQ: either ROCm-native simple GPTQ, or auto-gptq on CUDA
     elif config.finetuning_method == "gptq":
