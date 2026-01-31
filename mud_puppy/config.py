@@ -82,8 +82,11 @@ class TrainingConfig:
 
     def _validate_combinations(self) -> None:
         """Validate combinations of options that are known to be invalid."""
-        if self.finetuning_method == "qlora" and self.stream:
-            raise ValueError("Streaming is not supported with QLoRA")
+        if self.finetuning_method in ("lora", "qlora") and self.stream:
+            raise ValueError(
+                f"Streaming is not supported with {self.finetuning_method.upper()}. "
+                "LoRA modules are added after streaming hooks and won't be properly streamed."
+            )
         if self.tokens_per_batch < 0:
             raise ValueError("tokens_per_batch must be non-negative")
         if self.distributed and torch.cuda.device_count() < 2:

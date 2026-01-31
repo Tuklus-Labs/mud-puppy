@@ -689,6 +689,12 @@ def run_training(config: TrainingConfig) -> None:
     print(f"[mud-puppy] Output: {config.output_dir}")
     print(f"[mud-puppy] Precision: {config.precision}")
 
+    # Warn about incompatible options
+    if config.stream and config.finetuning_method in ("lora", "qlora"):
+        print("[mud-puppy] WARNING: Streaming + LoRA is not supported (LoRA modules won't stream)")
+        print("[mud-puppy] Disabling streaming mode for this training run")
+        config = TrainingConfig(**{**config.__dict__, "stream": False})
+
     # Set up distributed training if requested
     is_distributed = setup_distributed(config)
     if is_distributed:
