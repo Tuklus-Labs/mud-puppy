@@ -64,7 +64,7 @@ d616f70 feat: ROCm-native QLoRA and streaming support
 
 ### Gotchas for Future Sessions
 
-- **Don't use device_map="auto" on ROCm** - causes segfaults, load to CPU then move to GPU
+- **Don't use device_map="auto" on ROCm (with iGPU)** - The 9900X iGPU (gfx1036) is exposed as cuda:1 but segfaults on basic ops. Set `HIP_VISIBLE_DEVICES=0` to hide it, or disable iGPU in BIOS
 - **Linear4bit must inherit nn.Linear** - PEFT won't recognize it as LoRA target otherwise
 - **Streaming + LoRA don't mix** - LoRA modules are added after streaming hooks
 - **Streaming backward pass** - layers must stay on GPU through forward+backward, not just forward
