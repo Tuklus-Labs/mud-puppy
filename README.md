@@ -1,6 +1,10 @@
 # mud-puppy
 
+**ROCm-First LLM Fine-tuning Framework**
+
 mud-puppy is a ROCm-first LLM fine-tuning framework inspired by [Axolotl](https://github.com/OpenAccess-AI-Collective/axolotl). It targets AMD GPUs and is optimized for the `GFX1100` architecture, but should run on any recent ROCm-capable GPU.
+
+Read the [design whitepaper](https://tukluslabs.com/whitepaper-mud-puppy.html) for architecture details.
 
 ## Features
 
