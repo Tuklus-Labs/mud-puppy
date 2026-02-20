@@ -32,6 +32,7 @@ class TrainingConfig:
     # LoRA / QLoRA
     lora_r: int = 8
     lora_alpha: int = 16
+    lora_dropout: float = 0.05
     lora_target_modules: Optional[List[str]] = field(
         default_factory=lambda: [
             "q_proj",
@@ -57,6 +58,7 @@ class TrainingConfig:
 
     # Data / preprocessing
     max_seq_length: int = 0  # 0 = use model default (capped at 2048)
+    response_only: bool = True  # Mask prompt tokens in loss (train on response only)
     use_chat_template: bool = True
     trust_remote_code: bool = False
     dataloader_workers: int = 0
@@ -135,6 +137,8 @@ class TrainingConfig:
 
         if self.log_with not in {"none", "tensorboard", "wandb"}:
             raise ValueError(f"Unsupported logging backend: {self.log_with}")
+        if not 0.0 <= self.lora_dropout <= 1.0:
+            raise ValueError("lora_dropout must be between 0.0 and 1.0")
 
         self._validate_paths()
         self._validate_combinations()

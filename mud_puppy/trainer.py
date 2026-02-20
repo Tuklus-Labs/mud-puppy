@@ -28,7 +28,6 @@ from transformers import (
     AutoTokenizer,
     Trainer,
     TrainingArguments,
-    DataCollatorForLanguageModeling,
     TrainerCallback,
     EarlyStoppingCallback,
     PreTrainedModel,
@@ -435,6 +434,54 @@ class MudPuppyTrainer(Trainer):
         )
 
 
+class CausalLMCollator:
+    """Pad variable-length Causal LM examples while preserving label masks."""
+
+    def __init__(self, tokenizer: PreTrainedTokenizer):
+        self.tokenizer = tokenizer
+
+    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        has_labels = "labels" in features[0]
+        labels = []
+        cleaned = []
+
+        for feature in features:
+            item = {}
+            for key, value in feature.items():
+                if isinstance(value, torch.Tensor):
+                    value = value.tolist()
+                item[key] = value
+
+            item.pop("length", None)
+
+            if has_labels and "labels" in item:
+                labels.append(item.pop("labels"))
+
+            cleaned.append(item)
+
+        batch = self.tokenizer.pad(cleaned, padding=True, return_tensors="pt")
+
+        if has_labels and labels:
+            max_len = batch["input_ids"].shape[1]
+            label_batch = torch.full((len(labels), max_len), -100, dtype=torch.long)
+
+            for i, lbl in enumerate(labels):
+                if isinstance(lbl, torch.Tensor):
+                    lbl = lbl.tolist()
+                lbl = list(lbl)[:max_len]
+                if lbl:
+                    label_batch[i, : len(lbl)] = torch.tensor(lbl, dtype=torch.long)
+
+            batch["labels"] = label_batch
+        else:
+            labels_tensor = batch["input_ids"].clone()
+            if self.tokenizer.pad_token_id is not None:
+                labels_tensor[labels_tensor == self.tokenizer.pad_token_id] = -100
+            batch["labels"] = labels_tensor
+
+        return batch
+
+
 def load_model(config: TrainingConfig):
     """Load the base model and tokenizer with optional quantization.
 
@@ -636,7 +683,7 @@ def prepare_lora(model: nn.Module, config: TrainingConfig) -> nn.Module:
         r=config.lora_r,
         lora_alpha=config.lora_alpha,
         target_modules=target_modules,
-        lora_dropout=0.05,
+        lora_dropout=config.lora_dropout,
         bias="none",
         task_type="CAUSAL_LM",
     )
@@ -740,95 +787,178 @@ def load_and_preprocess_dataset(
     """Load and preprocess the training dataset.
 
     Supports JSONL format with chat-style messages or simple text fields.
-    """
-    # Load the dataset
-    dataset = load_dataset("json", data_files=config.dataset_path, split="train")
 
-    # Determine the format and preprocess accordingly
+    For instruction-style schemas, labels are masked to optimize only response
+    tokens (prompt/context tokens are set to -100).
+    """
+    dataset = load_dataset("json", data_files=config.dataset_path, split="train")
     columns = dataset.column_names
 
-    def tokenize_chat(examples: Dict[str, Any]) -> Dict[str, Any]:
-        """Tokenize chat-formatted examples."""
-        texts = []
+    # Use config max_seq_length if set, else model default (capped at 2048)
+    if config.max_seq_length > 0:
+        max_len = config.max_seq_length
+    else:
+        max_len = min(getattr(tokenizer, "model_max_length", 2048), 2048)
+        # GPT-2 and similar models have 1024 max positions
+        if max_len > 1024 and hasattr(tokenizer, "name_or_path"):
+            if "gpt2" in tokenizer.name_or_path.lower():
+                max_len = 1024
 
-        for i in range(len(examples[columns[0]])):
-            # Try to extract messages in various formats
-            if "messages" in columns:
-                messages = examples["messages"][i]
-                if (
-                    config.use_chat_template
-                    and hasattr(tokenizer, "apply_chat_template")
-                    and tokenizer.chat_template is not None
-                ):
-                    try:
-                        text = tokenizer.apply_chat_template(
-                            messages, tokenize=False, add_generation_prompt=False
-                        )
-                    except Exception:
-                        # Fallback if chat template fails
-                        text = "\n".join(
-                            f"{m.get('role', 'user')}: {m.get('content', '')}"
-                            for m in messages
-                        )
-                else:
-                    # Fallback: concatenate message contents
-                    text = "\n".join(
-                        f"{m.get('role', 'user')}: {m.get('content', '')}"
-                        for m in messages
-                    )
-            elif "text" in columns:
-                text = examples["text"][i]
-            elif "input" in columns and "output" in columns:
-                text = f"{examples['input'][i]}\n{examples['output'][i]}"
-            elif "prompt" in columns and "completion" in columns:
-                text = f"{examples['prompt'][i]}{examples['completion'][i]}"
-            elif "instruction" in columns:
-                text = examples["instruction"][i]
-                if "response" in columns:
-                    text = f"{text}\n{examples['response'][i]}"
-            else:
-                # Use first text-like column
-                text = str(examples[columns[0]][i])
+    def _safe_text(value: Any) -> str:
+        if value is None:
+            return ""
+        return str(value)
 
-            texts.append(text)
+    def _messages_to_fallback_text(messages: List[Dict[str, Any]]) -> str:
+        return "\n".join(
+            f"{m.get('role', 'user')}: {m.get('content', '')}" for m in messages
+        )
 
-        # Tokenize - use config max_seq_length if set, else model default (capped at 2048)
-        if config.max_seq_length > 0:
-            max_len = config.max_seq_length
-        else:
-            max_len = min(
-                getattr(tokenizer, "model_max_length", 2048),
-                2048
-            )
-            # GPT-2 and similar models have 1024 max positions
-            if max_len > 1024 and hasattr(tokenizer, "name_or_path"):
-                if "gpt2" in tokenizer.name_or_path.lower():
-                    max_len = 1024
-
-        tokenized = tokenizer(
-            texts,
+    def _encode_text(text: str) -> Dict[str, List[int]]:
+        return tokenizer(
+            text,
             truncation=True,
             padding=False,
             max_length=max_len,
             return_tensors=None,
         )
 
-        # Add length column for dynamic batching
-        tokenized["length"] = [len(ids) for ids in tokenized["input_ids"]]
+    def _encode_messages(messages: List[Dict[str, Any]]) -> Dict[str, List[int]]:
+        if (
+            config.use_chat_template
+            and hasattr(tokenizer, "apply_chat_template")
+            and tokenizer.chat_template is not None
+        ):
+            try:
+                return tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=True,
+                    add_generation_prompt=False,
+                    truncation=True,
+                    max_length=max_len,
+                    return_dict=True,
+                )
+            except Exception:
+                pass
 
-        return tokenized
+        return _encode_text(_messages_to_fallback_text(messages))
 
-    # Apply tokenization
+    def _prompt_token_len_for_messages(messages: List[Dict[str, Any]]) -> int:
+        if not isinstance(messages, list) or not messages:
+            return 0
+        last = messages[-1]
+        if not isinstance(last, dict) or last.get("role") != "assistant":
+            return 0
+
+        prompt_messages = messages[:-1]
+
+        if (
+            config.use_chat_template
+            and hasattr(tokenizer, "apply_chat_template")
+            and tokenizer.chat_template is not None
+        ):
+            try:
+                prompt_enc = tokenizer.apply_chat_template(
+                    prompt_messages,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    truncation=True,
+                    max_length=max_len,
+                    return_dict=True,
+                )
+                return len(prompt_enc["input_ids"])
+            except Exception:
+                pass
+
+        prompt_text = _messages_to_fallback_text(prompt_messages + [{"role": "assistant", "content": ""}])
+        prompt_enc = _encode_text(prompt_text)
+        return len(prompt_enc["input_ids"])
+
+    def tokenize_chat(examples: Dict[str, Any]) -> Dict[str, Any]:
+        input_ids_all: List[List[int]] = []
+        attention_masks_all: List[List[int]] = []
+        labels_all: List[List[int]] = []
+        lengths: List[int] = []
+
+        example_count = len(examples[columns[0]])
+
+        for i in range(example_count):
+            prompt_len = 0
+
+            if "messages" in columns:
+                messages = examples["messages"][i]
+                if isinstance(messages, list):
+                    enc = _encode_messages(messages)
+                    prompt_len = _prompt_token_len_for_messages(messages)
+                else:
+                    enc = _encode_text(_safe_text(messages))
+
+            elif "input" in columns and "output" in columns:
+                prompt_text = _safe_text(examples["input"][i])
+                completion_text = _safe_text(examples["output"][i])
+                enc = _encode_text(f"{prompt_text}\n{completion_text}")
+                prompt_len = len(_encode_text(prompt_text)["input_ids"])
+
+            elif "prompt" in columns and "completion" in columns:
+                prompt_text = _safe_text(examples["prompt"][i])
+                completion_text = _safe_text(examples["completion"][i])
+                enc = _encode_text(f"{prompt_text}{completion_text}")
+                prompt_len = len(_encode_text(prompt_text)["input_ids"])
+
+            elif "instruction" in columns and "response" in columns:
+                prompt_text = _safe_text(examples["instruction"][i])
+                completion_text = _safe_text(examples["response"][i])
+                enc = _encode_text(f"{prompt_text}\n{completion_text}")
+                prompt_len = len(_encode_text(prompt_text)["input_ids"])
+
+            elif "text" in columns:
+                text = _safe_text(examples["text"][i])
+                enc = _encode_text(text)
+                # Try to find response boundary for common delimiters
+                if config.response_only:
+                    for delim in ("### Output:", "### Response:", "### Answer:",
+                                  "\nAssistant:", "\nassistant:"):
+                        idx = text.find(delim)
+                        if idx >= 0:
+                            prompt_text = text[:idx + len(delim)]
+                            prompt_len = len(_encode_text(prompt_text)["input_ids"])
+                            break
+
+            elif "instruction" in columns:
+                enc = _encode_text(_safe_text(examples["instruction"][i]))
+
+            else:
+                enc = _encode_text(_safe_text(examples[columns[0]][i]))
+
+            input_ids = list(enc["input_ids"])
+            attention_mask = list(enc["attention_mask"])
+            prompt_len = min(prompt_len, len(input_ids))
+
+            labels = input_ids.copy()
+            if config.response_only and prompt_len > 0:
+                labels[:prompt_len] = [-100] * prompt_len
+
+            input_ids_all.append(input_ids)
+            attention_masks_all.append(attention_mask)
+            labels_all.append(labels)
+            lengths.append(len(input_ids))
+
+        return {
+            "input_ids": input_ids_all,
+            "attention_mask": attention_masks_all,
+            "labels": labels_all,
+            "length": lengths,
+        }
+
     dataset = dataset.map(
         tokenize_chat,
         batched=True,
-        num_proc=config.preprocessing_workers,
+        num_proc=config.preprocessing_workers if config.preprocessing_workers > 1 else None,
         remove_columns=columns,
         desc="Tokenizing dataset",
     )
 
-    # Set format for PyTorch
-    dataset.set_format(type="torch", columns=["input_ids", "attention_mask"])
+    dataset.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
 
     return dataset
 
@@ -911,6 +1041,13 @@ def run_training(config: TrainingConfig) -> None:
     print(f"[mud-puppy] Dataset: {config.dataset_path}")
     print(f"[mud-puppy] Output: {config.output_dir}")
     print(f"[mud-puppy] Precision: {config.precision}")
+    if config.response_only:
+        print("[mud-puppy] Response-only loss masking enabled (prompt tokens ignored)")
+    if config.finetuning_method in ("lora", "qlora") and config.learning_rate <= 3e-5:
+        print(
+            "[mud-puppy] WARNING: very low LR for LoRA/QLoRA. "
+            "Typical range is 1e-4 to 3e-4."
+        )
 
     # Warn about incompatible options
     if config.stream and config.finetuning_method in ("lora", "qlora"):
@@ -965,10 +1102,7 @@ def run_training(config: TrainingConfig) -> None:
     training_args = create_training_args(config)
 
     # Set up data collator
-    data_collator = DataCollatorForLanguageModeling(
-        tokenizer=tokenizer,
-        mlm=False,
-    )
+    data_collator = CausalLMCollator(tokenizer=tokenizer)
 
     # Set up callbacks
     callbacks = [LoggingCallback(config.log_with)]
