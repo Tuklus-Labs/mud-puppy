@@ -389,6 +389,21 @@ class LoggingCallback(TrainerCallback):
             print(f"[mud-puppy] step {state.global_step}: loss={loss}, lr={lr}")
 
 
+class ROCmCacheCallback(TrainerCallback):
+    """Flush the HIP memory allocator cache periodically on ROCm.
+
+    The ROCm/HIP caching allocator does not return freed blocks to the device.
+    Without periodic empty_cache() calls, the allocator cache grows until it
+    fills all VRAM, causing swap thrashing and 50-100x slowdowns.
+
+    This is a no-op on CUDA (the CUDA allocator manages this automatically).
+    """
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if is_rocm() and state.global_step % args.gradient_accumulation_steps == 0:
+            torch.cuda.empty_cache()
+
+
 class MudPuppyTrainer(Trainer):
     """Trainer with optional token-budget dynamic batching."""
 
@@ -957,6 +972,9 @@ def run_training(config: TrainingConfig) -> None:
 
     # Set up callbacks
     callbacks = [LoggingCallback(config.log_with)]
+
+    if is_rocm():
+        callbacks.append(ROCmCacheCallback())
 
     if config.early_stopping_patience > 0:
         callbacks.append(
