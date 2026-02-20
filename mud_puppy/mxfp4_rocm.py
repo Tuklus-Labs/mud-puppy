@@ -35,7 +35,7 @@ def _dequantize_mx4_packed(packed_weight, scales, out_features, in_padded, in_fe
     high = ((packed_weight >> 4) & 0x0F).to(dtype) - 8
     weight_q = torch.stack([low, high], dim=-1).reshape(out_features, in_padded)
     weight_blocks = weight_q.view(out_features, num_blocks, block_size)
-    weight_dequant = weight_blocks * scales.unsqueeze(2) / 7.0
+    weight_dequant = weight_blocks * scales.to(dtype).unsqueeze(2) / 7.0
     return weight_dequant.reshape(out_features, -1)[:, :in_features].contiguous()
 
 
