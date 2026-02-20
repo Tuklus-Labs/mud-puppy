@@ -8,14 +8,13 @@ Key differences from INT4:
 - Better suited for models with varying weight distributions per block
 - Compatible with potential future hardware FP4 support
 
-Memory: ~3.5x compression (4-bit weights + fp16 scales per block)
+Memory: ~4x compression (packed 4-bit weights + fp16 scales per block)
 
 Usage:
     from mud_puppy.mxfp4_rocm import LinearMX4, quantize_model_mx4
 
     # Quantize a single layer
-    linear_mx4 = LinearMX4(in_features, out_features)
-    linear_mx4.quantize_from(original_linear)
+    mx4 = LinearMX4.from_linear(original_linear, block_size=32)
 
     # Quantize an entire model
     model = quantize_model_mx4(model, block_size=32)
@@ -33,15 +32,15 @@ log = logging.getLogger(__name__)
 class LinearMX4(nn.Linear):
     """Linear layer with MXFP4 (block-wise 4-bit) quantized weights.
 
-    Inherits from nn.Linear so PEFT/LoRA recognizes it as a valid target.
+    Inherits from nn.Linear so PEFT/LoRA recognizes it via isinstance check.
+    Skips nn.Linear.__init__ to avoid allocating a full-size weight Parameter.
 
     Weights are stored as:
     - packed_weight: [out_features, in_padded // 2] uint8 (2 values per byte)
     - scales: [out_features, num_blocks] fp16 (per-block scale factors)
-    - weight: Dequantized weights (for LoRA compatibility)
 
-    During forward pass, weights are dequantized on-the-fly.
-    Bias remains in full precision and is trainable.
+    During forward pass, weights are dequantized on-the-fly from packed storage.
+    No full-precision weight copy is kept in memory.
     """
 
     def __init__(
@@ -53,9 +52,10 @@ class LinearMX4(nn.Linear):
         device=None,
         dtype: torch.dtype = torch.float16,
     ):
-        # Initialize as nn.Linear
-        super().__init__(in_features, out_features, bias=bias, device=device, dtype=dtype)
-
+        # Skip nn.Linear.__init__ to avoid allocating full weight tensor.
+        nn.Module.__init__(self)
+        self.in_features = in_features
+        self.out_features = out_features
         self.block_size = block_size
         self.dtype = dtype
 
@@ -75,8 +75,23 @@ class LinearMX4(nn.Linear):
             torch.ones(out_features, self.num_blocks, dtype=torch.float16, device=device),
         )
 
-        # Freeze the inherited weight parameter (base weights are quantized)
-        self.weight.requires_grad = False
+        # Bias as frozen parameter
+        if bias:
+            self.register_parameter(
+                "bias", nn.Parameter(torch.zeros(out_features, dtype=dtype, device=device), requires_grad=False)
+            )
+        else:
+            self.register_parameter("bias", None)
+
+    @property
+    def weight(self):
+        """Dequantize on access. PEFT may read this for dtype/device info."""
+        return self._dequantize_packed()
+
+    @weight.setter
+    def weight(self, value):
+        # No-op: PEFT or kbit training prep may try to assign.
+        pass
 
     @classmethod
     def from_linear(cls, linear: nn.Linear, block_size: int = 32) -> "LinearMX4":
@@ -120,69 +135,33 @@ class LinearMX4(nn.Linear):
         )
         self.packed_weight.copy_(packed)
 
-        # Update the inherited weight parameter with dequantized values
-        # This is needed for LoRA to work (it modifies self.weight)
-        dequant = self._dequantize_packed()
-        self.weight.copy_(dequant)
-        self.weight.requires_grad = False  # Base weights frozen
-
         # Copy bias if present
         if linear.bias is not None and self.bias is not None:
             self.bias.data.copy_(linear.bias.to(self.dtype))
 
     def _dequantize_packed(self) -> torch.Tensor:
-        """Internal dequantization without updating self.weight."""
+        """Unpack INT4 nibbles and apply block-wise scales."""
         # Unpack nibbles
         low = (self.packed_weight & 0x0F).to(self.dtype) - 8
         high = ((self.packed_weight >> 4) & 0x0F).to(self.dtype) - 8
 
         # Interleave to reconstruct weight
-        weight_q = torch.zeros(
-            self.out_features,
-            self.in_padded,
-            device=self.packed_weight.device,
-            dtype=self.dtype,
-        )
-        weight_q[:, 0::2] = low
-        weight_q[:, 1::2] = high
+        weight_q = torch.stack([low, high], dim=-1).reshape(self.out_features, self.in_padded)
 
         # Reshape to blocks and apply scales
         weight_blocks = weight_q.view(self.out_features, self.num_blocks, self.block_size)
         weight_dequant = weight_blocks * self.scales.unsqueeze(2) / 7.0
 
         # Flatten and trim to original input size
-        return weight_dequant.view(self.out_features, -1)[:, : self.in_features]
+        return weight_dequant.reshape(self.out_features, -1)[:, :self.in_features]
 
     def dequantize_weight(self) -> torch.Tensor:
-        """Dequantize packed weights to full precision."""
-        # Unpack nibbles
-        low = (self.packed_weight & 0x0F).to(self.dtype) - 8
-        high = ((self.packed_weight >> 4) & 0x0F).to(self.dtype) - 8
-
-        # Interleave to reconstruct weight
-        weight_q = torch.zeros(
-            self.out_features,
-            self.in_padded,
-            device=self.packed_weight.device,
-            dtype=self.dtype,
-        )
-        weight_q[:, 0::2] = low
-        weight_q[:, 1::2] = high
-
-        # Reshape to blocks and apply scales
-        weight_blocks = weight_q.view(self.out_features, self.num_blocks, self.block_size)
-        weight_dequant = weight_blocks * self.scales.unsqueeze(2) / 7.0
-
-        # Flatten and trim to original input size
-        return weight_dequant.view(self.out_features, -1)[:, : self.in_features]
+        """Public API: dequantize packed weights to full precision."""
+        return self._dequantize_packed()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass using stored weights.
-
-        Uses self.weight directly (not re-dequantized from packed weights)
-        so that LoRA modifications to self.weight are included.
-        """
-        return F.linear(x.to(self.dtype), self.weight, self.bias)
+        """Forward pass with on-the-fly dequantization."""
+        return F.linear(x.to(self.dtype), self._dequantize_packed(), self.bias)
 
     def extra_repr(self) -> str:
         return (

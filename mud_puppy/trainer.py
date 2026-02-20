@@ -61,36 +61,31 @@ def _prepare_model_for_kbit_training_rocm(model: nn.Module) -> None:
 
     This replaces peft's prepare_model_for_kbit_training which requires bitsandbytes.
     It performs the following:
-    1. Casts LayerNorm and embedding layers to float32 for training stability
-    2. Ensures quantized base weights are frozen
+    1. Casts non-quantized layers (norms, embeddings, lm_head) to float32
+       for training stability and dtype consistency
+    2. Quantized layers (Linear4bit/LinearMX4) are already frozen (packed buffers)
     3. Enables input gradients for LoRA to work
     """
-    # Cast normalization layers to float32 for stability
-    for name, module in model.named_modules():
-        if isinstance(module, (nn.LayerNorm, nn.BatchNorm1d, nn.BatchNorm2d)):
-            module.float()
-
-        # Also cast embedding layers
-        if isinstance(module, nn.Embedding):
-            module.float()
-
-    # Ensure quantized weights are frozen (Linear4bit/LinearMX4 already do this, but be safe)
     from .bnb_rocm import Linear4bit
     try:
         from .mxfp4_rocm import LinearMX4
     except ImportError:
         LinearMX4 = None
 
-    for module in model.modules():
-        if isinstance(module, Linear4bit):
-            # Base weight should be frozen, LoRA adapters will be trainable
-            module.weight.requires_grad = False
-            if module.bias is not None:
-                module.bias.requires_grad = False
-        elif LinearMX4 is not None and isinstance(module, LinearMX4):
-            # MXFP4: packed weights are buffers (already frozen), bias is trainable
-            if module.bias is not None:
-                module.bias.requires_grad = False  # Will be enabled by LoRA if needed
+    quant_types = (Linear4bit,) if LinearMX4 is None else (Linear4bit, LinearMX4)
+
+    for name, module in model.named_modules():
+        # Cast normalization layers to float32 for stability
+        if isinstance(module, (nn.LayerNorm, nn.BatchNorm1d, nn.BatchNorm2d)):
+            module.float()
+        # Cast embedding layers to float32
+        elif isinstance(module, nn.Embedding):
+            module.float()
+        # Cast non-quantized Linear layers (lm_head, etc.) to float32 so they
+        # match the norm outputs. These are frozen and not LoRA targets, so
+        # the fp32 cost is only the weight tensor itself (no optimizer states).
+        elif isinstance(module, nn.Linear) and not isinstance(module, quant_types):
+            module.float()
 
     # Enable input gradients so LoRA can receive gradients
     if hasattr(model, 'enable_input_require_grads'):
@@ -228,10 +223,15 @@ class DynamicBatchSampler(Sampler):
         self.drop_last = drop_last
 
         # Extract sequence lengths
+        self.lengths = None
         if hasattr(dataset, "features") and length_column in dataset.features:
-            self.lengths = dataset[length_column]
-        elif hasattr(dataset, "__getitem__"):
-            # Try to compute lengths from input_ids
+            try:
+                self.lengths = list(dataset[length_column])
+            except Exception:
+                self.lengths = None
+
+        if self.lengths is None:
+            # Fallback: compute lengths from input_ids
             self.lengths = []
             for i in range(len(dataset)):
                 item = dataset[i]
@@ -239,8 +239,6 @@ class DynamicBatchSampler(Sampler):
                     self.lengths.append(len(item["input_ids"]))
                 else:
                     self.lengths.append(512)  # Default estimate
-        else:
-            self.lengths = [512] * len(dataset)
 
     def __iter__(self) -> Iterator[List[int]]:
         indices = list(range(len(self.dataset)))
@@ -378,6 +376,37 @@ class LoggingCallback(TrainerCallback):
             loss = logs.get("loss", logs.get("train_loss", "N/A"))
             lr = logs.get("learning_rate", "N/A")
             print(f"[mud-puppy] step {state.global_step}: loss={loss}, lr={lr}")
+
+
+class MudPuppyTrainer(Trainer):
+    """Trainer with optional token-budget dynamic batching."""
+
+    def __init__(self, *args, tokens_per_batch: int = 0, **kwargs):
+        self.tokens_per_batch = tokens_per_batch
+        super().__init__(*args, **kwargs)
+
+    def get_train_dataloader(self) -> DataLoader:
+        if self.train_dataset is None:
+            raise ValueError("Trainer: training requires a train_dataset.")
+
+        if self.tokens_per_batch <= 0:
+            return super().get_train_dataloader()
+
+        sampler = DynamicBatchSampler(
+            dataset=self.train_dataset,
+            tokens_per_batch=self.tokens_per_batch,
+            length_column="length",
+            shuffle=True,
+            drop_last=self.args.dataloader_drop_last,
+        )
+
+        return DataLoader(
+            self.train_dataset,
+            batch_sampler=sampler,
+            collate_fn=self.data_collator,
+            num_workers=self.args.dataloader_num_workers,
+            pin_memory=self.args.dataloader_pin_memory,
+        )
 
 
 def load_model(config: TrainingConfig):
@@ -753,13 +782,10 @@ def load_and_preprocess_dataset(
         tokenized = tokenizer(
             texts,
             truncation=True,
-            padding="max_length",
+            padding=False,
             max_length=max_len,
             return_tensors=None,
         )
-
-        # Add labels for causal LM training
-        tokenized["labels"] = tokenized["input_ids"].copy()
 
         # Add length column for dynamic batching
         tokenized["length"] = [len(ids) for ids in tokenized["input_ids"]]
@@ -776,7 +802,7 @@ def load_and_preprocess_dataset(
     )
 
     # Set format for PyTorch
-    dataset.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
+    dataset.set_format(type="torch", columns=["input_ids", "attention_mask"])
 
     return dataset
 
@@ -938,13 +964,15 @@ def run_training(config: TrainingConfig) -> None:
         "callbacks": callbacks,
     }
 
-    # Use dynamic batching if tokens_per_batch is specified
     if config.tokens_per_batch > 0:
-        print(f"[mud-puppy] Using dynamic batching with {config.tokens_per_batch} tokens/batch")
-        # Note: The Trainer will use its own batching, but we can influence it
-        # through custom data collator or by passing pre-batched data
+        print(
+            f"[mud-puppy] Dynamic batching enabled: ~{config.tokens_per_batch} tokens/batch"
+        )
 
-    trainer = Trainer(**trainer_kwargs)
+    trainer = MudPuppyTrainer(
+        tokens_per_batch=config.tokens_per_batch,
+        **trainer_kwargs,
+    )
 
     # Resume from checkpoint if requested
     resume_from = None
