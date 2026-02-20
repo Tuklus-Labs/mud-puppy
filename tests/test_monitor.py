@@ -251,3 +251,162 @@ def test_cli_parser_has_monitor_flags():
     assert args.monitor_port == 5981
     args2 = parser.parse_args(["model.bin", "data.jsonl", "--monitor-tui"])
     assert args2.monitor_tui is True
+
+
+# ------------------------------------------------------------------
+# Task 4: TUI Monitor (Rich) tests
+# ------------------------------------------------------------------
+
+_TUI_PATH = Path(__file__).resolve().parent.parent / "mud_puppy" / "tui.py"
+_tui_spec = importlib.util.spec_from_file_location("mud_puppy.tui", _TUI_PATH)
+_tui_mod = importlib.util.module_from_spec(_tui_spec)
+sys.modules["mud_puppy.tui"] = _tui_mod
+_tui_spec.loader.exec_module(_tui_mod)
+
+TUIMonitor = _tui_mod.TUIMonitor
+sparkline = _tui_mod.sparkline
+_format_eta = _tui_mod._format_eta
+_format_lr = _tui_mod._format_lr
+
+
+def test_tui_monitor_handles_metrics():
+    """TUIMonitor processes config/metrics/gpu messages and stores latest_metrics."""
+    tui = TUIMonitor(live=False)
+
+    # Initially empty
+    assert tui.config_data is None
+    assert tui.latest_metrics is None
+    assert tui.latest_gpu is None
+    assert tui.loss_history == []
+
+    # Config message
+    tui.update({"type": "config", "method": "lora", "model": "llama-3-8b"})
+    assert tui.config_data is not None
+    assert tui.config_data["method"] == "lora"
+    assert tui.config_data["model"] == "llama-3-8b"
+
+    # Metrics message
+    tui.update({
+        "type": "metrics",
+        "step": 10,
+        "max_steps": 100,
+        "epoch": 0.5,
+        "loss": 0.42,
+        "lr": 5e-5,
+        "grad_norm": 1.2,
+        "eta_seconds": 90,
+    })
+    assert tui.latest_metrics is not None
+    assert tui.latest_metrics["step"] == 10
+    assert tui.latest_metrics["loss"] == 0.42
+    assert len(tui.loss_history) == 1
+    assert tui.loss_history[0] == 0.42
+
+    # Second metrics message
+    tui.update({
+        "type": "metrics",
+        "step": 20,
+        "max_steps": 100,
+        "epoch": 1.0,
+        "loss": 0.35,
+        "lr": 4e-5,
+        "grad_norm": 0.9,
+        "eta_seconds": 60,
+    })
+    assert tui.latest_metrics["step"] == 20
+    assert tui.latest_metrics["loss"] == 0.35
+    assert len(tui.loss_history) == 2
+    assert tui.loss_history[1] == 0.35
+
+    # GPU message
+    tui.update({
+        "type": "gpu",
+        "vram_used": 12.5,
+        "vram_total": 24.0,
+        "gpu_util": 95.0,
+        "temperature": 72.0,
+        "power_draw": 280.0,
+    })
+    assert tui.latest_gpu is not None
+    assert tui.latest_gpu["vram_used"] == 12.5
+    assert tui.latest_gpu["gpu_util"] == 95.0
+
+
+def test_tui_sparkline():
+    """sparkline() renders correctly with known values."""
+    # All same values -> all midpoint chars
+    result = sparkline([5.0, 5.0, 5.0, 5.0, 5.0], width=5)
+    assert len(result) == 5
+    # All identical values map to index 4 (midpoint)
+    assert all(c == _tui_mod._SPARK_CHARS[4] for c in result)
+
+    # Ascending 0-8 -> each maps to one character in order
+    vals = list(range(9))
+    result = sparkline([float(v) for v in vals], width=9)
+    assert len(result) == 9
+    # First char should be space (index 0), last should be full block (index 8)
+    assert result[0] == _tui_mod._SPARK_CHARS[0]
+    assert result[-1] == _tui_mod._SPARK_CHARS[8]
+
+    # Padding: fewer values than width
+    result = sparkline([1.0, 2.0, 3.0], width=10)
+    assert len(result) == 10
+    # First 7 chars should be spaces (padding)
+    assert result[:7] == "       "
+
+    # Truncation: more values than width
+    result = sparkline([float(i) for i in range(50)], width=10)
+    assert len(result) == 10
+
+    # Empty list -> all spaces
+    result = sparkline([], width=5)
+    assert result == "     "
+
+
+def test_tui_sparkline_two_values():
+    """Sparkline with min/max pair maps correctly."""
+    result = sparkline([0.0, 1.0], width=5)
+    assert len(result) == 5
+    # 3 padding spaces + space char + full block
+    assert result[3] == _tui_mod._SPARK_CHARS[0]  # min -> index 0
+    assert result[4] == _tui_mod._SPARK_CHARS[8]  # max -> index 8
+
+
+def test_format_eta():
+    """_format_eta produces correct time strings."""
+    assert _format_eta(0) == "--:--"
+    assert _format_eta(-5) == "--:--"
+    assert _format_eta(90) == "01:30"
+    assert _format_eta(3661) == "1:01:01"
+    assert _format_eta(60) == "01:00"
+    assert _format_eta(5) == "00:05"
+
+
+def test_format_lr():
+    """_format_lr produces scientific notation."""
+    assert _format_lr(5e-5) == "5.00e-05"
+    assert _format_lr(1e-3) == "1.00e-03"
+    assert _format_lr(0) == "0"
+
+
+def test_tui_complete_message():
+    """Complete message triggers _render_complete without crashing."""
+    tui = TUIMonitor(live=False)
+    # Should not raise
+    tui.update({
+        "type": "complete",
+        "total_time": 300.0,
+        "total_steps": 500,
+        "best_loss": 0.25,
+    })
+    # After complete, latest_metrics should still be None (complete doesn't set it)
+    assert tui.latest_metrics is None
+
+
+def test_tui_start_stop_no_live():
+    """start/stop with live=False are no-ops and don't raise."""
+    tui = TUIMonitor(live=False)
+    tui.start()
+    tui.stop()
+    # Should be safe to call multiple times
+    tui.stop()
