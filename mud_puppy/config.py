@@ -99,6 +99,8 @@ class TrainingConfig:
             )
         if self.tokens_per_batch < 0:
             raise ValueError("tokens_per_batch must be non-negative")
+        if self.max_seq_length < 0:
+            raise ValueError("max_seq_length must be non-negative")
         if self.distributed and torch.cuda.device_count() < 2:
             # Note: torch.distributed on ROCm still reports as CUDA in PyTorch
             raise ValueError("Distributed training requires at least 2 GPUs")

@@ -65,6 +65,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="dataset preprocessing workers",
     )
     parser.add_argument(
+        "--max-seq-length",
+        dest="max_seq_length",
+        type=int,
+        default=0,
+        help="max sequence length (0 uses tokenizer default, capped at 2048)",
+    )
+    parser.add_argument(
         "--trust-remote-code",
         action="store_true",
         dest="trust_remote_code",
@@ -208,6 +215,7 @@ def main() -> None:
         compile=args.compile,
         dataloader_workers=args.num_workers,
         preprocessing_workers=args.preprocess_workers,
+        max_seq_length=args.max_seq_length,
         trust_remote_code=args.trust_remote_code,
         use_chat_template=not args.no_chat_template,
         resume=args.resume,
