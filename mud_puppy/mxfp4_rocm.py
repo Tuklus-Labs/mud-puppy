@@ -29,6 +29,62 @@ import logging
 log = logging.getLogger(__name__)
 
 
+def _dequantize_mx4_packed(packed_weight, scales, out_features, in_padded, in_features, num_blocks, block_size, dtype):
+    """Unpack INT4 nibbles and apply block-wise scales."""
+    low = (packed_weight & 0x0F).to(dtype) - 8
+    high = ((packed_weight >> 4) & 0x0F).to(dtype) - 8
+    weight_q = torch.stack([low, high], dim=-1).reshape(out_features, in_padded)
+    weight_blocks = weight_q.view(out_features, num_blocks, block_size)
+    weight_dequant = weight_blocks * scales.unsqueeze(2) / 7.0
+    return weight_dequant.reshape(out_features, -1)[:, :in_features].contiguous()
+
+
+class _LinearMX4Fn(torch.autograd.Function):
+    """Custom autograd for MXFP4 linear that saves packed weights instead of dequantized.
+
+    Same principle as _Linear4bitFn in bnb_rocm.py: autograd saves the full
+    dequantized bf16 weight for backward (needed for input gradients). For a 3B
+    model with 252 layers, that's ~5 GB of saved tensors -- negating INT4 savings.
+
+    This function saves only packed_weight (uint8) + scales (fp16) and
+    re-dequantizes during backward. Trades ~2x compute for ~4x memory.
+    """
+
+    @staticmethod
+    def forward(ctx, input, packed_weight, scales, bias, out_features, in_padded, in_features, num_blocks, block_size, dtype):
+        w = _dequantize_mx4_packed(packed_weight, scales, out_features, in_padded, in_features, num_blocks, block_size, dtype)
+        output = F.linear(input, w, bias)
+
+        ctx.save_for_backward(packed_weight, scales)
+        ctx.out_features = out_features
+        ctx.in_padded = in_padded
+        ctx.in_features = in_features
+        ctx.num_blocks = num_blocks
+        ctx.block_size = block_size
+        ctx.dtype = dtype
+        ctx.has_bias = bias is not None
+
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        packed_weight, scales = ctx.saved_tensors
+
+        w = _dequantize_mx4_packed(
+            packed_weight, scales, ctx.out_features, ctx.in_padded,
+            ctx.in_features, ctx.num_blocks, ctx.block_size, ctx.dtype,
+        )
+
+        grad_input = grad_output @ w
+
+        grad_bias = None
+        if ctx.has_bias:
+            grad_bias = grad_output.reshape(-1, ctx.out_features).sum(0)
+
+        # No grads for packed_weight, scales, or shape params
+        return grad_input, None, None, grad_bias, None, None, None, None, None, None
+
+
 class LinearMX4(nn.Linear):
     """Linear layer with MXFP4 (block-wise 4-bit) quantized weights.
 
@@ -141,19 +197,11 @@ class LinearMX4(nn.Linear):
 
     def _dequantize_packed(self) -> torch.Tensor:
         """Unpack INT4 nibbles and apply block-wise scales."""
-        # Unpack nibbles
-        low = (self.packed_weight & 0x0F).to(self.dtype) - 8
-        high = ((self.packed_weight >> 4) & 0x0F).to(self.dtype) - 8
-
-        # Interleave to reconstruct weight
-        weight_q = torch.stack([low, high], dim=-1).reshape(self.out_features, self.in_padded)
-
-        # Reshape to blocks and apply scales
-        weight_blocks = weight_q.view(self.out_features, self.num_blocks, self.block_size)
-        weight_dequant = weight_blocks * self.scales.unsqueeze(2) / 7.0
-
-        # Flatten and trim to original input size (contiguous for F.linear)
-        return weight_dequant.reshape(self.out_features, -1)[:, :self.in_features].contiguous()
+        return _dequantize_mx4_packed(
+            self.packed_weight, self.scales, self.out_features,
+            self.in_padded, self.in_features, self.num_blocks,
+            self.block_size, self.dtype,
+        )
 
     def dequantize_weight(self) -> torch.Tensor:
         """Public API: dequantize packed weights to full precision."""
@@ -161,7 +209,18 @@ class LinearMX4(nn.Linear):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass with on-the-fly dequantization."""
-        return F.linear(x.to(self.dtype), self._dequantize_packed(), self.bias)
+        return _LinearMX4Fn.apply(
+            x.to(self.dtype),
+            self.packed_weight,
+            self.scales,
+            self.bias,
+            self.out_features,
+            self.in_padded,
+            self.in_features,
+            self.num_blocks,
+            self.block_size,
+            self.dtype,
+        )
 
     def extra_repr(self) -> str:
         return (
