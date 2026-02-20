@@ -222,3 +222,32 @@ def test_monitor_callback_collects_lora_norms():
     assert "layer.0.weight" not in norms
     assert norms["layer.0.lora_A"] == 0.5
     assert norms["layer.0.lora_B"] == 1.2
+
+
+# ------------------------------------------------------------------
+# Task 3: CLI parser integration tests
+# ------------------------------------------------------------------
+
+def test_cli_parser_has_monitor_flags():
+    # Load cli.py directly to avoid mud_puppy/__init__.py pulling in torch
+    _CLI_PATH = Path(__file__).resolve().parent.parent / "mud_puppy" / "cli.py"
+
+    # Stub out heavy imports that cli.py references at module level
+    fake_config = MagicMock()
+    fake_trainer = MagicMock()
+    with patch.dict("sys.modules", {
+        "mud_puppy": MagicMock(),
+        "mud_puppy.config": fake_config,
+        "mud_puppy.trainer": fake_trainer,
+    }):
+        _cli_spec = importlib.util.spec_from_file_location("mud_puppy.cli", _CLI_PATH)
+        _cli_mod = importlib.util.module_from_spec(_cli_spec)
+        _cli_spec.loader.exec_module(_cli_mod)
+
+    build_parser = _cli_mod.build_parser
+    parser = build_parser()
+    args = parser.parse_args(["model.bin", "data.jsonl", "--monitor", "--monitor-port", "5981"])
+    assert args.monitor is True
+    assert args.monitor_port == 5981
+    args2 = parser.parse_args(["model.bin", "data.jsonl", "--monitor-tui"])
+    assert args2.monitor_tui is True

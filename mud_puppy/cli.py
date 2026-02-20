@@ -145,6 +145,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["fp16", "bf16", "fp32"],
         help="precision for the merged model weights",
     )
+    parser.add_argument("--monitor", dest="monitor", action="store_true",
+        help="enable real-time web training dashboard (port 5980)")
+    parser.add_argument("--monitor-tui", dest="monitor_tui", action="store_true",
+        help="enable terminal (Rich) training monitor")
+    parser.add_argument("--monitor-port", dest="monitor_port", type=int, default=5980,
+        help="port for web training monitor (default: 5980)")
     parser.add_argument(
         "--distributed",
         dest="distributed",
@@ -214,6 +220,9 @@ def main() -> None:
         zero_offload=args.zero_offload,
         merge_lora=args.merge_lora,
         merge_precision=args.merge_precision,
+        monitor=args.monitor,
+        monitor_tui=args.monitor_tui,
+        monitor_port=args.monitor_port,
         distributed=args.distributed,
         local_rank=args.local_rank,
         quant_backend=args.quant_backend,

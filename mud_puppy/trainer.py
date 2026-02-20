@@ -966,6 +966,46 @@ def run_training(config: TrainingConfig) -> None:
     if config.zero_offload:
         callbacks.append(ZeroOffloadCallback())
 
+    # Monitor callback (web dashboard and/or TUI)
+    monitor_server = None
+    monitor_tui_inst = None
+    if config.monitor or config.monitor_tui:
+        from .monitor import MonitorCallback, MonitorServer, start_gpu_telemetry
+
+        config_data = {
+            "model": config.model_name_or_path,
+            "method": config.finetuning_method,
+            "precision": config.precision,
+            "batch_size": config.batch_size,
+            "learning_rate": config.learning_rate,
+            "num_epochs": config.num_epochs,
+            "dataset_size": len(dataset),
+            "lora_r": config.lora_r if config.finetuning_method in ("lora", "qlora") else None,
+            "lora_alpha": config.lora_alpha if config.finetuning_method in ("lora", "qlora") else None,
+            "quant_backend": config.quant_backend if config.finetuning_method == "qlora" else None,
+        }
+
+        if config.monitor:
+            monitor_server = MonitorServer(port=config.monitor_port)
+            monitor_server.start()
+            start_gpu_telemetry(monitor_server)
+            print(f"[mud-puppy] Training monitor: http://localhost:{config.monitor_port}")
+            import webbrowser
+            webbrowser.open(f"http://localhost:{config.monitor_port}")
+
+        if config.monitor_tui:
+            from .tui import TUIMonitor
+            monitor_tui_inst = TUIMonitor()
+            monitor_tui_inst.start()
+
+        callbacks.append(MonitorCallback(
+            model=model,
+            config_data=config_data,
+            server=monitor_server,
+            tui=monitor_tui_inst,
+            lora_norm_interval=50 if config.finetuning_method in ("lora", "qlora") else 0,
+        ))
+
     # Create trainer
     trainer_kwargs = {
         "model": model,
@@ -1002,6 +1042,12 @@ def run_training(config: TrainingConfig) -> None:
     # Run training
     print("[mud-puppy] Starting training...")
     trainer.train(resume_from_checkpoint=resume_from)
+
+    # Stop monitor
+    if monitor_server:
+        monitor_server.stop()
+    if monitor_tui_inst:
+        monitor_tui_inst.stop()
 
     # Save final model
     print("[mud-puppy] Saving model...")

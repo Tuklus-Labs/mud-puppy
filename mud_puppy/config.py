@@ -80,6 +80,11 @@ class TrainingConfig:
     merge_lora: bool = False
     merge_precision: str = "bf16"  # fp16, bf16, fp32
 
+    # Monitor
+    monitor: bool = False
+    monitor_tui: bool = False
+    monitor_port: int = 5980
+
     def _validate_paths(self) -> None:
         """Validate that input paths exist where required."""
         if not os.path.exists(self.dataset_path):
