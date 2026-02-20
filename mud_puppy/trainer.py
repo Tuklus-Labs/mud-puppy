@@ -737,15 +737,18 @@ def load_and_preprocess_dataset(
 
             texts.append(text)
 
-        # Tokenize - use model's max length if available
-        max_len = min(
-            getattr(tokenizer, "model_max_length", 2048),
-            2048
-        )
-        # GPT-2 and similar models have 1024 max positions
-        if max_len > 1024 and hasattr(tokenizer, "name_or_path"):
-            if "gpt2" in tokenizer.name_or_path.lower():
-                max_len = 1024
+        # Tokenize - use config max_seq_length if set, else model default (capped at 2048)
+        if config.max_seq_length > 0:
+            max_len = config.max_seq_length
+        else:
+            max_len = min(
+                getattr(tokenizer, "model_max_length", 2048),
+                2048
+            )
+            # GPT-2 and similar models have 1024 max positions
+            if max_len > 1024 and hasattr(tokenizer, "name_or_path"):
+                if "gpt2" in tokenizer.name_or_path.lower():
+                    max_len = 1024
 
         tokenized = tokenizer(
             texts,

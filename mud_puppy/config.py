@@ -56,6 +56,7 @@ class TrainingConfig:
     reward_modeling: bool = False
 
     # Data / preprocessing
+    max_seq_length: int = 0  # 0 = use model default (capped at 2048)
     use_chat_template: bool = True
     trust_remote_code: bool = False
     dataloader_workers: int = 0
