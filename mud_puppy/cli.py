@@ -89,6 +89,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="comma separated list of LoRA target modules",
     )
     parser.add_argument(
+        "--lora-r",
+        dest="lora_r",
+        type=int,
+        help="LoRA rank (overrides config default)",
+    )
+    parser.add_argument(
+        "--lora-alpha",
+        dest="lora_alpha",
+        type=int,
+        help="LoRA alpha (overrides config default)",
+    )
+    parser.add_argument(
+        "--lora-dropout",
+        dest="lora_dropout",
+        type=float,
+        help="LoRA dropout (overrides config default)",
+    )
+    parser.add_argument(
+        "--no-gradient-checkpointing",
+        dest="no_gradient_checkpointing",
+        action="store_true",
+        help="disable gradient checkpointing",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         dest="resume",
@@ -213,6 +237,7 @@ def main() -> None:
         precision=args.precision,
         preference=args.preference,
         compile=args.compile,
+        use_gradient_checkpointing=not args.no_gradient_checkpointing,
         dataloader_workers=args.num_workers,
         preprocessing_workers=args.preprocess_workers,
         max_seq_length=args.max_seq_length,
@@ -245,6 +270,12 @@ def main() -> None:
         config_kwargs["learning_rate"] = args.learning_rate
     if args.num_epochs is not None:
         config_kwargs["num_epochs"] = args.num_epochs
+    if args.lora_r is not None:
+        config_kwargs["lora_r"] = args.lora_r
+    if args.lora_alpha is not None:
+        config_kwargs["lora_alpha"] = args.lora_alpha
+    if args.lora_dropout is not None:
+        config_kwargs["lora_dropout"] = args.lora_dropout
 
     if args.lora_targets:
         config_kwargs["lora_target_modules"] = args.lora_targets.split(",")
