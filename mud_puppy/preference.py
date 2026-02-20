@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from typing import Dict, Optional, Type
 
+import torch
 from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments
 
@@ -100,9 +101,18 @@ def run_preference_training(config: TrainingConfig):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    dtype_map = {"fp16": torch.float16, "bf16": torch.bfloat16}
+    model_dtype = dtype_map.get(config.precision, torch.float16)
+
     model = AutoModelForCausalLM.from_pretrained(
-        config.model_name_or_path, trust_remote_code=config.trust_remote_code
+        config.model_name_or_path,
+        trust_remote_code=config.trust_remote_code,
+        torch_dtype=model_dtype,
+        device_map=None,
+        low_cpu_mem_usage=True,
     )
+    if torch.cuda.is_available():
+        model = model.to("cuda")
 
     dataset = _load_pairwise_dataset(config.dataset_path)
     training_args = _build_training_args(config)

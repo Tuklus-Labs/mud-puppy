@@ -81,11 +81,20 @@ def _prepare_model_for_kbit_training_rocm(model: nn.Module) -> None:
         # Cast embedding layers to float32
         elif isinstance(module, nn.Embedding):
             module.float()
-        # Cast non-quantized Linear layers (lm_head, etc.) to float32 so they
-        # match the norm outputs. These are frozen and not LoRA targets, so
-        # the fp32 cost is only the weight tensor itself (no optimizer states).
-        elif isinstance(module, nn.Linear) and not isinstance(module, quant_types):
-            module.float()
+
+    # Add a forward pre-hook on non-quantized Linear layers (lm_head, etc.)
+    # to cast input to match weight dtype. This avoids the fp32 VRAM cost of
+    # upcasting the weight (e.g. 2GB for lm_head on 128K-vocab models) while
+    # fixing the dtype mismatch from fp32 norm outputs.
+    def _cast_input_hook(module, args):
+        x = args[0]
+        if x.dtype != module.weight.dtype:
+            return (x.to(module.weight.dtype),) + args[1:]
+        return args
+
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear) and not isinstance(module, quant_types):
+            module.register_forward_pre_hook(_cast_input_hook)
 
     # Enable input gradients so LoRA can receive gradients
     if hasattr(model, 'enable_input_require_grads'):
@@ -341,8 +350,10 @@ class ZeroOffloadCallback(TrainerCallback):
                         self._cpu_states[pid][key].copy_(val, non_blocking=True)
                         opt_state[key] = self._cpu_states[pid][key]
 
-        # Clear CUDA cache
+        # Sync before clearing cache: non-blocking copies above must complete
+        # before the CPU tensors are read in on_step_begin.
         if torch.cuda.is_available():
+            torch.cuda.synchronize()
             torch.cuda.empty_cache()
 
     def on_step_begin(self, args, state, control, model=None, optimizer=None, **kwargs):
@@ -903,6 +914,12 @@ def run_training(config: TrainingConfig) -> None:
     # Load model and tokenizer
     model, tokenizer = load_model(config)
 
+    # Enable gradient checkpointing BEFORE LoRA wrapping.
+    # PEFT's forward hooks need gradient checkpointing already active so that
+    # checkpoint boundaries are correctly set inside the base model layers.
+    if config.use_gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
+
     # Apply LoRA if requested
     if config.finetuning_method in ("lora", "qlora"):
         model = prepare_lora(model, config)
@@ -910,10 +927,6 @@ def run_training(config: TrainingConfig) -> None:
     # Set up pipeline parallelism if requested
     if config.device_map == "pipeline":
         model = setup_pipeline_parallelism(model, config)
-
-    # Enable gradient checkpointing
-    if config.use_gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
-        model.gradient_checkpointing_enable()
 
     # Compile model if requested
     if config.compile and hasattr(torch, "compile"):

@@ -107,13 +107,24 @@ def run_grpo_training(config: TrainingConfig):
         )
 
 
+def _model_dtype(config: TrainingConfig) -> torch.dtype:
+    """Resolve config.precision to a torch dtype."""
+    return {"fp16": torch.float16, "bf16": torch.bfloat16}.get(config.precision, torch.float16)
+
+
 def _run_native_grpo(config: TrainingConfig, tokenizer, dataset):
     """Run training using TRL's native GRPOTrainer."""
     from trl import GRPOConfig
 
     model = AutoModelForCausalLM.from_pretrained(
-        config.model_name_or_path, trust_remote_code=config.trust_remote_code
+        config.model_name_or_path,
+        trust_remote_code=config.trust_remote_code,
+        torch_dtype=_model_dtype(config),
+        device_map=None,
+        low_cpu_mem_usage=True,
     )
+    if torch.cuda.is_available():
+        model = model.to("cuda")
 
     # Define reward function
     def reward_fn(completions: List[str], **kwargs) -> List[float]:
@@ -152,11 +163,18 @@ def _run_native_grpo(config: TrainingConfig, tokenizer, dataset):
 
 def _run_ppo_grpo(config: TrainingConfig, tokenizer, dataset):
     """Run GRPO-style training using PPOTrainer as a fallback."""
+    dtype = _model_dtype(config)
     model = AutoModelForCausalLMWithValueHead.from_pretrained(
-        config.model_name_or_path, trust_remote_code=config.trust_remote_code
+        config.model_name_or_path,
+        trust_remote_code=config.trust_remote_code,
+        torch_dtype=dtype,
+        low_cpu_mem_usage=True,
     )
     ref_model = AutoModelForCausalLMWithValueHead.from_pretrained(
-        config.model_name_or_path, trust_remote_code=config.trust_remote_code
+        config.model_name_or_path,
+        trust_remote_code=config.trust_remote_code,
+        torch_dtype=dtype,
+        low_cpu_mem_usage=True,
     )
 
     ppo_config = PPOConfig(
@@ -208,14 +226,18 @@ def _run_ppo_grpo(config: TrainingConfig, tokenizer, dataset):
 
             with torch.no_grad():
                 outputs = model.generate(**inputs, **gen_kwargs)
-            responses = tokenizer.batch_decode(outputs, skip_special_tokens=True)
 
-            # Compute heuristic rewards
+            # Split prompt from generated response for each example
+            prompt_lengths = inputs["input_ids"].shape[1]
+            response_only = [out[prompt_lengths:] for out in outputs]
+            responses = tokenizer.batch_decode(response_only, skip_special_tokens=True)
+
+            # Compute heuristic rewards on response only (not prompt)
             rewards = _compute_heuristic_reward(responses)
 
             # Convert to tensors for PPO step
             query_tensors = [inputs["input_ids"][i] for i in range(len(prompts))]
-            response_tensors = [outputs[i] for i in range(len(prompts))]
+            response_tensors = response_only
             reward_tensors = [
                 torch.tensor(r, dtype=torch.float32) for r in rewards
             ]

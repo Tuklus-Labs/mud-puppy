@@ -194,9 +194,9 @@ class CPUOffloadOptimizer:
                 continue
 
             if self.config.pin_memory and pid in self._pinned_buffers:
-                # Use pinned buffer for async transfer
+                # Use pinned buffer for transfer
                 pinned = self._pinned_buffers[pid]
-                pinned.copy_(param.grad, non_blocking=True)
+                pinned.copy_(param.grad)  # sync copy: must complete before add_
                 self._cpu_grads[pid].add_(pinned)
             else:
                 self._cpu_grads[pid].add_(param.grad.to(self._cpu))

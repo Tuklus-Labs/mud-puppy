@@ -152,8 +152,8 @@ class LinearMX4(nn.Linear):
         weight_blocks = weight_q.view(self.out_features, self.num_blocks, self.block_size)
         weight_dequant = weight_blocks * self.scales.unsqueeze(2) / 7.0
 
-        # Flatten and trim to original input size
-        return weight_dequant.reshape(self.out_features, -1)[:, :self.in_features]
+        # Flatten and trim to original input size (contiguous for F.linear)
+        return weight_dequant.reshape(self.out_features, -1)[:, :self.in_features].contiguous()
 
     def dequantize_weight(self) -> torch.Tensor:
         """Public API: dequantize packed weights to full precision."""
@@ -196,7 +196,16 @@ def quantize_model_mx4(
     Returns:
         Model with quantized Linear layers
     """
-    skip_modules = skip_modules or ["lora", "lm_head", "embed"]
+    skip_modules = skip_modules or [
+        "lora",
+        "lm_head",
+        "embed_tokens",
+        "word_embeddings",
+        "wte",
+        "wpe",
+        "score",
+        "classifier",
+    ]
 
     quantized_count = 0
     skipped_count = 0

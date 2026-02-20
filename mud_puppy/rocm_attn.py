@@ -44,21 +44,22 @@ def flash_attention(
     k = k.transpose(1, 2)
     v = v.transpose(1, 2)
 
-    if scale is not None:
-        q = q * scale
-
     attn_mask = mask
     if bias is not None:
         attn_mask = bias if attn_mask is None else attn_mask + bias
 
-    out = F.scaled_dot_product_attention(
-        q,
-        k,
-        v,
+    # Pass scale to SDPA directly instead of pre-multiplying q.
+    # Pre-multiplying q AND letting SDPA apply 1/sqrt(head_dim) causes
+    # double scaling (attention logits divided by head_dim, not sqrt(head_dim)).
+    sdpa_kwargs = dict(
         attn_mask=attn_mask,
         dropout_p=dropout_p,
         is_causal=causal,
     )
+    if scale is not None:
+        sdpa_kwargs["scale"] = scale
+
+    out = F.scaled_dot_product_attention(q, k, v, **sdpa_kwargs)
 
     return out.transpose(1, 2)
 

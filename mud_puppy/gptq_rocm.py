@@ -39,16 +39,37 @@ class GPTQLinear(nn.Module):
         return F.linear(x, weight, self.bias)
 
 
-def quantize_model_gptq(model: nn.Module, bits: int = 4) -> nn.Module:
-    """Convert all Linear layers to :class:`GPTQLinear`.
+def quantize_model_gptq(
+    model: nn.Module,
+    bits: int = 4,
+    skip_modules=None,
+    min_size: int = 1024,
+) -> nn.Module:
+    """Convert Linear layers to :class:`GPTQLinear`.
 
     This is a post-training quantization pass; call it on a trained model
-    before saving for int4 inference.
+    before saving for int4 inference. Skips lm_head, embeddings, and small
+    layers by default.
     """
+    skip_modules = skip_modules or [
+        "lm_head",
+        "embed_tokens",
+        "word_embeddings",
+        "wte",
+        "wpe",
+        "score",
+        "classifier",
+    ]
+
     for name, module in list(model.named_modules()):
-        if isinstance(module, nn.Linear):
-            qlinear = GPTQLinear(module, bits=bits)
-            _set_module(model, name, qlinear)
+        if not isinstance(module, nn.Linear):
+            continue
+        if any(skip in name.lower() for skip in skip_modules):
+            continue
+        if module.weight.numel() < min_size:
+            continue
+        qlinear = GPTQLinear(module, bits=bits)
+        _set_module(model, name, qlinear)
     return model
 
 
