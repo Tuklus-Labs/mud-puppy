@@ -4,6 +4,59 @@ import torch.nn.functional as F
 from typing import List, Optional
 
 
+def _dequantize_packed(qweight, scale, out_features, in_features, dtype):
+    """Unpack INT4 nibbles and apply row-wise scale."""
+    low = (qweight & 0x0F).to(dtype) - 8.0
+    high = ((qweight >> 4) & 0x0F).to(dtype) - 8.0
+    w = torch.stack([low, high], dim=-1).reshape(out_features, -1)
+    w = w[:, :in_features]
+    return w * scale.to(dtype)
+
+
+class _Linear4bitFn(torch.autograd.Function):
+    """Custom autograd for INT4 linear that saves packed weights instead of dequantized.
+
+    Standard F.linear saves the full dequantized bf16 weight in the autograd graph
+    (needed to compute input gradients for LoRA). For 252 layers in a 3B model,
+    that's ~5.2 GB of saved tensors -- negating INT4 savings entirely.
+
+    This function saves only qweight (packed uint8) + scale (fp32) and
+    re-dequantizes during backward. Trades ~2x compute for ~4x memory.
+    """
+
+    @staticmethod
+    def forward(ctx, input, qweight, scale, bias, out_features, in_features, dtype):
+        w = _dequantize_packed(qweight, scale, out_features, in_features, dtype)
+        output = F.linear(input, w, bias)
+
+        # Save packed tensors (tiny) instead of dequantized weight (huge)
+        ctx.save_for_backward(qweight, scale)
+        ctx.out_features = out_features
+        ctx.in_features = in_features
+        ctx.dtype = dtype
+        ctx.has_bias = bias is not None
+
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        qweight, scale = ctx.saved_tensors
+
+        # Re-dequantize during backward (~0.1ms per layer, saves ~20MB per layer)
+        w = _dequantize_packed(qweight, scale, ctx.out_features, ctx.in_features, ctx.dtype)
+
+        # grad_input = grad_output @ W (needed for LoRA gradient flow)
+        grad_input = grad_output @ w
+
+        # grad_bias = sum over batch+seq dims
+        grad_bias = None
+        if ctx.has_bias:
+            grad_bias = grad_output.reshape(-1, ctx.out_features).sum(0)
+
+        # No grads for qweight, scale, out_features, in_features, dtype
+        return grad_input, None, None, grad_bias, None, None, None
+
+
 class Linear4bit(nn.Linear):
     """4-bit quantized linear layer for ROCm.
 
@@ -12,6 +65,10 @@ class Linear4bit(nn.Linear):
 
     Stores weights as packed INT4 (2 values per uint8 byte) with row-wise
     symmetric quantization. Dequantizes on-the-fly during forward pass.
+
+    Uses a custom autograd Function that saves packed INT4 tensors instead of
+    dequantized bf16 weights in the computation graph. This prevents the ~5 GB
+    autograd memory overhead that made QLoRA training OOM on 24 GB cards.
 
     VRAM per layer: out * ceil(in/2) bytes (packed) + out * 4 bytes (scale)
     vs nn.Linear:   out * in * 2 bytes (bf16)
@@ -60,14 +117,20 @@ class Linear4bit(nn.Linear):
 
     def _dequantize(self):
         """Unpack INT4 nibbles and apply row-wise scale."""
-        low = (self.qweight & 0x0F).to(self.dtype) - 8.0
-        high = ((self.qweight >> 4) & 0x0F).to(self.dtype) - 8.0
-        w = torch.stack([low, high], dim=-1).reshape(self.out_features, -1)
-        w = w[:, :self.in_features]
-        return w * self.scale.to(self.dtype)
+        return _dequantize_packed(
+            self.qweight, self.scale, self.out_features, self.in_features, self.dtype
+        )
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        return F.linear(input.to(self.dtype), self._dequantize(), self.bias)
+        return _Linear4bitFn.apply(
+            input.to(self.dtype),
+            self.qweight,
+            self.scale,
+            self.bias,
+            self.out_features,
+            self.in_features,
+            self.dtype,
+        )
 
     def extra_repr(self) -> str:
         return (
