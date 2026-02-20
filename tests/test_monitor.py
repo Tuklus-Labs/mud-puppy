@@ -1,8 +1,10 @@
-"""Tests for mud_puppy.monitor -- GPU telemetry."""
+"""Tests for mud_puppy.monitor -- GPU telemetry + WebSocket server + callback."""
 
 import importlib.util
 import sys
+import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -102,3 +104,121 @@ def test_nvidia_smi_parsing():
     assert out["gpu_util"] == 87.0
     assert out["temperature"] == 72.0
     assert out["power_draw"] == 310.5
+
+
+# ------------------------------------------------------------------
+# Task 2: MonitorServer + MonitorCallback tests
+# ------------------------------------------------------------------
+
+MonitorServer = _monitor.MonitorServer
+MonitorCallback = _monitor.MonitorCallback
+
+
+def test_monitor_server_starts_and_stops():
+    """MonitorServer lifecycle: start sets is_running, stop clears it."""
+    server = MonitorServer(port=15980)  # high port to avoid conflicts
+    assert not server.is_running()
+
+    server.start()
+    try:
+        assert server.is_running()
+    finally:
+        server.stop()
+
+    assert not server.is_running()
+
+
+def test_monitor_callback_stores_metrics():
+    """on_log populates metrics_history with the expected fields."""
+    model = MagicMock()
+    model.named_parameters.return_value = []
+    cb = MonitorCallback(model=model, config_data={"lr": 1e-4})
+    # Simulate on_train_begin to set _start_time
+    state = SimpleNamespace(global_step=0, max_steps=100, epoch=0.0)
+    cb.on_train_begin(args=None, state=state, control=None)
+
+    # Simulate a log event at step 10
+    state.global_step = 10
+    state.epoch = 0.5
+    logs = {"loss": 0.42, "learning_rate": 5e-5, "grad_norm": 1.2}
+    cb.on_log(args=None, state=state, control=None, logs=logs)
+
+    assert len(cb.metrics_history) == 1
+    m = cb.metrics_history[0]
+    assert m["type"] == "metrics"
+    assert m["step"] == 10
+    assert m["max_steps"] == 100
+    assert m["loss"] == 0.42
+    assert m["lr"] == 5e-5
+    assert m["grad_norm"] == 1.2
+    assert "eta_seconds" in m
+    assert "steps_per_sec" in m
+
+
+def test_monitor_callback_computes_eta():
+    """ETA computation returns a plausible estimate from elapsed time."""
+    model = MagicMock()
+    model.named_parameters.return_value = []
+    cb = MonitorCallback(model=model, config_data={})
+
+    # Fake start time: 10 seconds ago
+    cb._start_time = time.time() - 10.0
+
+    # Simulate state: 50 of 100 steps done in ~10 seconds
+    state = SimpleNamespace(global_step=50, max_steps=100)
+    eta = cb._compute_eta(state)
+
+    # 50 remaining steps at 0.2 sec/step = ~10 seconds
+    assert 5.0 < eta < 15.0, f"ETA {eta} seems off for 50/100 steps in 10s"
+
+
+def test_monitor_callback_collects_lora_norms():
+    """LoRA norms are extracted from model params containing 'lora_' in name."""
+    # Build a mock model with named_parameters that include lora_ params
+    # (pure MagicMock -- no torch needed)
+
+    lora_a = MagicMock()
+    lora_a.requires_grad = True
+    lora_a.data = MagicMock()
+    lora_a.data.norm.return_value = MagicMock(item=MagicMock(return_value=0.5))
+
+    lora_b = MagicMock()
+    lora_b.requires_grad = True
+    lora_b.data = MagicMock()
+    lora_b.data.norm.return_value = MagicMock(item=MagicMock(return_value=1.2))
+
+    regular = MagicMock()
+    regular.requires_grad = True
+
+    model = MagicMock()
+    model.named_parameters.return_value = [
+        ("layer.0.lora_A", lora_a),
+        ("layer.0.lora_B", lora_b),
+        ("layer.0.weight", regular),  # not a lora param
+    ]
+
+    # Capture emitted messages via a mock server
+    mock_server = MagicMock()
+    cb = MonitorCallback(
+        model=model,
+        config_data={},
+        server=mock_server,
+        lora_norm_interval=50,
+    )
+    cb._start_time = time.time() - 10.0
+
+    # Trigger on_log at step 50 (divisible by lora_norm_interval)
+    state = SimpleNamespace(global_step=50, max_steps=200, epoch=1.0)
+    cb.on_log(args=None, state=state, control=None, logs={"loss": 0.3})
+
+    # Find the lora_norms broadcast call
+    calls = mock_server.broadcast.call_args_list
+    lora_msgs = [c.args[0] for c in calls if c.args[0].get("type") == "lora_norms"]
+
+    assert len(lora_msgs) == 1, f"Expected 1 lora_norms message, got {len(lora_msgs)}"
+    norms = lora_msgs[0]["norms"]
+    assert "layer.0.lora_A" in norms
+    assert "layer.0.lora_B" in norms
+    assert "layer.0.weight" not in norms
+    assert norms["layer.0.lora_A"] == 0.5
+    assert norms["layer.0.lora_B"] == 1.2
