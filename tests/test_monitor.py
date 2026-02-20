@@ -410,3 +410,59 @@ def test_tui_start_stop_no_live():
     tui.stop()
     # Should be safe to call multiple times
     tui.stop()
+
+
+# ------------------------------------------------------------------
+# Task 6: End-to-end integration test
+# ------------------------------------------------------------------
+
+def test_end_to_end_monitor_pipeline():
+    """Full pipeline: MonitorServer + MonitorCallback + simulated training steps."""
+    server = MonitorServer(port=15981)  # high port for testing
+    server.start()
+    assert server.is_running()
+
+    # Capture broadcasts
+    received = []
+    original_broadcast = server.broadcast
+    def capture(msg):
+        received.append(msg)
+        original_broadcast(msg)
+    server.broadcast = capture
+
+    try:
+        cb = MonitorCallback(
+            model=None,
+            config_data={"model": "test", "method": "full"},
+            server=server,
+            lora_norm_interval=0,
+        )
+
+        # Simulate on_train_begin
+        mock_state = MagicMock()
+        mock_state.global_step = 0
+        mock_state.max_steps = 100
+        mock_state.epoch = 0
+        cb.on_train_begin(None, mock_state, None)
+
+        # Simulate 3 logging steps
+        for step in [10, 20, 30]:
+            mock_state.global_step = step
+            mock_state.epoch = step / 100
+            cb.on_log(None, mock_state, None, logs={
+                "loss": 2.0 - step * 0.03,
+                "learning_rate": 2e-5 * (1 - step / 100),
+                "grad_norm": 0.5,
+            })
+
+        # Simulate on_train_end
+        cb.on_train_end(None, mock_state, None)
+
+        # Verify messages
+        types = [m["type"] for m in received]
+        assert "config" in types
+        assert types.count("metrics") == 3
+        assert "complete" in types
+        assert len(cb.metrics_history) == 3
+    finally:
+        server.stop()
