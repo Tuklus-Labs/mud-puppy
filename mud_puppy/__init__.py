@@ -58,6 +58,10 @@ __all__ = [
     # MXFP4 (block-wise 4-bit quantization)
     "quantize_model_mx4",
     "LinearMX4",
+    # Training monitor (WebSocket + TUI)
+    "MonitorServer",
+    "MonitorCallback",
+    "TUIMonitor",
 ]
 
 from .config import TrainingConfig
@@ -343,3 +347,36 @@ def LinearMX4(*args, **kwargs):
     """
     from .mxfp4_rocm import LinearMX4 as _LinearMX4
     return _LinearMX4(*args, **kwargs)
+
+
+# Training monitor exports (lazy imports to avoid aiohttp/rich at import time)
+
+
+def MonitorServer(*args, **kwargs):
+    """WebSocket server for real-time training telemetry.
+
+    Broadcasts metrics, GPU telemetry, and training events to connected
+    dashboard clients.
+    """
+    from .monitor import MonitorServer as _MonitorServer
+    return _MonitorServer(*args, **kwargs)
+
+
+def MonitorCallback(*args, **kwargs):
+    """HuggingFace TrainerCallback that feeds training metrics to MonitorServer.
+
+    Hooks into on_train_begin, on_log, and on_train_end to broadcast
+    loss, learning rate, ETA, and optional LoRA norm snapshots.
+    """
+    from .monitor import MonitorCallback as _MonitorCallback
+    return _MonitorCallback(*args, **kwargs)
+
+
+def TUIMonitor(*args, **kwargs):
+    """Rich-based terminal dashboard for live training monitoring.
+
+    Connects to MonitorServer and renders progress bars, loss sparklines,
+    GPU telemetry, and training configuration in the terminal.
+    """
+    from .tui import TUIMonitor as _TUIMonitor
+    return _TUIMonitor(*args, **kwargs)

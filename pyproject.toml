@@ -42,6 +42,12 @@ jax-tpu = [
     "orbax-checkpoint",
 ]
 
+# Training monitor (WebSocket dashboard + Rich TUI)
+monitor = [
+    "aiohttp>=3.9",
+    "rich>=13.0",
+]
+
 [project.scripts]
 mud-puppy = "mud_puppy.cli:main"
 mud-puppy-interactive = "mud_puppy.interactive:main"
