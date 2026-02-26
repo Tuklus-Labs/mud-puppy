@@ -19,7 +19,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="method",
         help=(
             "finetuning method: full, lora, qlora, gptq, qat, "
-            "preference, rl, multimodal, rm, prm"
+            "preference, rl, multimodal, rm, prm, embedding"
         ),
     )
     parser.add_argument(
@@ -294,6 +294,10 @@ def main() -> None:
         from .reward import train_reward_model
 
         train_reward_model(config)
+    elif config.finetuning_method == "embedding":
+        from .embedding import run_embedding_training
+
+        run_embedding_training(config)
     else:
         run_training(config)
 
