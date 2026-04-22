@@ -106,110 +106,6 @@ def _prepare_model_for_kbit_training_rocm(model: nn.Module) -> None:
         model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
 
 
-class StreamWrapper(nn.Module):
-    """Wrapper that streams model layers to GPU on demand.
-
-    This allows training models that don't fit entirely in GPU memory by
-    keeping most layers on CPU and moving them to GPU only when needed.
-
-    Strategy:
-    - Keep embedding/lm_head on GPU always (small, always needed)
-    - Move transformer layers to GPU for forward pass
-    - Keep layers on GPU through backward pass
-    - Offload to CPU after optimizer step (via offload_to_cpu method)
-
-    Note: This provides memory savings between training steps, not during
-    the forward/backward pass itself. For true streaming during forward/backward,
-    use gradient checkpointing with this wrapper.
-    """
-
-    def __init__(self, model: nn.Module):
-        super().__init__()
-        self.model = model
-        self._device = get_device()
-        self._cpu = torch.device("cpu")
-        self._on_gpu = False
-
-        # Find the transformer layers (supports LLaMA, GPT-2, etc.)
-        self._layers = self._find_layers()
-
-        # Move everything to CPU initially
-        self.model.to(self._cpu)
-
-        # Keep embedding and output layers on GPU (small and always needed)
-        self._move_endpoints_to_gpu()
-
-    def _find_layers(self) -> List[nn.Module]:
-        """Find the main transformer layers that can be streamed."""
-        # LLaMA-style: model.layers
-        if hasattr(self.model, 'model') and hasattr(self.model.model, 'layers'):
-            return list(self.model.model.layers)
-        # GPT-2 style: transformer.h
-        if hasattr(self.model, 'transformer') and hasattr(self.model.transformer, 'h'):
-            return list(self.model.transformer.h)
-        # Fallback: no streaming possible
-        return []
-
-    def _move_endpoints_to_gpu(self):
-        """Move embedding and output projection to GPU (always needed)."""
-        # Move embeddings
-        if hasattr(self.model, 'get_input_embeddings'):
-            emb = self.model.get_input_embeddings()
-            if emb is not None:
-                emb.to(self._device)
-
-        # Move output projection (lm_head)
-        if hasattr(self.model, 'lm_head'):
-            self.model.lm_head.to(self._device)
-
-        # Move final layer norm
-        if hasattr(self.model, 'model') and hasattr(self.model.model, 'norm'):
-            self.model.model.norm.to(self._device)
-        if hasattr(self.model, 'transformer') and hasattr(self.model.transformer, 'ln_f'):
-            self.model.transformer.ln_f.to(self._device)
-
-    def _ensure_on_gpu(self):
-        """Move all layers to GPU for forward/backward pass."""
-        if not self._on_gpu:
-            for layer in self._layers:
-                layer.to(self._device)
-            self._on_gpu = True
-
-    def offload_to_cpu(self):
-        """Move transformer layers back to CPU to free VRAM.
-
-        Call this after optimizer.step() to free memory between training steps.
-        """
-        if self._on_gpu:
-            for layer in self._layers:
-                layer.to(self._cpu)
-            self._on_gpu = False
-            # Clear CUDA cache
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-    def forward(self, *args, **kwargs):
-        # Ensure all layers are on GPU for forward pass
-        self._ensure_on_gpu()
-
-        # Move inputs to GPU
-        args = tuple(
-            a.to(self._device) if isinstance(a, torch.Tensor) else a for a in args
-        )
-        kwargs = {
-            k: v.to(self._device) if isinstance(v, torch.Tensor) else v
-            for k, v in kwargs.items()
-        }
-
-        return self.model(*args, **kwargs)
-
-    def __getattr__(self, name: str):
-        try:
-            return super().__getattr__(name)
-        except AttributeError:
-            return getattr(self.model, name)
-
-
 class DynamicBatchSampler(Sampler):
     """Sampler that creates batches based on a token budget.
 
@@ -342,12 +238,19 @@ class MudPuppyTrainer(Trainer):
             drop_last=self.args.dataloader_drop_last,
         )
 
+        num_workers = self.args.dataloader_num_workers
+        extra = {}
+        if num_workers > 0:
+            extra["persistent_workers"] = True
+            extra["prefetch_factor"] = 4
+
         return DataLoader(
             self.train_dataset,
             batch_sampler=sampler,
             collate_fn=self.data_collator,
-            num_workers=self.args.dataloader_num_workers,
+            num_workers=num_workers,
             pin_memory=self.args.dataloader_pin_memory,
+            **extra,
         )
 
 
@@ -496,10 +399,12 @@ def load_model(config: TrainingConfig):
             print("[mud-puppy] Moving model to GPU...")
             model = model.to("cuda")
 
-    # Streaming: keep model on CPU and stream leaf modules to active device
+    # Streaming: keep model on CPU and stream transformer blocks to GPU via prefetch ring
     if config.stream:
         model.to("cpu")
-        model = StreamWrapper(model)
+        from .stream import LayerStreamer
+        model = LayerStreamer.wrap(model, prefetch_layers=config.prefetch_layers)
+        print(f"[mud-puppy] LayerStreamer active (prefetch_layers={config.prefetch_layers})")
 
     # Experimental FP8 support
     if config.precision == "fp8":
@@ -828,12 +733,6 @@ def run_training(config: TrainingConfig) -> None:
     print(f"[mud-puppy] Output: {config.output_dir}")
     print(f"[mud-puppy] Precision: {config.precision}")
 
-    # Warn about incompatible options
-    if config.stream and config.finetuning_method in ("lora", "qlora"):
-        print("[mud-puppy] WARNING: Streaming + LoRA is not supported (LoRA modules won't stream)")
-        print("[mud-puppy] Disabling streaming mode for this training run")
-        config = TrainingConfig(**{**config.__dict__, "stream": False})
-
     # Set up distributed training if requested
     is_distributed = setup_distributed(config)
     if is_distributed:
@@ -859,10 +758,12 @@ def run_training(config: TrainingConfig) -> None:
     if config.device_map == "pipeline":
         model = setup_pipeline_parallelism(model, config)
 
-    # Compile model if requested
-    if config.compile and hasattr(torch, "compile"):
-        print("[mud-puppy] Compiling model with torch.compile...")
-        model = torch.compile(model)
+    # Compile model if requested (skip when --stream is active: custom hooks don't mesh with compile)
+    if config.compile and hasattr(torch, "compile") and not config.stream:
+        print(f"[mud-puppy] Compiling model with torch.compile (mode={config.compile_mode})...")
+        model = torch.compile(model, mode=config.compile_mode)
+    elif config.compile and config.stream:
+        print("[mud-puppy] torch.compile disabled when --stream is active")
 
     # Load and preprocess dataset
     dataset = load_and_preprocess_dataset(config, tokenizer)
@@ -881,10 +782,19 @@ def run_training(config: TrainingConfig) -> None:
     training_args = create_training_args(config)
 
     # Set up data collator
-    data_collator = DataCollatorForLanguageModeling(
-        tokenizer=tokenizer,
-        mlm=False,
-    )
+    if config.pack_sequences:
+        from .packing import PackedCollator
+        max_seq = config.max_seq_length if config.max_seq_length > 0 else 2048
+        data_collator = PackedCollator(
+            max_seq_length=max_seq,
+            pad_token_id=tokenizer.pad_token_id or 0,
+        )
+        print(f"[mud-puppy] Sequence packing enabled (max_seq_length={max_seq})")
+    else:
+        data_collator = DataCollatorForLanguageModeling(
+            tokenizer=tokenizer,
+            mlm=False,
+        )
 
     # Set up callbacks
     callbacks = [LoggingCallback(config.log_with)]
@@ -896,10 +806,9 @@ def run_training(config: TrainingConfig) -> None:
 
     # zero_offload is wired via MudPuppyTrainer.create_optimizer, not a callback
 
-    # Monitor callback (web dashboard and/or TUI)
+    # Monitor callback (web dashboard via WebSocket)
     monitor_server = None
-    monitor_tui_inst = None
-    if config.monitor or config.monitor_tui:
+    if config.monitor:
         from .monitor import MonitorCallback, MonitorServer, start_gpu_telemetry
 
         config_data = {
@@ -915,24 +824,18 @@ def run_training(config: TrainingConfig) -> None:
             "quant_backend": config.quant_backend if config.finetuning_method == "qlora" else None,
         }
 
-        if config.monitor:
-            monitor_server = MonitorServer(port=config.monitor_port)
-            monitor_server.start()
-            start_gpu_telemetry(monitor_server)
-            print(f"[mud-puppy] Training monitor: http://localhost:{config.monitor_port}")
-            import webbrowser
-            webbrowser.open(f"http://localhost:{config.monitor_port}")
-
-        if config.monitor_tui:
-            from .tui import TUIMonitor
-            monitor_tui_inst = TUIMonitor()
-            monitor_tui_inst.start()
+        monitor_server = MonitorServer(port=config.monitor_port)
+        monitor_server.start()
+        start_gpu_telemetry(monitor_server)
+        print(f"[mud-puppy] Training monitor: http://localhost:{config.monitor_port}")
+        import webbrowser
+        webbrowser.open(f"http://localhost:{config.monitor_port}")
 
         callbacks.append(MonitorCallback(
             model=model,
             config_data=config_data,
             server=monitor_server,
-            tui=monitor_tui_inst,
+            tui=None,
             lora_norm_interval=50 if config.finetuning_method in ("lora", "qlora") else 0,
         ))
 
@@ -977,8 +880,6 @@ def run_training(config: TrainingConfig) -> None:
     # Stop monitor
     if monitor_server:
         monitor_server.stop()
-    if monitor_tui_inst:
-        monitor_tui_inst.stop()
 
     # Save final model
     print("[mud-puppy] Saving model...")
