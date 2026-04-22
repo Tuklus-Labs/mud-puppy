@@ -312,10 +312,18 @@ class CPUOffloadOptimizer:
         if self.config.offload_gradients:
             self._transfer_grads_to_cpu()
 
-        # Wait for async D2H grad copies to finish before reading CPU grads.
-        if self._grad_sync_event is not None:
-            torch.cuda.current_stream().wait_event(self._grad_sync_event)
-            self._grad_sync_event = None
+        # CRITICAL: block the CPU thread until the D2H grad transfer on the
+        # dedicated stream has actually completed. wait_event on the current
+        # stream only serialises GPU work, not the Python reader. Without
+        # this, _run_optimizer_on_cpu reads zero/stale pinned buffers and
+        # silently trains on wrong gradients.
+        if (
+            self.config.offload_gradients
+            and self.config.async_transfer
+            and self._grad_stream is not None
+        ):
+            self._grad_stream.synchronize()
+        self._grad_sync_event = None  # no-op bookkeeping reset
 
         # Run optimizer on CPU
         if self.config.cpu_optimizer_step:
