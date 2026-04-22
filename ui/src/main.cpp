@@ -6,6 +6,8 @@
 #include "dataset_peek.hpp"
 #include "checkpoint_scan.hpp"
 
+#include <curl/curl.h>
+
 #include <csignal>
 #include <memory>
 
@@ -30,6 +32,12 @@ int main(int /*argc*/, char** /*argv*/) {
     // Install SIGTERM/SIGINT for clean shutdown of child processes.
     signal(SIGTERM, handle_sigterm);
     signal(SIGINT,  handle_sigterm);
+
+    // libcurl requires one global init before any easy handle is created.
+    if (curl_global_init(CURL_GLOBAL_ALL) != CURLE_OK) {
+        PHOS_LOG_ERROR("curl_global_init failed");
+        return 1;
+    }
 
     auto manifest = phos::resolve_manifest();
     PHOS_LOG_INFO("mud-puppy-studio starting, manifest={}", manifest);
@@ -99,5 +107,9 @@ int main(int /*argc*/, char** /*argv*/) {
         return mp_studio::dataset_peek(path, n);
     }));
 
-    return app.run();
+    int rc = app.run();
+
+    // libcurl cleanup mirrors the init at startup.
+    curl_global_cleanup();
+    return rc;
 }
