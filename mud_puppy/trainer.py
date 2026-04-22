@@ -38,11 +38,16 @@ from transformers import (
     PreTrainedTokenizer,
 )
 
-# Optional vision import (not available in all transformers versions)
+# Optional vision imports (not available in all transformers versions)
 try:
-    from transformers import AutoModelForVision2Seq
+    from transformers import AutoModelForVision2Seq, AutoProcessor
 except ImportError:
-    AutoModelForVision2Seq = None
+    try:
+        from transformers import AutoModelForVision2Seq
+        AutoProcessor = None
+    except ImportError:
+        AutoModelForVision2Seq = None
+        AutoProcessor = None
 
 from .config import TrainingConfig
 
@@ -257,11 +262,22 @@ class MudPuppyTrainer(Trainer):
         )
 
 
-def load_model(config: TrainingConfig):
+def load_model(config: TrainingConfig, calibration_data: Optional[List[torch.Tensor]] = None):
     """Load the base model and tokenizer with optional quantization.
 
     For ``finetuning_method == 'multimodal'``, this will attempt to load a
     vision+language model via :class:`AutoModelForVision2Seq`.
+
+    Parameters
+    ----------
+    config:
+        Training configuration.
+    calibration_data:
+        Optional list of input tensors used for GPTQ calibration on ROCm.
+        Typically the first 128 batches of the training set, each of shape
+        [batch, seq_len] (token ids) or [batch, in_features] for raw layers.
+        If None and GPTQ+ROCm is requested, attempts to load a pre-quantized
+        checkpoint from config.model_name_or_path instead.
     """
     try:
         tokenizer = AutoTokenizer.from_pretrained(
@@ -276,24 +292,73 @@ def load_model(config: TrainingConfig):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Multimodal: delegate to vision-language model class
+    # Multimodal: load AutoProcessor + AutoModelForVision2Seq
     if config.finetuning_method == "multimodal":
         if AutoModelForVision2Seq is None:
             raise RuntimeError(
                 "Multimodal training requires AutoModelForVision2Seq, "
                 "which is not available in this version of transformers"
             )
+
+        # Load processor (handles both image and text preprocessing).
+        # Fall back to the plain AutoTokenizer when AutoProcessor is not
+        # available (older transformers) or when the model has no image
+        # processor registered.
+        processor = None
+        if AutoProcessor is not None:
+            try:
+                processor = AutoProcessor.from_pretrained(
+                    config.model_name_or_path,
+                    trust_remote_code=config.trust_remote_code,
+                )
+                print("[mud-puppy] Loaded AutoProcessor for multimodal model")
+            except Exception as proc_err:
+                print(
+                    f"[mud-puppy] AutoProcessor load failed ({proc_err}); "
+                    "falling back to AutoTokenizer"
+                )
+
+        if processor is None:
+            # Plain tokenizer fallback -- pixel_values will not be produced
+            processor = tokenizer
+            print("[mud-puppy] Using tokenizer as processor fallback")
+
+        # Ensure pad token is set on the processor's tokenizer
+        proc_tok = getattr(processor, "tokenizer", processor)
+        if getattr(proc_tok, "pad_token", None) is None:
+            proc_tok.pad_token = getattr(proc_tok, "eos_token", None)
+
+        # Replace the returned tokenizer with the full processor so that
+        # callers (load_and_preprocess_dataset, run_training) receive it
+        tokenizer = processor
+
         try:
+            model_dtype_map = {
+                "fp16": torch.float16,
+                "bf16": torch.bfloat16,
+                "fp32": torch.float32,
+            }
+            model_dtype = model_dtype_map.get(config.precision, torch.bfloat16)
+
             model = AutoModelForVision2Seq.from_pretrained(
                 config.model_name_or_path,
                 trust_remote_code=config.trust_remote_code,
-                device_map=None if config.stream else config.device_map,
+                torch_dtype=model_dtype,
+                device_map=None,  # load to CPU first (ROCm segfault avoidance)
+                low_cpu_mem_usage=True,
             )
         except OSError as e:
             raise RuntimeError(
                 "Failed to load multimodal model; ensure this checkpoint "
-                "is compatible with AutoModelForVision2Seq"
+                "is compatible with AutoModelForVision2Seq. "
+                "Models known to work: LLaVA-1.5, Phi-3-vision, Qwen2-VL, InternVL2. "
+                "For models requiring custom code, set trust_remote_code=True."
             ) from e
+
+        # Move to GPU if available and not streaming
+        if not config.stream and torch.cuda.is_available():
+            print("[mud-puppy] Moving multimodal model to GPU...")
+            model = model.to("cuda")
 
     # QLoRA: load in 16-bit, apply 4-bit quantization, prepare for k-bit training
     elif config.finetuning_method == "qlora":
@@ -335,16 +400,48 @@ def load_model(config: TrainingConfig):
         print("[mud-puppy] Preparing model for k-bit training...")
         _prepare_model_for_kbit_training_rocm(model)
 
-    # GPTQ: either ROCm-native simple GPTQ, or auto-gptq on CUDA
+    # GPTQ: either ROCm-native real GPTQ, or auto-gptq on CUDA
     elif config.finetuning_method == "gptq":
         if is_rocm():
-            from .gptq_rocm import load_quantized
+            if calibration_data is not None:
+                # Real GPTQ: load fp32 model, run Hessian-calibrated quantization
+                from .gptq_rocm import quantize_model_gptq
 
-            model = load_quantized(
-                AutoModelForCausalLM,
-                config.model_name_or_path,
-                trust_remote_code=config.trust_remote_code,
-            )
+                print("[mud-puppy] Loading fp32 model for GPTQ calibration...")
+                try:
+                    model = AutoModelForCausalLM.from_pretrained(
+                        config.model_name_or_path,
+                        trust_remote_code=config.trust_remote_code,
+                        torch_dtype=torch.float32,
+                        device_map=None,
+                        low_cpu_mem_usage=True,
+                    )
+                except OSError as e:
+                    raise RuntimeError(
+                        f"Failed to load model from {config.model_name_or_path}"
+                    ) from e
+
+                n_calib = len(calibration_data)
+                print(f"[mud-puppy] Running GPTQ with {n_calib} calibration batches...")
+                model = quantize_model_gptq(
+                    model,
+                    calibration_data=calibration_data,
+                    bits=4,
+                    group_size=getattr(config, "gptq_group_size", 128),
+                    actorder=getattr(config, "gptq_actorder", True),
+                    damp_percent=getattr(config, "gptq_damp_percent", 0.01),
+                )
+                print("[mud-puppy] GPTQ quantization complete")
+            else:
+                # Fallback: load pre-quantized model from path
+                from .gptq_rocm import load_quantized
+
+                print("[mud-puppy] Loading pre-quantized GPTQ model (no calibration data)...")
+                model = load_quantized(
+                    AutoModelForCausalLM,
+                    config.model_name_or_path,
+                    trust_remote_code=config.trust_remote_code,
+                )
         else:
             try:  # pragma: no cover - auto_gptq optional
                 from auto_gptq import AutoGPTQForCausalLM
@@ -409,11 +506,32 @@ def load_model(config: TrainingConfig):
         model = LayerStreamer.wrap(model, prefetch_layers=config.prefetch_layers)
         print(f"[mud-puppy] LayerStreamer active (prefetch_layers={config.prefetch_layers})")
 
-    # Experimental FP8 support
+    # FP8 mixed-precision training via per-layer module replacement.
+    # This is the delayed-scaling recipe (Transformer Engine style),
+    # adapted for ROCm `_scaled_mm`. See mud_puppy/fp8_rocm.py.
     if config.precision == "fp8":
         if not hasattr(torch, "float8_e4m3fn"):
-            raise RuntimeError("FP8 precision is not supported in this PyTorch build")
-        model.to(torch.float8_e4m3fn)
+            raise RuntimeError(
+                "FP8 requires a PyTorch build with float8_e4m3fn dtype "
+                "(torch >= 2.1, ROCm 6.0+ or CUDA 11.8+)."
+            )
+        from .fp8_rocm import apply_fp8, is_fp8_hardware_available, fp8_layer_count
+
+        apply_fp8(model)
+        n_fp8 = fp8_layer_count(model)
+        if is_fp8_hardware_available():
+            print(
+                f"[mud-puppy] FP8 training enabled on hardware path "
+                f"({n_fp8} layers; torch._scaled_mm)"
+            )
+        else:
+            print(
+                "[mud-puppy] WARNING: FP8 requested but current GPU has no "
+                "hardware FP8 (ROCm requires MI300+/RDNA4, CUDA requires "
+                "SM 8.9+). Running emulated cast-dequant path — correct but "
+                "not faster than bf16. "
+                f"{n_fp8} layers wrapped."
+            )
 
     return model, tokenizer
 
@@ -564,7 +682,35 @@ def load_and_preprocess_dataset(
     """Load and preprocess the training dataset.
 
     Supports JSONL format with chat-style messages or simple text fields.
+
+    For ``finetuning_method == "multimodal"``, the ``tokenizer`` argument is
+    expected to be an ``AutoProcessor`` (as returned by ``load_model`` in the
+    multimodal branch). Image paths are preserved in the dataset; images are
+    loaded lazily by the ``MultimodalCollator`` during training.
     """
+    # Multimodal path: delegate to the dedicated multimodal tokenizer
+    if config.finetuning_method == "multimodal":
+        from .multimodal import tokenize_multimodal_dataset
+
+        import os as _os
+        base_dir = _os.path.dirname(_os.path.abspath(config.dataset_path))
+
+        if config.max_seq_length > 0:
+            max_len = config.max_seq_length
+        else:
+            # Try to get max length from the processor's tokenizer
+            proc_tok = getattr(tokenizer, "tokenizer", tokenizer)
+            max_len = min(getattr(proc_tok, "model_max_length", 2048), 2048)
+
+        print(f"[mud-puppy] Tokenizing multimodal dataset (max_length={max_len})...")
+        return tokenize_multimodal_dataset(
+            dataset_path=config.dataset_path,
+            processor=tokenizer,
+            max_length=max_len,
+            base_dir=base_dir,
+            preprocessing_workers=config.preprocessing_workers,
+        )
+
     # Load the dataset
     dataset = load_dataset("json", data_files=config.dataset_path, split="train")
 
@@ -810,7 +956,27 @@ def run_training(config: TrainingConfig) -> None:
     training_args = create_training_args(config)
 
     # Set up data collator
-    if config.pack_sequences:
+    if config.finetuning_method == "multimodal":
+        from .multimodal import MultimodalCollator
+        import os as _os
+
+        max_seq = config.max_seq_length if config.max_seq_length > 0 else 2048
+        base_dir = _os.path.dirname(_os.path.abspath(config.dataset_path))
+
+        # Determine pad token id from the processor's tokenizer or the tokenizer itself
+        proc_tok = getattr(tokenizer, "tokenizer", tokenizer)
+        pad_id = getattr(proc_tok, "pad_token_id", None) or 0
+
+        data_collator = MultimodalCollator(
+            processor=tokenizer,
+            tokenizer=proc_tok,
+            max_length=max_seq,
+            pad_token_id=pad_id,
+            base_dir=base_dir,
+        )
+        print("[mud-puppy] Using MultimodalCollator (image + text collation)")
+
+    elif config.pack_sequences:
         from .packing import PackedCollator
         max_seq = config.max_seq_length if config.max_seq_length > 0 else 2048
         data_collator = PackedCollator(
@@ -834,6 +1000,13 @@ def run_training(config: TrainingConfig) -> None:
 
     # zero_offload is wired via MudPuppyTrainer.create_optimizer, not a callback
 
+    # QAT: recalibrate per-channel scales periodically during training so
+    # the fake-quant range tracks weight distribution shifts.
+    if config.finetuning_method == "qat":
+        from .qat_rocm import QATScaleCallback
+
+        callbacks.append(QATScaleCallback(interval=50, momentum=0.01))
+
     # Monitor callback (web dashboard via WebSocket)
     monitor_server = None
     if config.monitor:
@@ -855,9 +1028,12 @@ def run_training(config: TrainingConfig) -> None:
         monitor_server = MonitorServer(port=config.monitor_port)
         monitor_server.start()
         start_gpu_telemetry(monitor_server)
-        print(f"[mud-puppy] Training monitor: http://localhost:{config.monitor_port}")
-        import webbrowser
-        webbrowser.open(f"http://localhost:{config.monitor_port}")
+        # Publish the actual bound port on stdout as a single line so the
+        # Phos shell (and any other parent process) can parse it without
+        # needing to pre-allocate a port (avoids the bind(:0) TOCTOU race).
+        bound = monitor_server.port
+        print(f"MUD_PUPPY_MONITOR_PORT={bound}", flush=True)
+        print(f"[mud-puppy] Training monitor: http://localhost:{bound}")
 
         callbacks.append(MonitorCallback(
             model=model,
