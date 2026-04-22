@@ -1,6 +1,6 @@
 [project]
 name = "mud-puppy"
-version = "0.3.0"
+version = "0.4.0"
 description = "A ROCm-first LLM fine-tuning framework"
 authors = [ { name = "LLM" } ]
 requires-python = ">=3.9"
@@ -42,10 +42,9 @@ jax-tpu = [
     "orbax-checkpoint",
 ]
 
-# Training monitor (WebSocket dashboard + Rich TUI)
+# Training monitor (WebSocket server for mud-puppy-studio and legacy browser dashboard)
 monitor = [
     "aiohttp>=3.9",
-    "rich>=13.0",
 ]
 
 [project.scripts]

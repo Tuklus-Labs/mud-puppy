@@ -395,6 +395,18 @@ Requires PyTorch with FP8 support.
 
 ## Version History
 
+### v0.4.0
+
+- **True per-layer RAM to GPU streaming** via `LayerStreamer` with a K-slot prefetch ring (`--stream --prefetch-layers N`). LoRA adapters are pinned to GPU so streaming + LoRA/QLoRA now works; the old incompatibility warning is gone. Streaming is intentionally rejected in combination with gradient checkpointing to avoid silent recomputation races.
+- **Sequence packing** via `PackedCollator` with block-diagonal attention masks and per-segment position IDs (`--pack-sequences`). Typical 1.5-3x throughput gain on varied-length chat datasets.
+- **Unified CPU offload path**: `CPUOffloadOptimizer` now uses foreach AdamW, correctly synchronizes the async D2H gradient stream before the CPU optimizer step (fixes a silent stale-gradient bug), and preserves per-group hyperparameters on rebuild. `ZeroOffloadCallback` removed; `PartitionedOptimizer` deprecated.
+- **ROCm allocator default** changed to `expandable_segments:True` (was `max_split_size_mb:128`).
+- **`--compile-mode` flag** with `reduce-overhead` as the default. `torch.compile` is automatically disabled when streaming.
+- **Monitor emissions**: `tokens_per_sec`, separate `memory_stats` event (with `allocated_gb`/`reserved_gb`/`active_gb`/`fragmentation`), and `stream_stats` for live GPU-residency visualisation.
+- **mud-puppy-studio**: new standalone Phos desktop app (`ui/`) replaces both the HTML dashboard and the Rich TUI. GTK4 + WebKitGTK shell spawns training sidecars, proxies their WebSocket monitor, and provides Launch / Monitor / Runs / Library / Logs panes over a Vector-Neon Molten React frontend. Build: `cd ui && cmake -B build && cmake --build build && (cd web && npm install && npm run build)`.
+- **Removed**: `--monitor-tui` flag and `mud_puppy.tui` module; `StreamWrapper` class (superseded by `LayerStreamer`); `ZeroOffloadCallback` (superseded by `CPUOffloadOptimizer` via `MudPuppyTrainer.create_optimizer`).
+- **Benchmark**: `bench/throughput.py` with four configs (baseline / packing / streaming / packing+stream) and per-config peak memory accounting.
+
 ### v0.3.0
 
 - Native `GRPOTrainer` support for reinforcement learning
