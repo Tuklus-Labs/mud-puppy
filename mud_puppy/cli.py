@@ -198,6 +198,33 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["fp16", "bf16", "fp32"],
         help="precision for the merged model weights",
     )
+    parser.add_argument(
+        "--gptq-group-size",
+        dest="gptq_group_size",
+        type=int,
+        default=128,
+        help="GPTQ group size for per-group quantization (default: 128)",
+    )
+    parser.add_argument(
+        "--gptq-actorder",
+        dest="gptq_actorder",
+        action="store_true",
+        default=True,
+        help="enable activation-order reordering in GPTQ (default: on)",
+    )
+    parser.add_argument(
+        "--no-gptq-actorder",
+        dest="gptq_actorder",
+        action="store_false",
+        help="disable GPTQ activation-order reordering",
+    )
+    parser.add_argument(
+        "--gptq-damp-percent",
+        dest="gptq_damp_percent",
+        type=float,
+        default=0.01,
+        help="GPTQ Hessian damping percentage, must be in (0, 1) (default: 0.01)",
+    )
     parser.add_argument("--monitor", dest="monitor", action="store_true",
         help="enable real-time web training dashboard (port 5980)")
     parser.add_argument("--monitor-port", dest="monitor_port", type=int, default=5980,
@@ -281,6 +308,9 @@ def main() -> None:
         distributed=args.distributed,
         local_rank=args.local_rank,
         quant_backend=args.quant_backend,
+        gptq_group_size=args.gptq_group_size,
+        gptq_actorder=args.gptq_actorder,
+        gptq_damp_percent=args.gptq_damp_percent,
     )
 
     # Optional training hyperparameters from CLI override dataclass defaults

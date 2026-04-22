@@ -49,6 +49,11 @@ class TrainingConfig:
     quant_backend: str = "int4"  # int4 (bnb_rocm) or mxfp4 (block-scaled)
     quant_block_size: int = 32   # Block size for mxfp4 quantization
 
+    # GPTQ hyperparameters (used when finetuning_method == "gptq")
+    gptq_group_size: int = 128
+    gptq_actorder: bool = True
+    gptq_damp_percent: float = 0.01
+
     # Method-specific switches (currently mostly informational)
     qat: bool = False
     grpo: bool = False
@@ -162,6 +167,10 @@ class TrainingConfig:
             raise ValueError(
                 f"lora_r must be > 0 for method={self.finetuning_method!r}, "
                 f"got {self.lora_r}"
+            )
+        if not 0 < self.gptq_damp_percent < 1:
+            raise ValueError(
+                f"gptq_damp_percent must be in (0, 1), got {self.gptq_damp_percent}"
             )
         if self.max_seq_length < 0:
             raise ValueError(

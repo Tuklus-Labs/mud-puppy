@@ -428,9 +428,9 @@ def load_model(config: TrainingConfig, calibration_data: Optional[List[torch.Ten
                     model,
                     calibration_data=calibration_data,
                     bits=4,
-                    group_size=getattr(config, "gptq_group_size", 128),
-                    actorder=getattr(config, "gptq_actorder", True),
-                    damp_percent=getattr(config, "gptq_damp_percent", 0.01),
+                    group_size=config.gptq_group_size,
+                    actorder=config.gptq_actorder,
+                    damp_percent=config.gptq_damp_percent,
                 )
                 print("[mud-puppy] GPTQ quantization complete")
             else:
