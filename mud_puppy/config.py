@@ -102,6 +102,10 @@ class TrainingConfig:
             raise ValueError("tokens_per_batch must be non-negative")
         if self.max_seq_length < 0:
             raise ValueError("max_seq_length must be non-negative")
+        if self.prefetch_layers < 1:
+            raise ValueError(
+                f"prefetch_layers must be >= 1, got {self.prefetch_layers}"
+            )
         if self.distributed and torch.cuda.device_count() < 2:
             # Note: torch.distributed on ROCm still reports as CUDA in PyTorch
             raise ValueError("Distributed training requires at least 2 GPUs")
@@ -139,6 +143,12 @@ class TrainingConfig:
             raise ValueError(f"Unsupported logging backend: {self.log_with}")
         if not 0.0 <= self.lora_dropout <= 1.0:
             raise ValueError("lora_dropout must be between 0.0 and 1.0")
+
+        if self.compile_mode not in {"default", "reduce-overhead", "max-autotune"}:
+            raise ValueError(
+                f"Unsupported compile_mode: {self.compile_mode}. "
+                "Must be one of: default, reduce-overhead, max-autotune"
+            )
 
         self._validate_paths()
         self._validate_combinations()

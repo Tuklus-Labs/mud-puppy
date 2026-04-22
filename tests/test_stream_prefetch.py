@@ -76,6 +76,19 @@ def test_streamer_respects_prefetch_depth():
     assert len(streamer._ring_slots) == 3
 
 
+def test_streamer_rejects_zero_prefetch_layers():
+    """prefetch_layers=0 is invalid; LayerStreamer should refuse to build.
+
+    CUDA availability is irrelevant -- the ValueError fires before the
+    CUDA check, so this can run on any host.
+    """
+    model = ToyTransformer(n_layers=2, dim=16)
+    with pytest.raises(ValueError, match="prefetch_layers"):
+        LayerStreamer(model, prefetch_layers=0)
+    with pytest.raises(ValueError, match="prefetch_layers"):
+        LayerStreamer(model, prefetch_layers=-1)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
 def test_streamer_pins_lora_adapters():
     """LoRA adapters must stay GPU-resident through eviction cycles."""

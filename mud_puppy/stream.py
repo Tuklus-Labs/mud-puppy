@@ -6,8 +6,9 @@ copies the next block asynchronously while the compute stream executes
 the current one, hiding transfer latency.
 
 Architecture:
-- Two CUDA streams: `compute_stream` (forward/backward) and `h2d_stream`
-  (host-to-device copies).
+- Dedicated `h2d_stream` handles host-to-device copies; compute runs on
+  whatever stream the trainer has installed as `torch.cuda.current_stream()`
+  (PyTorch's default stream by default).
 - Ring of K GPU slots (K = prefetch_layers). Each slot holds one block's
   weight tensors.
 - Pre-forward hook on block N: issue async H2D for block N+1 on h2d_stream;
@@ -85,6 +86,12 @@ class LayerStreamer:
     """
 
     def __init__(self, model: nn.Module, prefetch_layers: int = 2) -> None:
+        if prefetch_layers < 1:
+            raise ValueError(
+                f"prefetch_layers must be >= 1, got {prefetch_layers}. "
+                "A zero-slot ring has nowhere to load the current layer."
+            )
+
         self.model = model
         self.prefetch_layers = prefetch_layers
 
@@ -94,8 +101,9 @@ class LayerStreamer:
         self.device = torch.device("cuda")
         self._cpu = torch.device("cpu")
 
-        # Two CUDA streams: one for compute, one for H2D copies.
-        self.compute_stream = torch.cuda.Stream()
+        # Dedicated H2D stream so async copies can overlap with compute
+        # running on torch.cuda.current_stream() (the trainer's main
+        # stream -- PyTorch's default or a custom one it installed).
         self.h2d_stream = torch.cuda.Stream()
 
         # Discover transformer blocks.
