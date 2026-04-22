@@ -52,3 +52,39 @@ def test_foreach_rebuild_preserves_per_group_hyperparameters():
         assert g.get("foreach") is True, (
             f"foreach not enabled on group with lr={g.get('lr')}"
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
+def test_offload_disabled_grads_reads_direct():
+    """With offload_gradients=False, CPU optimizer must read live GPU grads.
+
+    Regression: previously the CPU step still routed through
+    self._cpu_grads (a zero-initialised accumulator that is never filled
+    when offload_gradients is off), so the optimizer trained on zeros or
+    crashed on device mismatch.
+    """
+    model = nn.Linear(8, 8).cuda()
+    w0 = model.weight.detach().clone()
+
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-2)
+    cfg = OffloadConfig(
+        offload_optimizer=True,
+        offload_gradients=False,  # critical switch
+        pin_memory=True,
+        async_transfer=False,
+        cpu_optimizer_step=True,
+    )
+    wrapped = CPUOffloadOptimizer(opt, cfg)
+
+    x = torch.randn(4, 8, device="cuda")
+    out = (model(x) ** 2).sum()
+    out.backward()
+    assert model.weight.grad is not None
+    assert model.weight.grad.abs().sum().item() > 0
+
+    wrapped.step()
+
+    # Parameter must have moved. If the bug returns, the optimizer reads
+    # zero CPU grads and the weight stays exactly equal to w0.
+    delta = (model.weight.detach() - w0.to(model.weight.device)).abs().sum().item()
+    assert delta > 0, "parameters did not update; optimizer ran on zero grads"

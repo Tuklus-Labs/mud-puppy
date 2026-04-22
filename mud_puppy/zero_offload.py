@@ -311,13 +311,26 @@ class CPUOffloadOptimizer:
         # Now run the actual optimizer step on CPU
         # We need to temporarily move params to CPU
         gpu_params = {}
+        saved_grads = {}
         for pid, param in self._param_map.items():
             gpu_params[pid] = param.data
+            saved_grads[pid] = param.grad  # may be None
             # Move param to CPU for optimizer
             param.data = param.data.to(self._cpu, dtype=self.config.state_dtype)
-            # Set gradient from CPU accumulator
-            if pid in self._cpu_grads:
+            # Source the gradient.
+            if self.config.offload_gradients and pid in self._cpu_grads:
+                # CPU accumulator, already populated by _transfer_grads_to_cpu.
                 param.grad = self._cpu_grads[pid]
+            elif saved_grads[pid] is not None:
+                # Not offloading gradients: pull the live GPU grad directly
+                # down to CPU for this step. Without this the CPU optimizer
+                # either blew up on device mismatch or silently routed to
+                # the zero-initialised _cpu_grads and trained on garbage.
+                param.grad = saved_grads[pid].detach().to(
+                    self._cpu, dtype=self.config.state_dtype
+                )
+            else:
+                param.grad = None
 
         # Run optimizer
         self.optimizer.step()
