@@ -47,7 +47,10 @@ def configure_training() -> TrainingConfig:
 
 
 def run(config: TrainingConfig):
-    """Dispatch to the correct training routine based on method."""
+    """Dispatch to the correct training routine based on method.
+
+    Kept in lockstep with the equivalent dispatch in ``cli.py``.
+    """
     if config.finetuning_method == "preference":
         from .preference import run_preference_training
 
@@ -61,9 +64,12 @@ def run(config: TrainingConfig):
         from .reward import train_reward_model
 
         train_reward_model(config)
+    elif config.finetuning_method == "embedding":
+        from .embedding import run_embedding_training
+
+        run_embedding_training(config)
     else:
         from .trainer import run_training
-
 
         run_training(config)
 

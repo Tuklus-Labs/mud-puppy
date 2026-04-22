@@ -49,7 +49,11 @@ SUPPORTED_PREFERENCES = {"dpo", "ipo", "kto", "orpo"}
 
 
 def _load_pairwise_dataset(path: str):
-    """Load a pairwise preference dataset with (prompt, chosen, rejected)."""
+    """Load a pairwise preference dataset with (prompt, chosen, rejected).
+
+    Used by DPO, IPO, and ORPO. KTO uses a different schema (see
+    :func:`_load_kto_dataset`).
+    """
     dataset = load_dataset("json", data_files=path)["train"]
 
     required_columns = {"prompt", "chosen", "rejected"}
@@ -62,6 +66,36 @@ def _load_pairwise_dataset(path: str):
             "prompt": batch["prompt"],
             "chosen": batch["chosen"],
             "rejected": batch["rejected"],
+        }
+
+    dataset = dataset.map(preprocess, remove_columns=dataset.column_names)
+    return dataset
+
+
+def _load_kto_dataset(path: str):
+    """Load a KTO dataset with (prompt, completion, label).
+
+    KTO's loss takes individual completions tagged as desirable (label=True)
+    or undesirable (label=False) rather than chosen/rejected pairs. This is
+    a real schema difference from the other preference methods: passing
+    pairwise data to KTOTrainer causes a downstream crash.
+    """
+    dataset = load_dataset("json", data_files=path)["train"]
+
+    required_columns = {"prompt", "completion", "label"}
+    missing = required_columns.difference(dataset.column_names)
+    if missing:
+        raise ValueError(
+            f"KTO dataset missing columns: {', '.join(sorted(missing))}. "
+            "KTO expects {prompt, completion, label} rows, not the "
+            "pairwise {prompt, chosen, rejected} format used by DPO/IPO/ORPO."
+        )
+
+    def preprocess(batch):
+        return {
+            "prompt": batch["prompt"],
+            "completion": batch["completion"],
+            "label": batch["label"],
         }
 
     dataset = dataset.map(preprocess, remove_columns=dataset.column_names)
@@ -114,10 +148,13 @@ def run_preference_training(config: TrainingConfig):
     if torch.cuda.is_available():
         model = model.to("cuda")
 
-    dataset = _load_pairwise_dataset(config.dataset_path)
-    training_args = _build_training_args(config)
-
     pref = config.preference.lower()
+    # KTO uses {prompt, completion, label}; the rest use {prompt, chosen, rejected}.
+    if pref == "kto":
+        dataset = _load_kto_dataset(config.dataset_path)
+    else:
+        dataset = _load_pairwise_dataset(config.dataset_path)
+    training_args = _build_training_args(config)
 
     if pref == "dpo":
         if DPOTrainer is None:

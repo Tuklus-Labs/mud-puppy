@@ -235,11 +235,16 @@ def _run_ppo_grpo(config: TrainingConfig, tokenizer, dataset):
             # Compute heuristic rewards on response only (not prompt)
             rewards = _compute_heuristic_reward(responses)
 
-            # Convert to tensors for PPO step
+            # Convert to tensors for PPO step. Rewards must live on the same
+            # device as query/response tensors; older TRL PPOTrainer does not
+            # auto-migrate them, crashing with a device-mismatch RuntimeError
+            # if rewards stay on CPU while inputs are on CUDA.
             query_tensors = [inputs["input_ids"][i] for i in range(len(prompts))]
             response_tensors = response_only
+            reward_device = query_tensors[0].device if query_tensors else "cpu"
             reward_tensors = [
-                torch.tensor(r, dtype=torch.float32) for r in rewards
+                torch.tensor(r, dtype=torch.float32, device=reward_device)
+                for r in rewards
             ]
 
             # Run PPO step

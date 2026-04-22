@@ -50,7 +50,14 @@ except ImportError:
 
 
 def _prepare_reward_dataset(path: str):
-    """Prepare a reward modeling dataset."""
+    """Prepare a reward modeling dataset.
+
+    Re-reads ``dataset.column_names`` after every rename so that subsequent
+    heuristics see the current shape. The previous version cached the
+    snapshot once and could crash with "column not found" on single-column
+    inputs where the second rename looked for a column the first rename
+    had already renamed away.
+    """
     dataset = load_dataset("json", data_files=path)["train"]
 
     columns = dataset.column_names
@@ -65,6 +72,7 @@ def _prepare_reward_dataset(path: str):
         possible = [c for c in columns if c not in {"text", "prompt", "input"}]
         if len(possible) == 1:
             dataset = dataset.rename_column(possible[0], "label")
+            columns = dataset.column_names
         else:
             raise ValueError("Dataset must contain a label/labels column or be in pairwise format")
 
