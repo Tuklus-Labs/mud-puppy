@@ -114,6 +114,18 @@ export function Launch() {
       setHfResults([]);
       return;
     }
+    // Don't hit HF Hub for obviously-local paths (absolute paths,
+    // home-dir, drive letters, or anything that looks like a file URI).
+    const looksLikePath =
+      cfg.model.startsWith("/") ||
+      cfg.model.startsWith("~") ||
+      cfg.model.startsWith(".") ||
+      cfg.model.startsWith("file://") ||
+      /^[A-Za-z]:[\\/]/.test(cfg.model);
+    if (looksLikePath) {
+      setHfResults([]);
+      return;
+    }
     const h = setTimeout(async () => {
       try {
         const r = await ipc.searchModels(cfg.model);
