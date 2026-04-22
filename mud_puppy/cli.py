@@ -41,7 +41,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--precision",
         dest="precision",
         default="bf16",
-        choices=["fp16", "bf16", "fp8"],
+        choices=["fp16", "bf16", "fp8", "fp32"],
         help="training precision",
     )
     parser.add_argument(
