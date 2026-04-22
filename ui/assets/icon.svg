@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <!-- Mud-Puppy Studio icon: vector-neon brand mark.
+       Matches ui/web/src/chrome/BrandMark.tsx, scaled up for a desktop icon. -->
+  <defs>
+    <radialGradient id="centerGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#ffcc33" stop-opacity="1"/>
+      <stop offset="70%" stop-color="#ffcc33" stop-opacity="0.6"/>
+      <stop offset="100%" stop-color="#ffcc33" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="cyanGlow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="1.2" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Void background with subtle rounded corners for DE compositing -->
+  <rect x="0" y="0" width="128" height="128" rx="16" fill="#04060b"/>
+
+  <!-- Outer hexagon (matches brand mark) -->
+  <g transform="translate(64 64)" filter="url(#cyanGlow)">
+    <polygon
+      points="0,-54 46,-27 46,27 0,54 -46,27 -46,-27"
+      fill="none"
+      stroke="#00e5ff"
+      stroke-width="2.4"
+    />
+    <!-- Inner hexagon -->
+    <polygon
+      points="0,-32 28,-16 28,16 0,32 -28,16 -28,-16"
+      fill="none"
+      stroke="#00e5ff"
+      stroke-width="1.6"
+      opacity="0.6"
+    />
+    <!-- Top and bottom stems -->
+    <line x1="0" y1="-54" x2="0" y2="-32" stroke="#00e5ff" stroke-width="1.2" opacity="0.5"/>
+    <line x1="0" y1="32"  x2="0" y2="54"  stroke="#00e5ff" stroke-width="1.2" opacity="0.5"/>
+  </g>
+
+  <!-- Amber center glow + core -->
+  <circle cx="64" cy="64" r="14" fill="url(#centerGlow)"/>
+  <circle cx="64" cy="64" r="7"  fill="#ffcc33"/>
+</svg>
