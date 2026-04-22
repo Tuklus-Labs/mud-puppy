@@ -4,6 +4,7 @@
  */
 import React, { useEffect, useCallback } from "react";
 import { useStore } from "./lib/store";
+import { ipc } from "./lib/ipc";
 import { Background } from "./chrome/Background";
 import { BrandMark, NavIcon } from "./chrome/BrandMark";
 import { Launch } from "./panes/Launch";
@@ -31,6 +32,35 @@ export function App() {
 
   const activeRun = activeRunId ? runs.find((r) => r.run_id === activeRunId) : null;
   const isRunning = activeRun?.status === "running";
+
+  // Subscribe to all IPC events at the App level so they flow to the store
+  // regardless of which pane is active. Monitor and Logs both read from the
+  // store; subscribing here means events are never missed during pane switches.
+  useEffect(() => {
+    const store = useStore.getState();
+    const unsubs = [
+      ipc.onMetrics((m) => store.appendMetrics(m)),
+      ipc.onGpu((g) => store.appendGpu(g)),
+      ipc.onStreamStats((s) => store.setStreamStats(s)),
+      ipc.onMemoryStats((s) => store.setMemoryStats(s)),
+      ipc.onLogLine((l) => store.appendLog(l)),
+      ipc.onRunComplete((e) => {
+        // Mark the matching run as complete/failed in the run list.
+        const current = useStore.getState().runs;
+        const idx = current.findIndex((r) => r.run_id === e.run_id);
+        if (idx >= 0) {
+          const updated = [...current];
+          updated[idx] = {
+            ...updated[idx],
+            status: e.exit_code === 0 ? "complete" : "failed",
+            end_time: Date.now(),
+          };
+          useStore.setState({ runs: updated });
+        }
+      }),
+    ];
+    return () => unsubs.forEach((u) => u());
+  }, []);
 
   const handleKey = useCallback(
     (e: KeyboardEvent) => {

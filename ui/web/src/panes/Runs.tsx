@@ -23,14 +23,21 @@ export function Runs() {
 
   useEffect(() => {
     let alive = true;
-    ipc
-      .listRuns()
-      .then((r) => {
-        if (alive && Array.isArray(r)) setRuns(r);
-      })
-      .catch(() => {});
+
+    const fetchRuns = () => {
+      ipc
+        .listRuns()
+        .then((r) => {
+          if (alive && Array.isArray(r)) setRuns(r);
+        })
+        .catch(() => {});
+    };
+
+    fetchRuns();
+    const interval = setInterval(fetchRuns, 3000);
     return () => {
       alive = false;
+      clearInterval(interval);
     };
   }, [setRuns]);
 

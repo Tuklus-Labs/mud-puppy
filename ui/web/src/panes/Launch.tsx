@@ -146,7 +146,10 @@ export function Launch() {
       monitor: true,
     };
     try {
-      await ipc.startRun(config);
+      const handle = await ipc.startRun(config);
+      if (handle?.run_id) {
+        useStore.getState().setActiveRunId(handle.run_id);
+      }
       setActivePane("monitor");
     } catch (e) {
       console.error("[launch] startRun failed", e);
