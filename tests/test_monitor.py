@@ -115,13 +115,20 @@ MonitorCallback = _monitor.MonitorCallback
 
 
 def test_monitor_server_starts_and_stops():
-    """MonitorServer lifecycle: start sets is_running, stop clears it."""
-    server = MonitorServer(port=15980)  # high port to avoid conflicts
+    """MonitorServer lifecycle: start sets is_running, stop clears it.
+
+    Uses port=0 so the kernel picks an ephemeral free port; the server
+    reads the actual bound port back through the listening socket.
+    Avoids CI flakiness from hardcoded ports colliding.
+    """
+    server = MonitorServer(port=0)
     assert not server.is_running()
 
     server.start()
     try:
         assert server.is_running()
+        # The real port must have been populated from the socket.
+        assert server.port > 0
     finally:
         server.stop()
 
