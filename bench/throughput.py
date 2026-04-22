@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """mud-puppy v0.4 throughput benchmark.
 
-Measures tokens/sec for the three training modes introduced in v0.4:
-  - baseline   : standard full-param training
-  - packing    : sequence packing (PackedCollator)
-  - streaming  : per-layer GPU streaming (LayerStreamer)
+Measures tokens/sec for the four training configs introduced in v0.4:
+  - baseline        : standard full-param training
+  - packing         : sequence packing (PackedCollator)
+  - streaming       : per-layer GPU streaming (LayerStreamer)
+  - packing+stream  : packing and streaming together
 
 Usage::
 
     # Quick smoke test (tiny model, synthetic data)
     python bench/throughput.py --model gpt2 --seq-len 256 --steps 20
 
-    # Full benchmark with all three modes
+    # Full benchmark with all four modes
     python bench/throughput.py --model meta-llama/Llama-3-8B \\
-        --seq-len 2048 --steps 50 --modes baseline packing streaming
+        --seq-len 2048 --steps 50 \\
+        --modes baseline packing streaming packing+stream
 
 Output format (stdout, one JSON blob per mode)::
 
@@ -147,6 +149,22 @@ def _benchmark_mode(
 
 
 # ---------------------------------------------------------------------------
+# Benchmark configs
+# ---------------------------------------------------------------------------
+#
+# Each config flips two orthogonal switches: pack_sequences and stream.
+# torch.compile is disabled for streaming configs per v0.4 spec (the
+# LayerStreamer hooks break compile's graph capture).
+
+CONFIGS: Dict[str, Dict[str, Any]] = {
+    "baseline":       dict(pack_sequences=False, stream=False, compile=True),
+    "packing":        dict(pack_sequences=True,  stream=False, compile=True),
+    "streaming":      dict(pack_sequences=False, stream=True,  compile=False),
+    "packing+stream": dict(pack_sequences=True,  stream=True,  compile=False),
+}
+
+
+# ---------------------------------------------------------------------------
 # Mode setup helpers
 # ---------------------------------------------------------------------------
 
@@ -190,9 +208,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--prefetch-layers", type=int, default=2, dest="prefetch_layers",
                    help="LayerStreamer prefetch depth for streaming mode (default: 2)")
     p.add_argument("--modes", nargs="+",
-                   choices=["baseline", "packing", "streaming"],
+                   choices=list(CONFIGS.keys()),
                    default=["baseline", "packing"],
-                   help="modes to benchmark (default: baseline packing)")
+                   help=("modes to benchmark (choices: "
+                         + ", ".join(CONFIGS.keys())
+                         + "; default: baseline packing)"))
     p.add_argument("--device", default="cuda" if True else "cpu",
                    help="device (default: cuda if available, else cpu)")
     p.add_argument("--output", default="-",
@@ -226,14 +246,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     for mode in args.modes:
         log.info("--- Mode: %s ---", mode)
 
-        streaming = mode == "streaming"
-        model = _load_model(args.model, device, streaming=streaming,
+        cfg = CONFIGS[mode]
+        model = _load_model(args.model, device,
+                            streaming=cfg["stream"],
                             prefetch_layers=args.prefetch_layers)
 
-        if mode == "packing":
-            batch_fn = _make_packed_batch
-        else:
-            batch_fn = _make_batch
+        batch_fn = _make_packed_batch if cfg["pack_sequences"] else _make_batch
 
         try:
             result = _benchmark_mode(
