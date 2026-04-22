@@ -50,9 +50,18 @@ configure_file(
     COPYONLY
 )
 
-# Copy web/dist (when built by the web workstream) next to the binary.
-# This block is intentionally a no-op until the web workstream produces dist/.
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/web/dist)
-    file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/web/dist
-         DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/web)
-endif()
+# Sync web/dist next to the binary at build time (not configure time).
+# The web workstream builds ui/web/dist; we mirror it to ui/build/web/dist
+# so phos::AssetServer can resolve "web/dist/index.html" with a relative
+# asset_dir from the binary's working directory.
+set(WEB_SRC_DIR  ${CMAKE_CURRENT_SOURCE_DIR}/web/dist)
+set(WEB_DEST_DIR ${CMAKE_CURRENT_BINARY_DIR}/web/dist)
+
+add_custom_command(
+    TARGET mud-puppy-studio POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${WEB_DEST_DIR}
+    COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different
+            ${WEB_SRC_DIR} ${WEB_DEST_DIR}
+    COMMENT "Syncing web/dist -> build/web/dist"
+    VERBATIM
+)
