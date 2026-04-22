@@ -579,7 +579,7 @@ def prepare_lora(model: nn.Module, config: TrainingConfig) -> nn.Module:
         r=config.lora_r,
         lora_alpha=config.lora_alpha,
         target_modules=target_modules,
-        lora_dropout=0.05,
+        lora_dropout=config.lora_dropout,
         bias="none",
         task_type="CAUSAL_LM",
     )

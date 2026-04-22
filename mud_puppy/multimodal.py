@@ -463,16 +463,14 @@ def tokenize_multimodal_dataset(
                 except Exception:
                     # If the tokenizer is a mock or doesn't support these args,
                     # fall through to a plain call
-                    try:
-                        enc = tokenizer(text)
-                        ids = enc["input_ids"][0] if isinstance(enc["input_ids"][0], list) else enc["input_ids"]
-                        attn = enc["attention_mask"][0] if isinstance(enc["attention_mask"][0], list) else enc["attention_mask"]
-                    except Exception:
-                        ids = [1, 2, 3]
-                        attn = [1, 1, 1]
+                    enc = tokenizer(text)
+                    ids = enc["input_ids"][0] if isinstance(enc["input_ids"][0], list) else enc["input_ids"]
+                    attn = enc["attention_mask"][0] if isinstance(enc["attention_mask"][0], list) else enc["attention_mask"]
             else:
-                ids = [1, 2, 3]
-                attn = [1, 1, 1]
+                raise ValueError(
+                    "tokenizer is None or not callable -- cannot tokenize multimodal "
+                    "sample. Provide a valid tokenizer to tokenize_multimodal_dataset()."
+                )
 
             # Ensure we have plain Python lists (not tensors)
             if hasattr(ids, "tolist"):

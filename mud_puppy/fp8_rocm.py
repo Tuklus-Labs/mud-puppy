@@ -94,16 +94,15 @@ def _fp8_cast_ste(t: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 def is_fp8_hardware_available() -> bool:
     """Return True if ``torch._scaled_mm`` will actually run on this device.
 
-    Probes by trying a small scaled mm. Cached because the probe is
-    cheap but non-trivial (it allocates GPU memory and runs a kernel).
+    Probes by trying a small scaled mm. Not cached: caching at module level
+    would permanently return False if called before torch.cuda is initialized
+    (e.g. in test environments), and the probe cost (~2ms) is negligible
+    compared to any real use.
     """
     if not (hasattr(torch, "_scaled_mm") and hasattr(torch, "float8_e4m3fn")):
         return False
     if not torch.cuda.is_available():
         return False
-    cached = getattr(is_fp8_hardware_available, "_cache", None)
-    if cached is not None:
-        return cached
     try:
         a = torch.zeros(16, 32, device="cuda", dtype=torch.bfloat16).to(
             torch.float8_e4m3fn
@@ -114,12 +113,10 @@ def is_fp8_hardware_available() -> bool:
         sa = torch.tensor(1.0, device="cuda")
         sb = torch.tensor(1.0, device="cuda")
         torch._scaled_mm(a, b, scale_a=sa, scale_b=sb, out_dtype=torch.bfloat16)
-        result = True
+        return True
     except Exception as exc:
         log.debug("FP8 hardware probe failed: %s", exc)
-        result = False
-    setattr(is_fp8_hardware_available, "_cache", result)
-    return result
+        return False
 
 
 class FP8Linear(nn.Module):

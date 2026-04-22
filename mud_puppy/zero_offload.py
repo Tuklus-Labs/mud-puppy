@@ -396,18 +396,57 @@ class CPUOffloadOptimizer:
         if torch.cuda.is_available():
             torch.cuda.synchronize()
 
+    def _param_index_map(self) -> Dict[int, int]:
+        """Build a mapping from id(param) -> positional index across all groups.
+
+        The positional index is stable as long as the optimizer is constructed
+        with the same parameter groups in the same order (required for any
+        checkpoint restore). Keying cpu_states by positional index allows
+        state_dict round-trips to work across Python sessions where id(param)
+        would differ.
+        """
+        idx_map: Dict[int, int] = {}
+        pos = 0
+        for group in self.optimizer.param_groups:
+            for param in group["params"]:
+                if param.requires_grad:
+                    idx_map[id(param)] = pos
+                    pos += 1
+        return idx_map
+
     def state_dict(self) -> Dict:
-        """Return optimizer state dict with CPU states."""
+        """Return optimizer state dict with CPU states keyed by positional index.
+
+        NOTE: The positional index is stable only when the optimizer is
+        re-created with the same parameter groups in the same order. If the
+        model architecture changes between save and restore the state cannot
+        be loaded -- this is the same requirement as PyTorch's own optimizer
+        state_dict().
+        """
+        idx_map = self._param_index_map()
+        cpu_states_by_idx: Dict[int, Dict[str, Any]] = {}
+        for pid, state in self._cpu_states.items():
+            idx = idx_map.get(pid)
+            if idx is not None:
+                cpu_states_by_idx[idx] = state
         return {
             "optimizer": self.optimizer.state_dict(),
-            "cpu_states": self._cpu_states,
+            "cpu_states": cpu_states_by_idx,
             "config": self.config,
         }
 
     def load_state_dict(self, state_dict: Dict):
-        """Load optimizer state including CPU states."""
+        """Load optimizer state including CPU states keyed by positional index."""
         self.optimizer.load_state_dict(state_dict["optimizer"])
-        self._cpu_states = state_dict.get("cpu_states", {})
+        saved = state_dict.get("cpu_states", {})
+        # Translate positional index back to id(param) for runtime lookup.
+        idx_map = self._param_index_map()
+        idx_to_pid = {v: k for k, v in idx_map.items()}
+        self._cpu_states = {}
+        for idx, state in saved.items():
+            pid = idx_to_pid.get(int(idx))
+            if pid is not None:
+                self._cpu_states[pid] = state
 
     @property
     def param_groups(self):
