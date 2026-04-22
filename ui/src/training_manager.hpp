@@ -12,6 +12,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 namespace mp_studio {
 
@@ -124,8 +125,25 @@ private:
     static void sigchld_handler(int);  // async-signal-safe: writes one byte
     void on_child_exit(pid_t pid, int status);  // runs on reaper thread
 
-    // Resolve the mud-puppy sidecar path. Throws if not found.
-    static std::string resolve_sidecar_path();
+    // How the sidecar should be launched.
+    struct SidecarLauncher {
+        // Program to exec (an absolute path).
+        std::string program;
+        // Argv prefix to insert between program and user args. Empty
+        // for the venv case; ["-m", "mud_puppy.cli"] for the system
+        // python fallback so the repo's package is loaded as a module.
+        std::vector<std::string> argv_prefix;
+        // cwd to chdir into before exec, or empty to keep current cwd.
+        // Used by the system-python fallback so Python finds mud_puppy
+        // on sys.path via the current directory.
+        std::string cwd;
+    };
+
+    // Resolve how to launch the mud-puppy training sidecar. Prefers the
+    // repo-local venv entry point when installed; falls back to `python3
+    // -m mud_puppy.cli` run from the repo root so training works even
+    // when the user has not set up the venv. Throws if neither is usable.
+    static SidecarLauncher resolve_sidecar_launcher();
 
     // Close fds, join reader threads. Caller must NOT hold mutex_.
     static void cleanup_run(ActiveRun& run);

@@ -286,27 +286,53 @@ std::string TrainingManager::make_run_id() {
     return ss.str();
 }
 
-std::string TrainingManager::resolve_sidecar_path() {
-    // 1. $HOME/Projects/mud-puppy/venv/bin/mud-puppy
-    // 2. getpwuid()->pw_dir/Projects/mud-puppy/venv/bin/mud-puppy
-    // 3. throw
+TrainingManager::SidecarLauncher TrainingManager::resolve_sidecar_launcher() {
+    // Resolve HOME via $HOME then getpwuid fallback.
     std::string home;
     if (const char* h = ::getenv("HOME"); h && *h) {
         home = h;
+    } else if (struct passwd* pw = ::getpwuid(::getuid()); pw && pw->pw_dir) {
+        home = pw->pw_dir;
     } else {
-        if (struct passwd* pw = ::getpwuid(::getuid()); pw && pw->pw_dir) {
-            home = pw->pw_dir;
-        } else {
-            throw std::runtime_error(
-                "cannot resolve HOME for mud-puppy sidecar lookup");
-        }
+        throw std::runtime_error(
+            "cannot resolve HOME for mud-puppy sidecar lookup");
     }
 
-    std::string candidate = home + "/Projects/mud-puppy/venv/bin/mud-puppy";
-    if (::access(candidate.c_str(), X_OK) != 0) {
-        throw std::runtime_error("mud-puppy sidecar not found at: " + candidate);
+    const std::string repo = home + "/Projects/mud-puppy";
+
+    // 1. Preferred: the venv entry-point. Fast start, no PYTHONPATH dance.
+    const std::string venv_bin = repo + "/venv/bin/mud-puppy";
+    if (::access(venv_bin.c_str(), X_OK) == 0) {
+        return SidecarLauncher{venv_bin, {}, {}};
     }
-    return candidate;
+
+    // 2. User-site install via pip --user.
+    const std::string user_bin = home + "/.local/bin/mud-puppy";
+    if (::access(user_bin.c_str(), X_OK) == 0) {
+        return SidecarLauncher{user_bin, {}, {}};
+    }
+
+    // 3. Fallback: system python3 with the repo on sys.path. Works on
+    //    any host that has torch + transformers installed for system
+    //    python3 (the common case for Gary's workflow). chdir into the
+    //    repo root so `python3 -m mud_puppy.cli` finds the package.
+    const std::string system_python = "/usr/bin/python3";
+    if (::access(system_python.c_str(), X_OK) == 0 &&
+        ::access((repo + "/mud_puppy/__init__.py").c_str(), F_OK) == 0) {
+        return SidecarLauncher{
+            system_python,
+            {"-m", "mud_puppy.cli"},
+            repo,
+        };
+    }
+
+    throw std::runtime_error(
+        "mud-puppy sidecar not runnable. Tried:\n"
+        "  1. " + venv_bin + " (venv not populated? run: "
+        "cd " + repo + " && python3 -m venv venv && venv/bin/pip install -e .)\n"
+        "  2. " + user_bin + " (try: pip install --user -e " + repo + ")\n"
+        "  3. python3 -m mud_puppy.cli from " + repo +
+        " (requires /usr/bin/python3 with torch/transformers installed)");
 }
 
 void TrainingManager::cleanup_run(ActiveRun& run) {
@@ -328,7 +354,7 @@ void TrainingManager::cleanup_run(ActiveRun& run) {
 // ---------------------------------------------------------------------------
 
 RunHandle TrainingManager::start(const nlohmann::json& config) {
-    std::string venv_python = resolve_sidecar_path();
+    SidecarLauncher launcher = resolve_sidecar_launcher();
 
     // Pass --monitor-port 0 so the child OS-binds an ephemeral port;
     // it announces the bound port via a stdout marker line which we
@@ -337,11 +363,15 @@ RunHandle TrainingManager::start(const nlohmann::json& config) {
     int monitor_port = 0;
     std::string run_id = make_run_id();
 
-    // Build argv from config JSON fields.
+    // Build argv from config JSON fields. argv[0] is the program to
+    // exec; argv[1..N] is the launcher's argv_prefix (e.g. ["-m",
+    // "mud_puppy.cli"] for the system-python fallback) followed by
+    // the standard mud-puppy CLI flags from the config.
     std::vector<std::string> args_storage;
     std::vector<const char*> argv;
 
-    args_storage.push_back(venv_python);
+    args_storage.push_back(launcher.program);
+    for (const auto& p : launcher.argv_prefix) args_storage.push_back(p);
 
     if (config.contains("model_name_or_path"))
         args_storage.push_back(config["model_name_or_path"].get<std::string>());
@@ -448,6 +478,16 @@ RunHandle TrainingManager::start(const nlohmann::json& config) {
         ::dup2(err_pipe[1], STDERR_FILENO);
         ::close(out_pipe[0]); ::close(out_pipe[1]);
         ::close(err_pipe[0]); ::close(err_pipe[1]);
+
+        // If the launcher asked for a specific cwd (system-python fallback
+        // needs to run `python3 -m mud_puppy.cli` from the repo root so
+        // the package is on sys.path), chdir there before execv.
+        if (!launcher.cwd.empty()) {
+            if (::chdir(launcher.cwd.c_str()) != 0) {
+                ::_exit(126);  // chdir failed
+            }
+        }
+
         ::execv(argv[0], const_cast<char* const*>(argv.data()));
         ::_exit(127);  // exec failed
     }

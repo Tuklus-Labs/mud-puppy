@@ -116,26 +116,37 @@ export function Monitor() {
       </div>
 
       {!run ? (
-        <Panel>
-          <div
-            style={{
-              padding: 60,
-              textAlign: "center",
-              color: "var(--text-dim)",
-            }}
-          >
-            <div
-              className="mono"
-              style={{ fontSize: 14, marginBottom: 8, color: "var(--cyan)" }}
-            >
-              No active run
-            </div>
-            <div style={{ fontSize: 12 }}>
-              Launch a configuration or pick a recent run to populate this
-              view.
-            </div>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            minHeight: "60vh",
+          }}
+        >
+          <div style={{ width: "min(520px, 80%)" }}>
+            <Panel>
+              <div
+                style={{
+                  padding: "48px 32px",
+                  textAlign: "center",
+                  color: "var(--text-dim)",
+                }}
+              >
+                <div
+                  className="mono"
+                  style={{ fontSize: 14, marginBottom: 10, color: "var(--cyan)", letterSpacing: "0.22em" }}
+                >
+                  No active run
+                </div>
+                <div style={{ fontSize: 12 }}>
+                  Launch a configuration or pick a recent run to populate this
+                  view.
+                </div>
+              </div>
+            </Panel>
           </div>
-        </Panel>
+        </div>
       ) : (
         <div className="monitor-grid">
           <Panel label="Run" bodyStyle={{ padding: "20px 18px" }}>
