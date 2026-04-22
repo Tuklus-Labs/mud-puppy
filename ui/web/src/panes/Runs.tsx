@@ -10,7 +10,7 @@ import { ipc } from "../lib/ipc";
 import { useStore } from "../lib/store";
 import { fmtDuration, fmtRelTime, fmtLoss } from "../lib/format";
 
-type StatusFilter = "all" | "running" | "complete" | "failed";
+type StatusFilter = "all" | "running" | "complete" | "failed" | "stopping";
 
 export function Runs() {
   const runs = useStore((s) => s.runs);
@@ -43,10 +43,17 @@ export function Runs() {
 
   const filtered = useMemo(() => {
     if (filter === "all") return runs;
+    // "running" filter groups stopping runs with running ones for visibility.
+    if (filter === "running")
+      return runs.filter(
+        (r) => r.status === "running" || r.status === "stopping"
+      );
     return runs.filter((r) => r.status === filter);
   }, [runs, filter]);
 
-  const activeCount = runs.filter((r) => r.status === "running").length;
+  const activeCount = runs.filter(
+    (r) => r.status === "running" || r.status === "stopping"
+  ).length;
 
   const toggleCompare = (id: string) => {
     setCompareSet((s) => {
@@ -74,7 +81,7 @@ export function Runs() {
             {runs.length} runs · {activeCount} active
           </span>
           <div className="seg">
-            {(["all", "running", "complete", "failed"] as const).map((s) => (
+            {(["all", "running", "stopping", "complete", "failed"] as const).map((s) => (
               <button
                 key={s}
                 className={filter === s ? "active" : ""}
@@ -107,9 +114,10 @@ export function Runs() {
           </thead>
           <tbody>
             {filtered.map((r) => {
-              const active = r.status === "running";
+              const active =
+                r.status === "running" || r.status === "stopping";
               const stepsCell =
-                r.status === "running"
+                r.status === "running" || r.status === "stopping"
                   ? `${r.steps_done ?? 0}/${r.steps_total ?? "?"}`
                   : r.status === "failed"
                   ? "— (error)"
@@ -129,6 +137,8 @@ export function Runs() {
                       className={`dot ${
                         r.status === "running"
                           ? "running"
+                          : r.status === "stopping"
+                          ? "stopping"
                           : r.status === "failed"
                           ? "error"
                           : "idle"

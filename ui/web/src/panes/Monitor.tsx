@@ -23,7 +23,9 @@ export function Monitor() {
 
   const run = activeRunId
     ? runs.find((r) => r.run_id === activeRunId) ?? null
-    : runs.find((r) => r.status === "running") ?? null;
+    : runs.find(
+        (r) => r.status === "running" || r.status === "stopping"
+      ) ?? null;
 
   const metrics = run ? metricsHistory[run.run_id] ?? [] : [];
   const latest = metrics.length > 0 ? metrics[metrics.length - 1] : null;
@@ -71,15 +73,25 @@ export function Monitor() {
       <div className="pane-title">
         <h1>Monitor</h1>
         <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
-          {run?.status === "running" && (
+          {(run?.status === "running" || run?.status === "stopping") && (
             <>
               <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                <span className="dot running" />
+                <span
+                  className={`dot ${
+                    run.status === "stopping" ? "stopping" : "running"
+                  }`}
+                />
                 <span
                   className="mono"
-                  style={{ fontSize: "var(--f-xs)", color: "var(--lime)" }}
+                  style={{
+                    fontSize: "var(--f-xs)",
+                    color:
+                      run.status === "stopping"
+                        ? "var(--amber)"
+                        : "var(--lime)",
+                  }}
                 >
-                  Training
+                  {run.status === "stopping" ? "Stopping" : "Training"}
                 </span>
               </div>
               {run.steps_total && run.steps_done != null && (
@@ -91,7 +103,11 @@ export function Monitor() {
                   {run.steps_total.toLocaleString()}
                 </div>
               )}
-              <button className="btn btn-danger" onClick={stopRun}>
+              <button
+                className="btn btn-danger"
+                onClick={stopRun}
+                disabled={run.status === "stopping"}
+              >
                 Stop run
               </button>
             </>

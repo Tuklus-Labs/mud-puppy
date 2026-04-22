@@ -200,15 +200,18 @@ void TrainingManager::on_child_exit(pid_t pid, int status) {
                       : -1;
             run.exit_code = exit_code;
 
-            // Determine final status: user-requested stop is "stopped",
-            // clean exit is "complete", everything else is "failed".
+            // Determine final status: a clean exit (exit_code == 0) always
+            // wins regardless of whether stop() had been called -- the child
+            // finished on its own before SIGTERM arrived.  Only a nonzero exit
+            // after stop() is "stopped"; a nonzero exit without a stop request
+            // is "failed".
             const char* status_str;
-            if (run.status == RunStatus::Stopped) {
-                status_str = "stopped";
-                // Keep RunStatus::Stopped -- already set by stop()
-            } else if (exit_code == 0) {
+            if (exit_code == 0) {
                 run.status = RunStatus::Complete;
                 status_str = "complete";
+            } else if (run.status == RunStatus::Stopped) {
+                // Keep RunStatus::Stopped -- already set by stop()
+                status_str = "stopped";
             } else {
                 run.status = RunStatus::Failed;
                 status_str = "failed";
@@ -575,12 +578,22 @@ nlohmann::json TrainingManager::list() const {
 
     // Active runs first.
     for (const auto& [id, run] : runs_) {
+        // A2: reflect the actual run status rather than hardcoding "running".
+        // After stop() sets RunStatus::Stopped the UI needs to know so it can
+        // disable the Stop button and stop spam-clicking.
+        const char* live_status;
+        switch (run.status) {
+            case RunStatus::Stopped:  live_status = "stopping"; break;
+            case RunStatus::Complete: live_status = "complete"; break;
+            case RunStatus::Failed:   live_status = "failed";   break;
+            default:                  live_status = "running";  break;
+        }
         nlohmann::json entry = {
             {"run_id",     run.run_id},
             {"model",      run.model},
             {"method",     run.method},
             {"dataset",    run.dataset},
-            {"status",     "running"},
+            {"status",     live_status},
             {"start_time", run.start_time_ms},
         };
         result.push_back(std::move(entry));

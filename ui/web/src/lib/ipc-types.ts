@@ -49,7 +49,7 @@ export interface RunSummary {
   model: string;
   method: string;
   dataset: string;
-  status: "running" | "complete" | "failed" | "stopped";
+  status: "running" | "stopping" | "complete" | "failed" | "stopped";
   start_time: number;
   end_time?: number;
   final_loss?: number;
@@ -74,7 +74,7 @@ export interface HFModel {
 
 export interface Checkpoint {
   path: string;
-  step: number;
+  step?: number;
   loss?: number;
   /**
    * Unix epoch seconds (NOT milliseconds). Multiply by 1000 before
