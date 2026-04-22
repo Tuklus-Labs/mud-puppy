@@ -41,6 +41,7 @@ Usage:
         optimizer.step()  # Handles CPU<->GPU transfers automatically
 """
 
+import warnings
 import torch
 import torch.nn as nn
 from torch.optim import Optimizer
@@ -102,6 +103,12 @@ class CPUOffloadOptimizer:
         # Track which params we're managing
         self._param_ids: List[int] = []
         self._param_map: Dict[int, nn.Parameter] = {}
+
+        # Async grad transfer stream (D2H runs here while forward proceeds).
+        self._grad_stream: Optional[Any] = None
+        if torch.cuda.is_available():
+            self._grad_stream = torch.cuda.Stream()
+        self._grad_sync_event: Optional[Any] = None
 
         # Initialize
         self._setup_offload()
@@ -188,29 +195,97 @@ class CPUOffloadOptimizer:
                 cpu_grad.zero_()
 
     def _transfer_grads_to_cpu(self):
-        """Copy gradients from GPU to CPU storage."""
-        for pid, param in self._param_map.items():
-            if param.grad is None:
-                continue
-
-            if self.config.pin_memory and pid in self._pinned_buffers:
-                # Use pinned buffer for transfer
-                pinned = self._pinned_buffers[pid]
-                pinned.copy_(param.grad)  # sync copy: must complete before add_
-                self._cpu_grads[pid].add_(pinned)
-            else:
-                self._cpu_grads[pid].add_(param.grad.to(self._cpu))
-
-            # Free GPU gradient memory
-            param.grad = None
+        """Copy gradients from GPU to CPU storage, async on _grad_stream."""
+        stream = self._grad_stream
+        if stream is not None and self.config.async_transfer:
+            with torch.cuda.stream(stream):
+                for pid, param in self._param_map.items():
+                    if param.grad is None:
+                        continue
+                    if self.config.pin_memory and pid in self._pinned_buffers:
+                        pinned = self._pinned_buffers[pid]
+                        pinned.copy_(param.grad, non_blocking=True)
+                        self._cpu_grads[pid].add_(pinned)
+                    else:
+                        self._cpu_grads[pid].add_(
+                            param.grad.to(self._cpu, non_blocking=True)
+                        )
+                    param.grad = None
+            # Record event; step() will wait on it before reading CPU grads.
+            evt = torch.cuda.Event()
+            evt.record(stream)
+            self._grad_sync_event = evt
+        else:
+            for pid, param in self._param_map.items():
+                if param.grad is None:
+                    continue
+                if self.config.pin_memory and pid in self._pinned_buffers:
+                    pinned = self._pinned_buffers[pid]
+                    pinned.copy_(param.grad)
+                    self._cpu_grads[pid].add_(pinned)
+                else:
+                    self._cpu_grads[pid].add_(param.grad.to(self._cpu))
+                param.grad = None
+            self._grad_sync_event = None
 
     def _run_optimizer_on_cpu(self):
-        """Run optimizer step on CPU with offloaded states."""
-        # For each parameter, we need to:
-        # 1. Move optimizer state to CPU (if not already there)
-        # 2. Set param.data and param.grad to CPU versions
-        # 3. Run optimizer step
-        # 4. Move param.data back to GPU
+        """Run optimizer step on CPU with offloaded states.
+
+        When the wrapped optimizer is AdamW and the PyTorch build supports
+        foreach, rebuilds it as AdamW(foreach=True) on first invocation for
+        ~2x CPU step speedup via vectorised foreach fusion.
+        """
+        # One-time switch to foreach AdamW when possible.
+        if not getattr(self, "_foreach_checked", False):
+            self._foreach_checked = True
+            opt = self.optimizer
+            if isinstance(opt, torch.optim.AdamW) and getattr(opt, "foreach", None) is not False:
+                try:
+                    # Rebuild preserving ALL per-group hyperparameters
+                    # (lr, weight_decay, eps, betas, amsgrad, etc.). Passing
+                    # opt.param_groups to the constructor picks up only the
+                    # params list; subsequent add_param_group merges each
+                    # group's full dict so LR scheduler state, per-group
+                    # weight_decay overrides (common with LoRA), and other
+                    # tunables are preserved.
+                    first_group = opt.param_groups[0]
+                    new_opt = torch.optim.AdamW(
+                        first_group["params"],
+                        lr=first_group.get("lr", 1e-3),
+                        betas=first_group.get("betas", (0.9, 0.999)),
+                        eps=first_group.get("eps", 1e-8),
+                        weight_decay=first_group.get("weight_decay", 0.0),
+                        amsgrad=first_group.get("amsgrad", False),
+                        foreach=True,
+                    )
+                    # Merge remaining attributes of the first group that the
+                    # AdamW constructor might have normalised. Skip keys
+                    # that the new (foreach) optimizer already set itself;
+                    # copying the old group's foreach=None would wipe out
+                    # the foreach=True switch we just asked for.
+                    _FOREACH_OWNED = {"foreach", "fused", "capturable"}
+                    for key, val in first_group.items():
+                        if key == "params" or key in _FOREACH_OWNED:
+                            continue
+                        new_opt.param_groups[0][key] = val
+
+                    # Append subsequent groups verbatim so per-group
+                    # hyperparameter overrides survive. Strip foreach-owned
+                    # keys so add_param_group uses the new optimizer's
+                    # defaults (foreach=True) rather than the old None.
+                    for group in opt.param_groups[1:]:
+                        clean = {
+                            k: v for k, v in group.items()
+                            if k not in _FOREACH_OWNED
+                        }
+                        new_opt.add_param_group(clean)
+
+                    # Copy existing state (may be empty on first step).
+                    new_opt.state.update(opt.state)
+                    self.optimizer = new_opt
+                    log.info("CPUOffloadOptimizer: switched to foreach=True AdamW")
+                except Exception as exc:
+                    log.debug("foreach AdamW switch failed: %s", exc)
 
         for group in self.optimizer.param_groups:
             for param in group["params"]:
@@ -236,13 +311,26 @@ class CPUOffloadOptimizer:
         # Now run the actual optimizer step on CPU
         # We need to temporarily move params to CPU
         gpu_params = {}
+        saved_grads = {}
         for pid, param in self._param_map.items():
             gpu_params[pid] = param.data
+            saved_grads[pid] = param.grad  # may be None
             # Move param to CPU for optimizer
             param.data = param.data.to(self._cpu, dtype=self.config.state_dtype)
-            # Set gradient from CPU accumulator
-            if pid in self._cpu_grads:
+            # Source the gradient.
+            if self.config.offload_gradients and pid in self._cpu_grads:
+                # CPU accumulator, already populated by _transfer_grads_to_cpu.
                 param.grad = self._cpu_grads[pid]
+            elif saved_grads[pid] is not None:
+                # Not offloading gradients: pull the live GPU grad directly
+                # down to CPU for this step. Without this the CPU optimizer
+                # either blew up on device mismatch or silently routed to
+                # the zero-initialised _cpu_grads and trained on garbage.
+                param.grad = saved_grads[pid].detach().to(
+                    self._cpu, dtype=self.config.state_dtype
+                )
+            else:
+                param.grad = None
 
         # Run optimizer
         self.optimizer.step()
@@ -268,9 +356,22 @@ class CPUOffloadOptimizer:
         if closure is not None:
             raise NotImplementedError("Closure not supported with CPU offload")
 
-        # Transfer gradients to CPU
+        # Transfer gradients to CPU (async when configured).
         if self.config.offload_gradients:
             self._transfer_grads_to_cpu()
+
+        # CRITICAL: block the CPU thread until the D2H grad transfer on the
+        # dedicated stream has actually completed. wait_event on the current
+        # stream only serialises GPU work, not the Python reader. Without
+        # this, _run_optimizer_on_cpu reads zero/stale pinned buffers and
+        # silently trains on wrong gradients.
+        if (
+            self.config.offload_gradients
+            and self.config.async_transfer
+            and self._grad_stream is not None
+        ):
+            self._grad_stream.synchronize()
+        self._grad_sync_event = None  # no-op bookkeeping reset
 
         # Run optimizer on CPU
         if self.config.cpu_optimizer_step:
@@ -305,10 +406,11 @@ class CPUOffloadOptimizer:
 class PartitionedOptimizer:
     """ZeRO-style optimizer that partitions states across CPU and GPU.
 
-    More sophisticated than CPUOffloadOptimizer:
-    - Partitions large tensors into chunks
-    - Streams chunks during optimizer step
-    - Better memory/compute overlap
+    .. deprecated::
+        ``PartitionedOptimizer`` is deprecated and will be removed in v0.5.
+        Use ``CPUOffloadOptimizer`` together with ``LayerStreamer`` instead.
+        ``LayerStreamer`` renders partition-based streaming obsolete for
+        single-GPU targets.
     """
 
     def __init__(
@@ -317,6 +419,12 @@ class PartitionedOptimizer:
         config: OffloadConfig = None,
         partition_size: int = 500_000_000,  # 500M elements per partition
     ):
+        warnings.warn(
+            "PartitionedOptimizer is deprecated; use CPUOffloadOptimizer + "
+            "LayerStreamer instead. Will be removed in v0.5.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.optimizer = optimizer
         self.config = config or OffloadConfig()
         self.partition_size = partition_size

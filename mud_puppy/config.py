@@ -20,7 +20,7 @@ class TrainingConfig:
 
     # High-level method selection
     finetuning_method: str = "full"  # full, lora, qlora, gptq, qat, preference, rl, multimodal, rm, prm, embedding
-    precision: str = "bf16"  # fp16, bf16, fp8, fp32
+    precision: str = "bf16"  # fp16, bf16, fp8
 
     # Optimization hyperparameters
     batch_size: int = 1
@@ -64,8 +64,12 @@ class TrainingConfig:
     dataloader_workers: int = 0
     preprocessing_workers: int = 1
 
+    # Sequence packing
+    pack_sequences: bool = False  # Greedy bin-packing collator (v0.4, default-on v0.5)
+
     # System / runtime behavior
     compile: bool = False
+    compile_mode: str = "reduce-overhead"  # torch.compile mode: reduce-overhead, default, max-autotune
     resume: bool = False
     log_with: str = "none"  # none, tensorboard, wandb
     tokens_per_batch: int = 0
@@ -73,6 +77,7 @@ class TrainingConfig:
     early_stopping_patience: int = 0
     device_map: str = "auto"  # auto, pipeline, or HF accelerate-style map
     stream: bool = False
+    prefetch_layers: int = 2  # Number of layers to keep resident in GPU ring
     zero_offload: bool = False
     max_grad_norm: float = 1.0
     distributed: bool = False
@@ -82,9 +87,8 @@ class TrainingConfig:
     merge_lora: bool = False
     merge_precision: str = "bf16"  # fp16, bf16, fp32
 
-    # Monitor
+    # Monitor (web dashboard via WebSocket)
     monitor: bool = False
-    monitor_tui: bool = False
     monitor_port: int = 5980
 
     def _validate_paths(self) -> None:
@@ -94,15 +98,14 @@ class TrainingConfig:
 
     def _validate_combinations(self) -> None:
         """Validate combinations of options that are known to be invalid."""
-        if self.finetuning_method in ("lora", "qlora") and self.stream:
-            raise ValueError(
-                f"Streaming is not supported with {self.finetuning_method.upper()}. "
-                "LoRA modules are added after streaming hooks and won't be properly streamed."
-            )
         if self.tokens_per_batch < 0:
             raise ValueError("tokens_per_batch must be non-negative")
         if self.max_seq_length < 0:
             raise ValueError("max_seq_length must be non-negative")
+        if self.prefetch_layers < 1:
+            raise ValueError(
+                f"prefetch_layers must be >= 1, got {self.prefetch_layers}"
+            )
         if self.distributed and torch.cuda.device_count() < 2:
             # Note: torch.distributed on ROCm still reports as CUDA in PyTorch
             raise ValueError("Distributed training requires at least 2 GPUs")
@@ -124,7 +127,7 @@ class TrainingConfig:
         if self.finetuning_method not in supported:
             raise ValueError(f"Unsupported finetuning method: {self.finetuning_method}")
 
-        if self.precision not in {"fp16", "bf16", "fp8", "fp32"}:
+        if self.precision not in {"fp16", "bf16", "fp8"}:
             raise ValueError(f"Unsupported precision: {self.precision}")
 
         schedulers = {"linear", "cosine", "cosine_with_restarts", "polynomial"}
@@ -140,6 +143,12 @@ class TrainingConfig:
             raise ValueError(f"Unsupported logging backend: {self.log_with}")
         if not 0.0 <= self.lora_dropout <= 1.0:
             raise ValueError("lora_dropout must be between 0.0 and 1.0")
+
+        if self.compile_mode not in {"default", "reduce-overhead", "max-autotune"}:
+            raise ValueError(
+                f"Unsupported compile_mode: {self.compile_mode}. "
+                "Must be one of: default, reduce-overhead, max-autotune"
+            )
 
         self._validate_paths()
         self._validate_combinations()

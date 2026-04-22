@@ -61,7 +61,6 @@ __all__ = [
     # Training monitor (WebSocket + TUI)
     "MonitorServer",
     "MonitorCallback",
-    "TUIMonitor",
 ]
 
 from .config import TrainingConfig
@@ -372,11 +371,3 @@ def MonitorCallback(*args, **kwargs):
     return _MonitorCallback(*args, **kwargs)
 
 
-def TUIMonitor(*args, **kwargs):
-    """Rich-based terminal dashboard for live training monitoring.
-
-    Connects to MonitorServer and renders progress bars, loss sparklines,
-    GPU telemetry, and training configuration in the terminal.
-    """
-    from .tui import TUIMonitor as _TUIMonitor
-    return _TUIMonitor(*args, **kwargs)

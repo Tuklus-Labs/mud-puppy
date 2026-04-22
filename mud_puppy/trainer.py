@@ -5,12 +5,15 @@ specialized trainers for features like dynamic batching and layer streaming.
 """
 
 import os
+import logging
 
 # Favor ROCm-friendly allocator behavior by default
-os.environ.setdefault("PYTORCH_HIP_ALLOC_CONF", "max_split_size_mb:128")
+os.environ.setdefault("PYTORCH_HIP_ALLOC_CONF", "expandable_segments:True")
 
 from typing import Dict, List, Optional, Iterator, Any
 import random
+
+log = logging.getLogger(__name__)
 from torch.utils.data import Sampler, DataLoader, Dataset
 
 import torch
@@ -28,6 +31,7 @@ from transformers import (
     AutoTokenizer,
     Trainer,
     TrainingArguments,
+    DataCollatorForLanguageModeling,
     TrainerCallback,
     EarlyStoppingCallback,
     PreTrainedModel,
@@ -103,110 +107,6 @@ def _prepare_model_for_kbit_training_rocm(model: nn.Module) -> None:
         def make_inputs_require_grad(module, input, output):
             output.requires_grad_(True)
         model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
-
-
-class StreamWrapper(nn.Module):
-    """Wrapper that streams model layers to GPU on demand.
-
-    This allows training models that don't fit entirely in GPU memory by
-    keeping most layers on CPU and moving them to GPU only when needed.
-
-    Strategy:
-    - Keep embedding/lm_head on GPU always (small, always needed)
-    - Move transformer layers to GPU for forward pass
-    - Keep layers on GPU through backward pass
-    - Offload to CPU after optimizer step (via offload_to_cpu method)
-
-    Note: This provides memory savings between training steps, not during
-    the forward/backward pass itself. For true streaming during forward/backward,
-    use gradient checkpointing with this wrapper.
-    """
-
-    def __init__(self, model: nn.Module):
-        super().__init__()
-        self.model = model
-        self._device = get_device()
-        self._cpu = torch.device("cpu")
-        self._on_gpu = False
-
-        # Find the transformer layers (supports LLaMA, GPT-2, etc.)
-        self._layers = self._find_layers()
-
-        # Move everything to CPU initially
-        self.model.to(self._cpu)
-
-        # Keep embedding and output layers on GPU (small and always needed)
-        self._move_endpoints_to_gpu()
-
-    def _find_layers(self) -> List[nn.Module]:
-        """Find the main transformer layers that can be streamed."""
-        # LLaMA-style: model.layers
-        if hasattr(self.model, 'model') and hasattr(self.model.model, 'layers'):
-            return list(self.model.model.layers)
-        # GPT-2 style: transformer.h
-        if hasattr(self.model, 'transformer') and hasattr(self.model.transformer, 'h'):
-            return list(self.model.transformer.h)
-        # Fallback: no streaming possible
-        return []
-
-    def _move_endpoints_to_gpu(self):
-        """Move embedding and output projection to GPU (always needed)."""
-        # Move embeddings
-        if hasattr(self.model, 'get_input_embeddings'):
-            emb = self.model.get_input_embeddings()
-            if emb is not None:
-                emb.to(self._device)
-
-        # Move output projection (lm_head)
-        if hasattr(self.model, 'lm_head'):
-            self.model.lm_head.to(self._device)
-
-        # Move final layer norm
-        if hasattr(self.model, 'model') and hasattr(self.model.model, 'norm'):
-            self.model.model.norm.to(self._device)
-        if hasattr(self.model, 'transformer') and hasattr(self.model.transformer, 'ln_f'):
-            self.model.transformer.ln_f.to(self._device)
-
-    def _ensure_on_gpu(self):
-        """Move all layers to GPU for forward/backward pass."""
-        if not self._on_gpu:
-            for layer in self._layers:
-                layer.to(self._device)
-            self._on_gpu = True
-
-    def offload_to_cpu(self):
-        """Move transformer layers back to CPU to free VRAM.
-
-        Call this after optimizer.step() to free memory between training steps.
-        """
-        if self._on_gpu:
-            for layer in self._layers:
-                layer.to(self._cpu)
-            self._on_gpu = False
-            # Clear CUDA cache
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-    def forward(self, *args, **kwargs):
-        # Ensure all layers are on GPU for forward pass
-        self._ensure_on_gpu()
-
-        # Move inputs to GPU
-        args = tuple(
-            a.to(self._device) if isinstance(a, torch.Tensor) else a for a in args
-        )
-        kwargs = {
-            k: v.to(self._device) if isinstance(v, torch.Tensor) else v
-            for k, v in kwargs.items()
-        }
-
-        return self.model(*args, **kwargs)
-
-    def __getattr__(self, name: str):
-        try:
-            return super().__getattr__(name)
-        except AttributeError:
-            return getattr(self.model, name)
 
 
 class DynamicBatchSampler(Sampler):
@@ -295,86 +195,6 @@ class DynamicBatchSampler(Sampler):
         return max(1, total_tokens // self.tokens_per_batch)
 
 
-class ZeroOffloadCallback(TrainerCallback):
-    """Callback to offload optimizer states to CPU memory.
-
-    This is a ROCm-native implementation of ZeRO-Offload that doesn't
-    require DeepSpeed (which is CUDA-only).
-
-    The approach:
-    - After each optimizer step, move optimizer states to CPU
-    - Before each step, states are automatically moved back as needed
-    - This saves VRAM between steps (optimizer states are 2x model size for Adam)
-    """
-
-    def __init__(self):
-        self._optimizer_wrapped = False
-        self._cpu_states = {}
-        self._cpu = torch.device("cpu")
-        self._gpu = torch.device("cuda") if torch.cuda.is_available() else self._cpu
-
-    def on_train_begin(self, args, state, control, model=None, **kwargs):
-        """Initialize CPU offload structures."""
-        print("[mud-puppy] ZeRO-Offload enabled (ROCm-native)")
-
-    def on_step_end(self, args, state, control, model=None, optimizer=None, **kwargs):
-        """After optimizer step, offload states to CPU."""
-        if optimizer is None:
-            return
-
-        # Move optimizer states to CPU to free VRAM
-        for group in optimizer.param_groups:
-            for param in group["params"]:
-                if param not in optimizer.state:
-                    continue
-
-                opt_state = optimizer.state[param]
-                pid = id(param)
-
-                # Initialize CPU storage for this param
-                if pid not in self._cpu_states:
-                    self._cpu_states[pid] = {}
-
-                # Move each state tensor to CPU
-                for key, val in opt_state.items():
-                    if isinstance(val, torch.Tensor) and val.device.type == "cuda":
-                        # Move to CPU (pinned memory for faster transfer back)
-                        if pid not in self._cpu_states or key not in self._cpu_states[pid]:
-                            cpu_tensor = torch.empty(
-                                val.shape, dtype=val.dtype, device=self._cpu,
-                                pin_memory=True
-                            )
-                            self._cpu_states[pid][key] = cpu_tensor
-
-                        self._cpu_states[pid][key].copy_(val, non_blocking=True)
-                        opt_state[key] = self._cpu_states[pid][key]
-
-        # Sync before clearing cache: non-blocking copies above must complete
-        # before the CPU tensors are read in on_step_begin.
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-
-    def on_step_begin(self, args, state, control, model=None, optimizer=None, **kwargs):
-        """Before optimizer step, move states back to GPU."""
-        if optimizer is None:
-            return
-
-        # Move optimizer states back to GPU for the step
-        for group in optimizer.param_groups:
-            for param in group["params"]:
-                if param not in optimizer.state:
-                    continue
-
-                opt_state = optimizer.state[param]
-
-                for key, val in opt_state.items():
-                    if isinstance(val, torch.Tensor) and val.device.type == "cpu":
-                        # Move back to GPU
-                        gpu_tensor = val.to(self._gpu, non_blocking=True)
-                        opt_state[key] = gpu_tensor
-
-
 class LoggingCallback(TrainerCallback):
     """Enhanced logging callback for mud-puppy."""
 
@@ -388,27 +208,23 @@ class LoggingCallback(TrainerCallback):
             print(f"[mud-puppy] step {state.global_step}: loss={loss}, lr={lr}")
 
 
-class ROCmCacheCallback(TrainerCallback):
-    """Flush the HIP memory allocator cache periodically on ROCm.
-
-    The ROCm/HIP caching allocator does not return freed blocks to the device.
-    Without periodic empty_cache() calls, the allocator cache grows until it
-    fills all VRAM, causing swap thrashing and 50-100x slowdowns.
-
-    This is a no-op on CUDA (the CUDA allocator manages this automatically).
-    """
-
-    def on_step_end(self, args, state, control, **kwargs):
-        if is_rocm() and state.global_step % args.gradient_accumulation_steps == 0:
-            torch.cuda.empty_cache()
-
-
 class MudPuppyTrainer(Trainer):
-    """Trainer with optional token-budget dynamic batching."""
+    """Trainer with optional token-budget dynamic batching and CPU offload."""
 
-    def __init__(self, *args, tokens_per_batch: int = 0, **kwargs):
+    def __init__(self, *args, tokens_per_batch: int = 0,
+                 mudpuppy_zero_offload: bool = False, **kwargs):
         self.tokens_per_batch = tokens_per_batch
+        self._mudpuppy_zero_offload = mudpuppy_zero_offload
         super().__init__(*args, **kwargs)
+
+    def create_optimizer(self):
+        """Create optimizer, wrapping with CPUOffloadOptimizer when requested."""
+        opt = super().create_optimizer()
+        if self._mudpuppy_zero_offload:
+            from .zero_offload import wrap_optimizer_for_offload
+            opt = wrap_optimizer_for_offload(opt)
+            print("[mud-puppy] ZeRO-Offload enabled via CPUOffloadOptimizer")
+        return opt
 
     def get_train_dataloader(self) -> DataLoader:
         if self.train_dataset is None:
@@ -425,61 +241,20 @@ class MudPuppyTrainer(Trainer):
             drop_last=self.args.dataloader_drop_last,
         )
 
+        num_workers = self.args.dataloader_num_workers
+        extra = {}
+        if num_workers > 0:
+            extra["persistent_workers"] = True
+            extra["prefetch_factor"] = 4
+
         return DataLoader(
             self.train_dataset,
             batch_sampler=sampler,
             collate_fn=self.data_collator,
-            num_workers=self.args.dataloader_num_workers,
+            num_workers=num_workers,
             pin_memory=self.args.dataloader_pin_memory,
+            **extra,
         )
-
-
-class CausalLMCollator:
-    """Pad variable-length Causal LM examples while preserving label masks."""
-
-    def __init__(self, tokenizer: PreTrainedTokenizer):
-        self.tokenizer = tokenizer
-
-    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        has_labels = "labels" in features[0]
-        labels = []
-        cleaned = []
-
-        for feature in features:
-            item = {}
-            for key, value in feature.items():
-                if isinstance(value, torch.Tensor):
-                    value = value.tolist()
-                item[key] = value
-
-            item.pop("length", None)
-
-            if has_labels and "labels" in item:
-                labels.append(item.pop("labels"))
-
-            cleaned.append(item)
-
-        batch = self.tokenizer.pad(cleaned, padding=True, return_tensors="pt")
-
-        if has_labels and labels:
-            max_len = batch["input_ids"].shape[1]
-            label_batch = torch.full((len(labels), max_len), -100, dtype=torch.long)
-
-            for i, lbl in enumerate(labels):
-                if isinstance(lbl, torch.Tensor):
-                    lbl = lbl.tolist()
-                lbl = list(lbl)[:max_len]
-                if lbl:
-                    label_batch[i, : len(lbl)] = torch.tensor(lbl, dtype=torch.long)
-
-            batch["labels"] = label_batch
-        else:
-            labels_tensor = batch["input_ids"].clone()
-            if self.tokenizer.pad_token_id is not None:
-                labels_tensor[labels_tensor == self.tokenizer.pad_token_id] = -100
-            batch["labels"] = labels_tensor
-
-        return batch
 
 
 def load_model(config: TrainingConfig):
@@ -627,10 +402,12 @@ def load_model(config: TrainingConfig):
             print("[mud-puppy] Moving model to GPU...")
             model = model.to("cuda")
 
-    # Streaming: keep model on CPU and stream leaf modules to active device
+    # Streaming: keep model on CPU and stream transformer blocks to GPU via prefetch ring
     if config.stream:
         model.to("cpu")
-        model = StreamWrapper(model)
+        from .stream import LayerStreamer
+        model = LayerStreamer.wrap(model, prefetch_layers=config.prefetch_layers)
+        print(f"[mud-puppy] LayerStreamer active (prefetch_layers={config.prefetch_layers})")
 
     # Experimental FP8 support
     if config.precision == "fp8":
@@ -683,7 +460,7 @@ def prepare_lora(model: nn.Module, config: TrainingConfig) -> nn.Module:
         r=config.lora_r,
         lora_alpha=config.lora_alpha,
         target_modules=target_modules,
-        lora_dropout=config.lora_dropout,
+        lora_dropout=0.05,
         bias="none",
         task_type="CAUSAL_LM",
     )
@@ -787,178 +564,108 @@ def load_and_preprocess_dataset(
     """Load and preprocess the training dataset.
 
     Supports JSONL format with chat-style messages or simple text fields.
-
-    For instruction-style schemas, labels are masked to optimize only response
-    tokens (prompt/context tokens are set to -100).
     """
+    # Load the dataset
     dataset = load_dataset("json", data_files=config.dataset_path, split="train")
+
+    # Determine the format and preprocess accordingly
     columns = dataset.column_names
 
-    # Use config max_seq_length if set, else model default (capped at 2048)
-    if config.max_seq_length > 0:
-        max_len = config.max_seq_length
-    else:
-        max_len = min(getattr(tokenizer, "model_max_length", 2048), 2048)
-        # GPT-2 and similar models have 1024 max positions
-        if max_len > 1024 and hasattr(tokenizer, "name_or_path"):
-            if "gpt2" in tokenizer.name_or_path.lower():
-                max_len = 1024
+    def tokenize_chat(examples: Dict[str, Any]) -> Dict[str, Any]:
+        """Tokenize chat-formatted examples."""
+        texts = []
 
-    def _safe_text(value: Any) -> str:
-        if value is None:
-            return ""
-        return str(value)
+        for i in range(len(examples[columns[0]])):
+            # Try to extract messages in various formats
+            if "messages" in columns:
+                messages = examples["messages"][i]
+                if (
+                    config.use_chat_template
+                    and hasattr(tokenizer, "apply_chat_template")
+                    and tokenizer.chat_template is not None
+                ):
+                    try:
+                        text = tokenizer.apply_chat_template(
+                            messages, tokenize=False, add_generation_prompt=False
+                        )
+                    except Exception:
+                        # Fallback if chat template fails
+                        text = "\n".join(
+                            f"{m.get('role', 'user')}: {m.get('content', '')}"
+                            for m in messages
+                        )
+                else:
+                    # Fallback: concatenate message contents
+                    text = "\n".join(
+                        f"{m.get('role', 'user')}: {m.get('content', '')}"
+                        for m in messages
+                    )
+            elif "text" in columns:
+                text = examples["text"][i]
+            elif "input" in columns and "output" in columns:
+                text = f"{examples['input'][i]}\n{examples['output'][i]}"
+            elif "prompt" in columns and "completion" in columns:
+                text = f"{examples['prompt'][i]}{examples['completion'][i]}"
+            elif "instruction" in columns:
+                text = examples["instruction"][i]
+                if "response" in columns:
+                    text = f"{text}\n{examples['response'][i]}"
+            else:
+                # Use first text-like column
+                text = str(examples[columns[0]][i])
 
-    def _messages_to_fallback_text(messages: List[Dict[str, Any]]) -> str:
-        return "\n".join(
-            f"{m.get('role', 'user')}: {m.get('content', '')}" for m in messages
-        )
+            texts.append(text)
 
-    def _encode_text(text: str) -> Dict[str, List[int]]:
-        return tokenizer(
-            text,
+        # Tokenize - use config max_seq_length if set, else model default (capped at 2048)
+        if config.max_seq_length > 0:
+            max_len = config.max_seq_length
+        else:
+            max_len = min(
+                getattr(tokenizer, "model_max_length", 2048),
+                2048
+            )
+            # GPT-2 and similar models have 1024 max positions
+            if max_len > 1024 and hasattr(tokenizer, "name_or_path"):
+                if "gpt2" in tokenizer.name_or_path.lower():
+                    max_len = 1024
+
+        tokenized = tokenizer(
+            texts,
             truncation=True,
             padding=False,
             max_length=max_len,
             return_tensors=None,
         )
 
-    def _encode_messages(messages: List[Dict[str, Any]]) -> Dict[str, List[int]]:
-        if (
-            config.use_chat_template
-            and hasattr(tokenizer, "apply_chat_template")
-            and tokenizer.chat_template is not None
-        ):
-            try:
-                return tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=True,
-                    add_generation_prompt=False,
-                    truncation=True,
-                    max_length=max_len,
-                    return_dict=True,
-                )
-            except Exception:
-                pass
+        # Add length column for dynamic batching
+        tokenized["length"] = [len(ids) for ids in tokenized["input_ids"]]
 
-        return _encode_text(_messages_to_fallback_text(messages))
+        # Populate labels for causal LM training. PackedCollator (and the
+        # standard data collator without label shifting) requires labels to
+        # exist up-front; HuggingFace's Trainer shifts internally at loss
+        # time, so we clone input_ids here and let the model handle the
+        # shift. Downstream masking (response-only, prompt masking) can
+        # overwrite these values with -100 as needed.
+        tokenized["labels"] = [list(ids) for ids in tokenized["input_ids"]]
 
-    def _prompt_token_len_for_messages(messages: List[Dict[str, Any]]) -> int:
-        if not isinstance(messages, list) or not messages:
-            return 0
-        last = messages[-1]
-        if not isinstance(last, dict) or last.get("role") != "assistant":
-            return 0
+        return tokenized
 
-        prompt_messages = messages[:-1]
-
-        if (
-            config.use_chat_template
-            and hasattr(tokenizer, "apply_chat_template")
-            and tokenizer.chat_template is not None
-        ):
-            try:
-                prompt_enc = tokenizer.apply_chat_template(
-                    prompt_messages,
-                    tokenize=True,
-                    add_generation_prompt=True,
-                    truncation=True,
-                    max_length=max_len,
-                    return_dict=True,
-                )
-                return len(prompt_enc["input_ids"])
-            except Exception:
-                pass
-
-        prompt_text = _messages_to_fallback_text(prompt_messages + [{"role": "assistant", "content": ""}])
-        prompt_enc = _encode_text(prompt_text)
-        return len(prompt_enc["input_ids"])
-
-    def tokenize_chat(examples: Dict[str, Any]) -> Dict[str, Any]:
-        input_ids_all: List[List[int]] = []
-        attention_masks_all: List[List[int]] = []
-        labels_all: List[List[int]] = []
-        lengths: List[int] = []
-
-        example_count = len(examples[columns[0]])
-
-        for i in range(example_count):
-            prompt_len = 0
-
-            if "messages" in columns:
-                messages = examples["messages"][i]
-                if isinstance(messages, list):
-                    enc = _encode_messages(messages)
-                    prompt_len = _prompt_token_len_for_messages(messages)
-                else:
-                    enc = _encode_text(_safe_text(messages))
-
-            elif "input" in columns and "output" in columns:
-                prompt_text = _safe_text(examples["input"][i])
-                completion_text = _safe_text(examples["output"][i])
-                enc = _encode_text(f"{prompt_text}\n{completion_text}")
-                prompt_len = len(_encode_text(prompt_text)["input_ids"])
-
-            elif "prompt" in columns and "completion" in columns:
-                prompt_text = _safe_text(examples["prompt"][i])
-                completion_text = _safe_text(examples["completion"][i])
-                enc = _encode_text(f"{prompt_text}{completion_text}")
-                prompt_len = len(_encode_text(prompt_text)["input_ids"])
-
-            elif "instruction" in columns and "response" in columns:
-                prompt_text = _safe_text(examples["instruction"][i])
-                completion_text = _safe_text(examples["response"][i])
-                enc = _encode_text(f"{prompt_text}\n{completion_text}")
-                prompt_len = len(_encode_text(prompt_text)["input_ids"])
-
-            elif "text" in columns:
-                text = _safe_text(examples["text"][i])
-                enc = _encode_text(text)
-                # Try to find response boundary for common delimiters
-                if config.response_only:
-                    for delim in ("### Output:", "### Response:", "### Answer:",
-                                  "\nAssistant:", "\nassistant:"):
-                        idx = text.find(delim)
-                        if idx >= 0:
-                            prompt_text = text[:idx + len(delim)]
-                            prompt_len = len(_encode_text(prompt_text)["input_ids"])
-                            break
-
-            elif "instruction" in columns:
-                enc = _encode_text(_safe_text(examples["instruction"][i]))
-
-            else:
-                enc = _encode_text(_safe_text(examples[columns[0]][i]))
-
-            input_ids = list(enc["input_ids"])
-            attention_mask = list(enc["attention_mask"])
-            prompt_len = min(prompt_len, len(input_ids))
-
-            labels = input_ids.copy()
-            if config.response_only and prompt_len > 0:
-                labels[:prompt_len] = [-100] * prompt_len
-
-            input_ids_all.append(input_ids)
-            attention_masks_all.append(attention_mask)
-            labels_all.append(labels)
-            lengths.append(len(input_ids))
-
-        return {
-            "input_ids": input_ids_all,
-            "attention_mask": attention_masks_all,
-            "labels": labels_all,
-            "length": lengths,
-        }
-
+    # Apply tokenization
     dataset = dataset.map(
         tokenize_chat,
         batched=True,
-        num_proc=config.preprocessing_workers if config.preprocessing_workers > 1 else None,
+        num_proc=config.preprocessing_workers,
         remove_columns=columns,
         desc="Tokenizing dataset",
     )
 
-    dataset.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
+    # Set format for PyTorch. Retain "labels" (required by collators +
+    # PackedCollator) and "length" (required by DynamicBatchSampler when
+    # tokens_per_batch > 0).
+    format_columns = ["input_ids", "attention_mask", "labels"]
+    if getattr(config, "tokens_per_batch", 0) > 0:
+        format_columns.append("length")
+    dataset.set_format(type="torch", columns=format_columns)
 
     return dataset
 
@@ -1041,19 +748,6 @@ def run_training(config: TrainingConfig) -> None:
     print(f"[mud-puppy] Dataset: {config.dataset_path}")
     print(f"[mud-puppy] Output: {config.output_dir}")
     print(f"[mud-puppy] Precision: {config.precision}")
-    if config.response_only:
-        print("[mud-puppy] Response-only loss masking enabled (prompt tokens ignored)")
-    if config.finetuning_method in ("lora", "qlora") and config.learning_rate <= 3e-5:
-        print(
-            "[mud-puppy] WARNING: very low LR for LoRA/QLoRA. "
-            "Typical range is 1e-4 to 3e-4."
-        )
-
-    # Warn about incompatible options
-    if config.stream and config.finetuning_method in ("lora", "qlora"):
-        print("[mud-puppy] WARNING: Streaming + LoRA is not supported (LoRA modules won't stream)")
-        print("[mud-puppy] Disabling streaming mode for this training run")
-        config = TrainingConfig(**{**config.__dict__, "stream": False})
 
     # Set up distributed training if requested
     is_distributed = setup_distributed(config)
@@ -1062,6 +756,18 @@ def run_training(config: TrainingConfig) -> None:
 
     # Create output directory
     os.makedirs(config.output_dir, exist_ok=True)
+
+    # Streaming + gradient_checkpointing is unsafe. During backward,
+    # checkpoint recomputation re-invokes the forward hooks installed by
+    # LayerStreamer; a concurrent prefetch/eviction can rip weights out
+    # from under an in-flight recomputation. Fail fast rather than silently
+    # training on corrupted gradients.
+    if config.stream and config.use_gradient_checkpointing:
+        raise RuntimeError(
+            "LayerStreamer is incompatible with gradient checkpointing "
+            "(recomputation races against ring eviction). "
+            "Disable --use-gradient-checkpointing or --stream."
+        )
 
     # Load model and tokenizer
     model, tokenizer = load_model(config)
@@ -1080,10 +786,12 @@ def run_training(config: TrainingConfig) -> None:
     if config.device_map == "pipeline":
         model = setup_pipeline_parallelism(model, config)
 
-    # Compile model if requested
-    if config.compile and hasattr(torch, "compile"):
-        print("[mud-puppy] Compiling model with torch.compile...")
-        model = torch.compile(model)
+    # Compile model if requested (skip when --stream is active: custom hooks don't mesh with compile)
+    if config.compile and hasattr(torch, "compile") and not config.stream:
+        print(f"[mud-puppy] Compiling model with torch.compile (mode={config.compile_mode})...")
+        model = torch.compile(model, mode=config.compile_mode)
+    elif config.compile and config.stream:
+        log.warning("torch.compile disabled when --stream is active")
 
     # Load and preprocess dataset
     dataset = load_and_preprocess_dataset(config, tokenizer)
@@ -1102,26 +810,33 @@ def run_training(config: TrainingConfig) -> None:
     training_args = create_training_args(config)
 
     # Set up data collator
-    data_collator = CausalLMCollator(tokenizer=tokenizer)
+    if config.pack_sequences:
+        from .packing import PackedCollator
+        max_seq = config.max_seq_length if config.max_seq_length > 0 else 2048
+        data_collator = PackedCollator(
+            max_seq_length=max_seq,
+            pad_token_id=tokenizer.pad_token_id or 0,
+        )
+        print(f"[mud-puppy] Sequence packing enabled (max_seq_length={max_seq})")
+    else:
+        data_collator = DataCollatorForLanguageModeling(
+            tokenizer=tokenizer,
+            mlm=False,
+        )
 
     # Set up callbacks
     callbacks = [LoggingCallback(config.log_with)]
-
-    if is_rocm():
-        callbacks.append(ROCmCacheCallback())
 
     if config.early_stopping_patience > 0:
         callbacks.append(
             EarlyStoppingCallback(early_stopping_patience=config.early_stopping_patience)
         )
 
-    if config.zero_offload:
-        callbacks.append(ZeroOffloadCallback())
+    # zero_offload is wired via MudPuppyTrainer.create_optimizer, not a callback
 
-    # Monitor callback (web dashboard and/or TUI)
+    # Monitor callback (web dashboard via WebSocket)
     monitor_server = None
-    monitor_tui_inst = None
-    if config.monitor or config.monitor_tui:
+    if config.monitor:
         from .monitor import MonitorCallback, MonitorServer, start_gpu_telemetry
 
         config_data = {
@@ -1137,24 +852,18 @@ def run_training(config: TrainingConfig) -> None:
             "quant_backend": config.quant_backend if config.finetuning_method == "qlora" else None,
         }
 
-        if config.monitor:
-            monitor_server = MonitorServer(port=config.monitor_port)
-            monitor_server.start()
-            start_gpu_telemetry(monitor_server)
-            print(f"[mud-puppy] Training monitor: http://localhost:{config.monitor_port}")
-            import webbrowser
-            webbrowser.open(f"http://localhost:{config.monitor_port}")
-
-        if config.monitor_tui:
-            from .tui import TUIMonitor
-            monitor_tui_inst = TUIMonitor()
-            monitor_tui_inst.start()
+        monitor_server = MonitorServer(port=config.monitor_port)
+        monitor_server.start()
+        start_gpu_telemetry(monitor_server)
+        print(f"[mud-puppy] Training monitor: http://localhost:{config.monitor_port}")
+        import webbrowser
+        webbrowser.open(f"http://localhost:{config.monitor_port}")
 
         callbacks.append(MonitorCallback(
             model=model,
             config_data=config_data,
             server=monitor_server,
-            tui=monitor_tui_inst,
+            tui=None,
             lora_norm_interval=50 if config.finetuning_method in ("lora", "qlora") else 0,
         ))
 
@@ -1176,6 +885,7 @@ def run_training(config: TrainingConfig) -> None:
 
     trainer = MudPuppyTrainer(
         tokens_per_batch=config.tokens_per_batch,
+        mudpuppy_zero_offload=config.zero_offload,
         **trainer_kwargs,
     )
 
@@ -1198,8 +908,6 @@ def run_training(config: TrainingConfig) -> None:
     # Stop monitor
     if monitor_server:
         monitor_server.stop()
-    if monitor_tui_inst:
-        monitor_tui_inst.stop()
 
     # Save final model
     print("[mud-puppy] Saving model...")

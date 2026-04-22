@@ -19,7 +19,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="method",
         help=(
             "finetuning method: full, lora, qlora, gptq, qat, "
-            "preference, rl, multimodal, rm, prm, embedding"
+            "preference, rl, multimodal, rm, prm"
         ),
     )
     parser.add_argument(
@@ -49,6 +49,28 @@ def build_parser() -> argparse.ArgumentParser:
         dest="compile",
         action="store_true",
         help="enable torch.compile for extra speed",
+    )
+    parser.add_argument(
+        "--compile-mode",
+        dest="compile_mode",
+        default="reduce-overhead",
+        choices=["reduce-overhead", "default", "max-autotune"],
+        help="torch.compile mode (default: reduce-overhead)",
+    )
+    parser.add_argument(
+        "--pack-sequences",
+        dest="pack_sequences",
+        action="store_true",
+        help="enable sequence packing (bin-packs short examples into rows, "
+             "uses block-diagonal attention mask)",
+    )
+    parser.add_argument(
+        "--prefetch-layers",
+        dest="prefetch_layers",
+        type=int,
+        default=2,
+        help="number of transformer layers to keep resident in GPU ring "
+             "when --stream is active (default: 2)",
     )
     parser.add_argument(
         "--num-workers",
@@ -178,8 +200,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--monitor", dest="monitor", action="store_true",
         help="enable real-time web training dashboard (port 5980)")
-    parser.add_argument("--monitor-tui", dest="monitor_tui", action="store_true",
-        help="enable terminal (Rich) training monitor")
     parser.add_argument("--monitor-port", dest="monitor_port", type=int, default=5980,
         help="port for web training monitor (default: 5980)")
     parser.add_argument(
@@ -237,6 +257,9 @@ def main() -> None:
         precision=args.precision,
         preference=args.preference,
         compile=args.compile,
+        compile_mode=args.compile_mode,
+        pack_sequences=args.pack_sequences,
+        prefetch_layers=args.prefetch_layers,
         use_gradient_checkpointing=not args.no_gradient_checkpointing,
         dataloader_workers=args.num_workers,
         preprocessing_workers=args.preprocess_workers,
@@ -254,7 +277,6 @@ def main() -> None:
         merge_lora=args.merge_lora,
         merge_precision=args.merge_precision,
         monitor=args.monitor,
-        monitor_tui=args.monitor_tui,
         monitor_port=args.monitor_port,
         distributed=args.distributed,
         local_rank=args.local_rank,

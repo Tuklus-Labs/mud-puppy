@@ -220,18 +220,32 @@ class MonitorServer:
         self._thread: Optional[threading.Thread] = None
         self._runner: Any = None  # aiohttp.web.AppRunner
         self._running = threading.Event()
+        # Captured from the worker thread on startup failure (e.g. aiohttp
+        # missing) so start() can re-raise synchronously.
+        self._start_error: Optional[BaseException] = None
 
     # -- lifecycle ----------------------------------------------------------
 
     def start(self) -> None:
-        """Start the server in a background daemon thread."""
+        """Start the server in a background daemon thread.
+
+        If the worker thread fails during import/setup (e.g. aiohttp
+        missing), the captured exception is re-raised here so the caller
+        sees a real error instead of a silent no-op.
+        """
         if self._thread is not None and self._thread.is_alive():
             return
 
+        self._start_error = None
         self._thread = threading.Thread(target=self._run, daemon=True, name="monitor-ws")
         self._thread.start()
-        # Wait for the server to be ready (up to 5s)
+        # Wait for the server to be ready (up to 5s); _running is set on
+        # both success and startup-failure paths so we unblock promptly.
         self._running.wait(timeout=5.0)
+        if self._start_error is not None:
+            err, self._start_error = self._start_error, None
+            self._running.clear()
+            raise err
 
     def stop(self) -> None:
         """Gracefully shut down the server."""
@@ -261,7 +275,14 @@ class MonitorServer:
         """Entry point for the daemon thread."""
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
-        self._loop.run_until_complete(self._serve())
+        try:
+            self._loop.run_until_complete(self._serve())
+        except BaseException as exc:  # noqa: BLE001 -- capture for main thread
+            # Record the failure and unblock start()'s wait so the caller
+            # can re-raise. Using _running.set() here is a signal only;
+            # start() checks _start_error first.
+            self._start_error = exc
+            self._running.set()
 
     async def _serve(self) -> None:
         """Set up and run the aiohttp application."""
@@ -275,6 +296,13 @@ class MonitorServer:
         await self._runner.setup()
         site = web.TCPSite(self._runner, "0.0.0.0", self.port)
         await site.start()
+        # Record the actual bound port (useful when port=0 is passed).
+        try:
+            sockets = site._server.sockets if site._server is not None else []
+            if sockets:
+                self.port = sockets[0].getsockname()[1]
+        except Exception as exc:
+            log.debug("could not read bound socket port: %s", exc)
         log.info("MonitorServer listening on port %d", self.port)
         self._running.set()
 
@@ -399,6 +427,11 @@ class MonitorCallback:
         elapsed = time.time() - (self._start_time or time.time())
         steps_per_sec = step / elapsed if elapsed > 0 and step > 0 else 0.0
 
+        # tokens_per_sec: HF Trainer logs this directly; fall back to
+        # steps_per_sec * batch_tokens if available, else 0.
+        tokens_per_sec = float(logs.get("tokens_per_second",
+                                        logs.get("train_tokens_per_second", 0.0)))
+
         msg = {
             "type": "metrics",
             "step": step,
@@ -409,9 +442,13 @@ class MonitorCallback:
             "grad_norm": grad_norm,
             "eta_seconds": eta,
             "steps_per_sec": steps_per_sec,
+            "tokens_per_sec": tokens_per_sec,
         }
         self.metrics_history.append(msg)
         self._emit(msg)
+
+        # Stream stats (if LayerStreamer is attached to model)
+        self._emit_stream_stats(step)
 
         # LoRA norms at interval
         if self.lora_norm_interval > 0 and step % self.lora_norm_interval == 0 and step > 0:
@@ -476,13 +513,71 @@ class MonitorCallback:
         if norms:
             self._emit({"type": "lora_norms", "step": step, "norms": norms})
 
+    def _emit_stream_stats(self, step: int) -> None:
+        """Emit LayerStreamer stats if a streamer is attached to the model."""
+        if self.model is None:
+            return
+        streamer = getattr(self.model, "_streamer", None)
+        if streamer is None:
+            return
+        try:
+            stats = streamer.stats()
+            self._emit({"type": "stream_stats", "step": step, **stats})
+        except Exception as exc:
+            log.debug("stream stats collection failed: %s", exc)
+
 
 # ---------------------------------------------------------------------------
 # GPU telemetry broadcaster
 # ---------------------------------------------------------------------------
 
+def _get_memory_stats(device_index: int = 0) -> Dict[str, float]:
+    """Return torch allocator memory stats (GB + fragmentation ratio).
+
+    Returns keys:
+      - allocated_gb: torch.cuda.memory_allocated (GB)
+      - reserved_gb:  torch.cuda.memory_reserved  (GB)
+      - active_gb:    active_bytes.all.current from memory_stats  (GB)
+      - fragmentation: (reserved - allocated) / reserved, 0.0 if reserved=0
+    """
+    stats: Dict[str, float] = {
+        "allocated_gb": 0.0,
+        "reserved_gb": 0.0,
+        "active_gb": 0.0,
+        "fragmentation": 0.0,
+    }
+    try:
+        import torch  # noqa: delayed import
+        if not torch.cuda.is_available():
+            return stats
+        dev = min(device_index, torch.cuda.device_count() - 1)
+        if dev < 0:
+            return stats
+        allocated = torch.cuda.memory_allocated(dev) / 1e9
+        reserved = torch.cuda.memory_reserved(dev) / 1e9
+        mem = torch.cuda.memory_stats(dev)
+        active = mem.get("active_bytes.all.current", 0) / 1e9
+        fragmentation = (reserved - allocated) / reserved if reserved > 0 else 0.0
+        stats["allocated_gb"] = allocated
+        stats["reserved_gb"] = reserved
+        stats["active_gb"] = active
+        stats["fragmentation"] = fragmentation
+    except Exception as exc:
+        log.debug("memory_stats failed: %s", exc)
+    return stats
+
+
 def start_gpu_telemetry(server: MonitorServer, interval: float = 1.0) -> threading.Thread:
-    """Start a daemon thread that broadcasts GPU telemetry at *interval* seconds.
+    """Start a daemon thread that broadcasts telemetry at *interval* seconds.
+
+    Broadcasts two separate events per tick:
+      - ``{"type": "gpu", ...}``           pure GPU telemetry (vram, util,
+                                            temperature, power)
+      - ``{"type": "memory_stats", ...}``  torch allocator stats (allocated,
+                                            reserved, active, fragmentation)
+
+    The Phos WsBridge forwards each event to the webview as a distinct
+    event name, so they MUST stay as two frames (not merged).
 
     Returns the thread object (already started).
     """
@@ -493,6 +588,11 @@ def start_gpu_telemetry(server: MonitorServer, interval: float = 1.0) -> threadi
                 server.broadcast({"type": "gpu", **data})
             except Exception as exc:
                 log.debug("gpu telemetry broadcast failed: %s", exc)
+            try:
+                mem = _get_memory_stats()
+                server.broadcast({"type": "memory_stats", **mem})
+            except Exception as exc:
+                log.debug("memory_stats broadcast failed: %s", exc)
             time.sleep(interval)
 
     t = threading.Thread(target=_loop, daemon=True, name="monitor-gpu-telem")
