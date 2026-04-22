@@ -241,10 +241,45 @@ class CPUOffloadOptimizer:
             opt = self.optimizer
             if isinstance(opt, torch.optim.AdamW) and getattr(opt, "foreach", None) is not False:
                 try:
+                    # Rebuild preserving ALL per-group hyperparameters
+                    # (lr, weight_decay, eps, betas, amsgrad, etc.). Passing
+                    # opt.param_groups to the constructor picks up only the
+                    # params list; subsequent add_param_group merges each
+                    # group's full dict so LR scheduler state, per-group
+                    # weight_decay overrides (common with LoRA), and other
+                    # tunables are preserved.
+                    first_group = opt.param_groups[0]
                     new_opt = torch.optim.AdamW(
-                        opt.param_groups,
+                        first_group["params"],
+                        lr=first_group.get("lr", 1e-3),
+                        betas=first_group.get("betas", (0.9, 0.999)),
+                        eps=first_group.get("eps", 1e-8),
+                        weight_decay=first_group.get("weight_decay", 0.0),
+                        amsgrad=first_group.get("amsgrad", False),
                         foreach=True,
                     )
+                    # Merge remaining attributes of the first group that the
+                    # AdamW constructor might have normalised. Skip keys
+                    # that the new (foreach) optimizer already set itself;
+                    # copying the old group's foreach=None would wipe out
+                    # the foreach=True switch we just asked for.
+                    _FOREACH_OWNED = {"foreach", "fused", "capturable"}
+                    for key, val in first_group.items():
+                        if key == "params" or key in _FOREACH_OWNED:
+                            continue
+                        new_opt.param_groups[0][key] = val
+
+                    # Append subsequent groups verbatim so per-group
+                    # hyperparameter overrides survive. Strip foreach-owned
+                    # keys so add_param_group uses the new optimizer's
+                    # defaults (foreach=True) rather than the old None.
+                    for group in opt.param_groups[1:]:
+                        clean = {
+                            k: v for k, v in group.items()
+                            if k not in _FOREACH_OWNED
+                        }
+                        new_opt.add_param_group(clean)
+
                     # Copy existing state (may be empty on first step).
                     new_opt.state.update(opt.state)
                     self.optimizer = new_opt
