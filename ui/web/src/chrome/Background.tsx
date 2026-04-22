@@ -27,6 +27,7 @@ const FS = /* glsl */ `
   precision mediump float;
   uniform float uTime;
   uniform vec2  uResolution;
+  uniform vec2  uMouse;     // eased mouse position, 0..1
 
   // ---- Noise / fbm helpers ----
   float hash(vec2 p) {
@@ -60,6 +61,11 @@ const FS = /* glsl */ `
   void main() {
     vec2 uv = gl_FragCoord.xy / uResolution;
     uv.y = 1.0 - uv.y; // flip Y
+
+    // Subtle parallax: offset UV by small fraction of mouse from center.
+    // 0.08 is the spec-tuned factor — barely perceptible.
+    vec2 parallax = (uMouse - 0.5) * 0.08;
+    uv += parallax;
 
     // Slow time - phase field feel
     float t = uTime * 0.04;
@@ -109,6 +115,22 @@ export function Background() {
   const programInfoRef = useRef<twgl.ProgramInfo | null>(null);
   const bufferInfoRef = useRef<twgl.BufferInfo | null>(null);
 
+  // Mouse parallax: target updated on mousemove, current eased toward target
+  // each frame (low-pass filter -> subtle, slow drift).
+  const mouseRef = useRef<[number, number]>([0.5, 0.5]);
+  const targetRef = useRef<[number, number]>([0.5, 0.5]);
+
+  useEffect(() => {
+    const onMove = (e: MouseEvent) => {
+      targetRef.current = [
+        e.clientX / window.innerWidth,
+        e.clientY / window.innerHeight,
+      ];
+    };
+    window.addEventListener("mousemove", onMove, { passive: true });
+    return () => window.removeEventListener("mousemove", onMove);
+  }, []);
+
   useEffect(() => {
     if (!enabled || !canvasRef.current) return;
 
@@ -152,11 +174,18 @@ export function Background() {
 
       const t = (now - startTime) / 1000;
 
+      // Ease current mouse toward target (low-pass). EASE 0.04 = slow + subtle.
+      const [mx, my] = mouseRef.current;
+      const [tx, ty] = targetRef.current;
+      const EASE = 0.04;
+      mouseRef.current = [mx + (tx - mx) * EASE, my + (ty - my) * EASE];
+
       gl.useProgram(programInfoRef.current.program);
       twgl.setBuffersAndAttributes(gl, programInfoRef.current, bufferInfoRef.current);
       twgl.setUniforms(programInfoRef.current, {
         uTime: t,
         uResolution: [canvas.width, canvas.height],
+        uMouse: mouseRef.current,
       });
       twgl.drawBufferInfo(gl, bufferInfoRef.current);
 
