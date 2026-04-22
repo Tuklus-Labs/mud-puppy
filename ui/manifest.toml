@@ -21,7 +21,7 @@ devtools = true
 
 [assets]
 embed = true
-root = "web/dist"
+dir = "web/dist"
 
 [threading]
 pool_size = 4
