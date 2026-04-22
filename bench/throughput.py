@@ -213,7 +213,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help=("modes to benchmark (choices: "
                          + ", ".join(CONFIGS.keys())
                          + "; default: baseline packing)"))
-    p.add_argument("--device", default="cuda" if True else "cpu",
+    # Default resolved in main() where torch is already imported.
+    p.add_argument("--device", default=None,
                    help="device (default: cuda if available, else cpu)")
     p.add_argument("--output", default="-",
                    help="output file path, or '-' for stdout (default: -)")
@@ -232,8 +233,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
 
-    # Resolve device
-    if args.device == "cuda" and not torch.cuda.is_available():
+    # Resolve device: default to cuda when available, else cpu.
+    if args.device is None:
+        device_str = "cuda" if torch.cuda.is_available() else "cpu"
+    elif args.device == "cuda" and not torch.cuda.is_available():
         log.warning("CUDA not available; falling back to CPU")
         device_str = "cpu"
     else:
@@ -268,10 +271,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             log.error("Mode %s failed: %s", mode, exc)
             result = {"mode": mode, "error": str(exc)}
         finally:
-            # Release model memory between modes
+            # Release model memory between modes and start each config with
+            # a clean peak-memory counter so per-mode max_memory_allocated
+            # readings are independent of the prior run.
             del model
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+                torch.cuda.reset_peak_memory_stats()
 
         results.append(result)
 
