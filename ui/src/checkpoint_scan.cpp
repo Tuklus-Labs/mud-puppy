@@ -62,6 +62,17 @@ nlohmann::json scan_checkpoints(const std::string& output_dir) {
         return result;
     }
 
+    // Helper: determine if a directory looks like a LoRA adapter.
+    // A directory is treated as a LoRA adapter if its name contains "lora"
+    // or "adapter", or if it contains an adapter_config.json file.
+    auto is_lora_dir = [](const fs::path& p) -> bool {
+        const std::string n = p.filename().string();
+        if (n.find("lora") != std::string::npos) return true;
+        if (n.find("adapter") != std::string::npos) return true;
+        if (fs::exists(p / "adapter_config.json")) return true;
+        return false;
+    };
+
     // Enumerate checkpoint-* directories.
     for (const auto& entry : fs::directory_iterator(root)) {
         if (!entry.is_directory()) continue;
@@ -71,10 +82,11 @@ nlohmann::json scan_checkpoints(const std::string& output_dir) {
         nlohmann::json item;
         item["path"] = entry.path().string();
         item["name"] = name;
-        item["type"] = "checkpoint";
-        item["mtime"] = path_mtime(entry.path());
+        // save_time_s: Unix seconds (matches ipc-types.ts Checkpoint.save_time_s).
+        item["save_time_s"] = path_mtime(entry.path());
+        item["is_lora"] = is_lora_dir(entry.path());
 
-        // Merge trainer_state data.
+        // Merge trainer_state data (step, loss, eval_loss, best).
         auto state = read_trainer_state(entry.path());
         item.update(state);
 
@@ -89,8 +101,8 @@ nlohmann::json scan_checkpoints(const std::string& output_dir) {
             nlohmann::json item;
             item["path"] = entry.path().string();
             item["name"] = entry.path().filename().string();
-            item["type"] = "lora_adapter";
-            item["mtime"] = path_mtime(entry.path());
+            item["save_time_s"] = path_mtime(entry.path());
+            item["is_lora"] = true;  // Everything in lora_library is a LoRA adapter.
             result.push_back(std::move(item));
         }
     }
