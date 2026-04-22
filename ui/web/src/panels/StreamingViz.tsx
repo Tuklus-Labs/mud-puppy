@@ -138,8 +138,10 @@ export function StreamingViz() {
                 position: "relative",
               }}
               onMouseEnter={(e) => {
+                const parent = e.currentTarget.parentElement;
+                if (!parent) return;
                 const rect = e.currentTarget.getBoundingClientRect();
-                const parentRect = e.currentTarget.parentElement!.getBoundingClientRect();
+                const parentRect = parent.getBoundingClientRect();
                 setTooltip({
                   idx: s.idx,
                   x: rect.right - parentRect.left + 4,

@@ -5,7 +5,7 @@
  * Updates on metrics.lora_norms (every 50 steps).
  * Hover shows layer name + exact norm.
  */
-import React, { useState, useMemo } from "react";
+import React, { useState, useMemo, useRef } from "react";
 import { useStore } from "../lib/store";
 
 interface CellTooltip {
@@ -29,6 +29,7 @@ export function LoraHeatmap() {
   const metricsHistory = useStore((s) => s.metricsHistory);
   const activeRunId = useStore((s) => s.activeRunId);
   const [tooltip, setTooltip] = useState<CellTooltip | null>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
 
   // Get the latest lora_norms
   const latestNorms = useMemo(() => {
@@ -73,7 +74,7 @@ export function LoraHeatmap() {
   const rankCellW = Math.max(4, Math.min(14, Math.floor(200 / maxRank)));
 
   return (
-    <div style={{ padding: "10px 14px", height: "100%", position: "relative", overflow: "auto" }}>
+    <div ref={scrollRef} style={{ padding: "10px 14px", height: "100%", position: "relative", overflow: "auto" }}>
       {/* Header */}
       <div
         style={{
@@ -170,11 +171,13 @@ export function LoraHeatmap() {
                       cursor: "default",
                     }}
                     onMouseEnter={(e) => {
+                      const container = scrollRef.current;
+                      if (!container) return;
                       const rect = e.currentTarget.getBoundingClientRect();
-                      const parentRect = e.currentTarget.closest("[style]")!.getBoundingClientRect();
+                      const parentRect = container.getBoundingClientRect();
                       setTooltip({
                         x: rect.left - parentRect.left + rankCellW,
-                        y: rect.top - parentRect.top,
+                        y: rect.top - parentRect.top + container.scrollTop,
                         layerName,
                         rankIdx: ri,
                         norm: val,

@@ -153,8 +153,10 @@ export function VramBar() {
                 position: "relative",
               }}
               onMouseEnter={(e) => {
+                const parent = e.currentTarget.parentElement;
+                if (!parent) return;
                 const rect = e.currentTarget.getBoundingClientRect();
-                const parentRect = e.currentTarget.parentElement!.getBoundingClientRect();
+                const parentRect = parent.getBoundingClientRect();
                 setTooltip({
                   x: rect.left - parentRect.left + rect.width / 2,
                   y: -8,

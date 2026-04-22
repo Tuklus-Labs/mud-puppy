@@ -62,7 +62,8 @@ export function LossChart({ runId }: LossChartProps) {
         });
       }
     });
-    ro.observe(svgRef.current.parentElement!);
+    const parent = svgRef.current.parentElement;
+    if (parent) ro.observe(parent);
     return () => ro.disconnect();
   }, []);
 
