@@ -13,19 +13,25 @@ import functools
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
-import jax
-import jax.numpy as jnp
-from jax import random
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-from jax.experimental.shard_map import shard_map
+try:
+    import jax
+    import jax.numpy as jnp
+    from jax import random
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+    from jax.experimental.shard_map import shard_map
 
-import flax
-from flax import linen as nn
-from flax.training import train_state
-from flax.training import orbax_utils
+    import flax
+    from flax import linen as nn
+    from flax.training import train_state
+    from flax.training import orbax_utils
 
-import optax
-import orbax.checkpoint as ocp
+    import optax
+    import orbax.checkpoint as ocp
+except ImportError as _jax_import_err:
+    raise ImportError(
+        f"JAX backend requires the [jax] optional extra: "
+        f"pip install mud-puppy[jax]  (missing: {_jax_import_err.name})"
+    ) from _jax_import_err
 
 from datasets import load_dataset
 from transformers import AutoTokenizer, FlaxAutoModelForCausalLM

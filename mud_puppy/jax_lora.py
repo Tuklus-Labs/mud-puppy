@@ -44,11 +44,17 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
-import jax
-import jax.numpy as jnp
-from flax import linen as nn
-from flax.core import freeze, unfreeze
-from flax.traverse_util import flatten_dict, unflatten_dict
+try:
+    import jax
+    import jax.numpy as jnp
+    from flax import linen as nn
+    from flax.core import freeze, unfreeze
+    from flax.traverse_util import flatten_dict, unflatten_dict
+except ImportError as _jax_import_err:
+    raise ImportError(
+        f"JAX backend requires the [jax] optional extra: "
+        f"pip install mud-puppy[jax]  (missing: {_jax_import_err.name})"
+    ) from _jax_import_err
 
 # Type aliases
 Array = jax.Array

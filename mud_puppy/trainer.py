@@ -23,7 +23,7 @@ import torch.distributed as dist
 
 try:
     from torch.distributed.pipeline.sync import Pipe
-except Exception:  # pragma: no cover - optional dependency
+except ImportError:  # pragma: no cover - optional dependency
     Pipe = None
 
 from datasets import load_dataset
