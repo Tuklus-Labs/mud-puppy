@@ -52,10 +52,7 @@ int main(int /*argc*/, char** /*argv*/) {
     g_ws = &ws;
 
     // --- IPC handlers ---
-
-    win.handle("get-platform", [](const phos::Json&) -> phos::Json {
-        return phos::platform_info();
-    });
+    // Only handlers declared in manifest.toml are registered here.
 
     // run.start: spawn a training sidecar and connect WsBridge to its monitor port.
     win.handle("run.start", phos::safe_handler([&](const phos::Json& req) -> phos::Json {
