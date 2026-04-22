@@ -52,3 +52,7 @@ Thumbs.db
 # Web frontend
 ui/web/node_modules/
 ui/web/dist/
+
+# Claude
+CLAUDE.md
+data/aegis-reflib-qlora.jsonl
