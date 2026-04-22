@@ -130,6 +130,17 @@ class TestLoadImage:
         with pytest.raises(FileNotFoundError):
             load_image("/nonexistent/path/to/image.png")
 
+    def test_load_image_rejects_path_traversal(self, tmp_path):
+        """D: path-traversal via relative "../.." must be rejected with ValueError."""
+        from mud_puppy.multimodal import load_image
+
+        base = tmp_path / "dataset"
+        base.mkdir()
+        # The path is relative, so it will be joined with base and then
+        # resolved. "../../etc/passwd" would escape the dataset root.
+        with pytest.raises(ValueError, match="escapes base_dir"):
+            load_image("../../etc/passwd", base_dir=str(base))
+
 
 # ---------------------------------------------------------------------------
 # 3. MultimodalCollator (mock processor)

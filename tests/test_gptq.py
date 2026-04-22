@@ -155,6 +155,34 @@ class TestInt4PackUnpack:
 
 
 # ---------------------------------------------------------------------------
+# 2b. NaN weight and zero Hessian guards (D cluster regression tests)
+# ---------------------------------------------------------------------------
+
+class TestGPTQSafetyGuards:
+    def test_gptq_nan_weight_raises(self):
+        """D: calibrating a layer whose weights contain NaN must raise RuntimeError,
+        not produce a silent NaN model."""
+        in_f, out_f = 32, 16
+        W = torch.randn(out_f, in_f, dtype=torch.float32)
+        W[0, 0] = float("nan")  # inject NaN
+        X = _random_activations(64, in_f)
+        quantizer = GPTQQuantizer(bits=4, group_size=16, actorder=False)
+        with pytest.raises(RuntimeError, match="non-finite"):
+            _gptq_quantize_layer(W, X, quantizer)
+
+    def test_gptq_zero_hessian_raises(self):
+        """D: zero-activation calibration data must raise RuntimeError, not
+        produce a NaN-quantized model (zero Hessian diagonal guard)."""
+        in_f, out_f = 32, 16
+        W = torch.randn(out_f, in_f, dtype=torch.float32)
+        # All-zero activations produce a zero Hessian diagonal.
+        X = torch.zeros(64, in_f, dtype=torch.float32)
+        quantizer = GPTQQuantizer(bits=4, group_size=16, actorder=False)
+        with pytest.raises(RuntimeError, match="[Zz]ero"):
+            _gptq_quantize_layer(W, X, quantizer)
+
+
+# ---------------------------------------------------------------------------
 # 3. Group-size quantization
 # ---------------------------------------------------------------------------
 
