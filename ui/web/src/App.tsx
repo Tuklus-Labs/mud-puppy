@@ -221,6 +221,7 @@ export function App() {
           {/* Background toggle */}
           <button
             onClick={toggleBackground}
+            aria-label="Toggle background animation"
             style={{
               width: "100%",
               padding: "8px 12px",

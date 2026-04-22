@@ -1,13 +1,19 @@
 /**
- * VectorFrame — SVG panel frame with 45-degree clipped corners.
+ * Panel — SVG-edged panel frame with 45-degree clipped corners.
  *
- * 1px cyan stroke on main rect, 2px amber corner accents at 8px clip size.
- * No rounded corners anywhere — this is the distinctive aesthetic element.
- * Drop-shadow filter only activates on [data-active] or [data-alert] state.
+ * This is the sole production component exported from this file. The
+ * earlier VectorFrame export was dead code (broken SVG polygons) and has
+ * been removed.
+ *
+ * Aesthetic:
+ * - clip-path polygon for the 8px corner cut (no rounded corners anywhere)
+ * - 1px cyan stroke via inline SVG viewBox polyline
+ * - 2px amber corner accents (top-left + bottom-right)
+ * - drop-shadow filter only active on [data-active] / [data-alert]
  */
 import React from "react";
 
-interface VectorFrameProps {
+interface PanelProps {
   children: React.ReactNode;
   /** Optional label displayed in the top-left corner accent */
   label?: string;
@@ -23,134 +29,6 @@ interface VectorFrameProps {
 // Corner clip size in pixels
 const CLIP = 8;
 
-export function VectorFrame({
-  children,
-  label,
-  active = false,
-  alert = false,
-  className = "",
-  style,
-  id,
-}: VectorFrameProps) {
-  const glowColor = alert ? "rgba(255, 43, 214, 0.6)" : "rgba(0, 229, 255, 0.5)";
-  const showGlow = active || alert;
-
-  return (
-    <div
-      id={id}
-      className={className}
-      data-active={active ? "true" : undefined}
-      data-alert={alert ? "true" : undefined}
-      style={{
-        position: "relative",
-        background: "var(--panel)",
-        // Use clip-path for the 45-degree corner effect
-        clipPath: `polygon(
-          ${CLIP}px 0,
-          calc(100% - ${CLIP}px) 0,
-          100% ${CLIP}px,
-          100% calc(100% - ${CLIP}px),
-          calc(100% - ${CLIP}px) 100%,
-          ${CLIP}px 100%,
-          0 calc(100% - ${CLIP}px),
-          0 ${CLIP}px
-        )`,
-        filter: showGlow
-          ? `drop-shadow(0 0 6px ${glowColor}) drop-shadow(0 0 14px ${glowColor})`
-          : undefined,
-        transition: "filter 0.2s ease",
-        ...style,
-      }}
-    >
-      {/* SVG overlay for the border strokes */}
-      <svg
-        style={{
-          position: "absolute",
-          inset: 0,
-          width: "100%",
-          height: "100%",
-          pointerEvents: "none",
-          overflow: "visible",
-        }}
-      >
-        <defs>
-          <filter id="frame-glow">
-            <feGaussianBlur stdDeviation="2" result="blur" />
-            <feMerge>
-              <feMergeNode in="blur" />
-              <feMergeNode in="SourceGraphic" />
-            </feMerge>
-          </filter>
-        </defs>
-
-        {/* Main border — 1px cyan, clipped corners */}
-        <polygon
-          points={`
-            ${CLIP},1
-            calc(100% - ${CLIP}),1
-            ${/* right edge handled via percent — use 99.5% for inner stroke */``}
-          `}
-          fill="none"
-          stroke="none"
-        />
-
-        {/* Use a rect with clip-path mirroring the container */}
-        <rect
-          x="0.5"
-          y="0.5"
-          width="calc(100% - 1px)"
-          height="calc(100% - 1px)"
-          fill="none"
-          stroke="var(--cyan)"
-          strokeWidth="1"
-          style={{
-            // SVG doesn't support CSS calc in attributes, use a workaround
-            // We'll draw the polygon manually using 100% tricks via a foreignObject approach
-          }}
-        />
-
-        {/* Amber 2px corner accents — top-left */}
-        <polyline
-          points={`${CLIP + 6},1 1,1 1,${CLIP + 6}`}
-          fill="none"
-          stroke="var(--amber)"
-          strokeWidth="2"
-          strokeLinecap="square"
-        />
-      </svg>
-
-      {/* Content */}
-      <div style={{ position: "relative", zIndex: 1, width: "100%", height: "100%" }}>
-        {label && (
-          <div
-            style={{
-              position: "absolute",
-              top: 0,
-              left: CLIP + 4,
-              fontSize: "10px",
-              fontFamily: "var(--font-heading, 'Share Tech Mono', monospace)",
-              letterSpacing: "2px",
-              textTransform: "uppercase",
-              color: "var(--cyan)",
-              background: "var(--panel)",
-              padding: "0 4px",
-              transform: "translateY(-50%)",
-              zIndex: 2,
-            }}
-          >
-            {label}
-          </div>
-        )}
-        {children}
-      </div>
-    </div>
-  );
-}
-
-/**
- * Simplified version using CSS-only approach for better SVG compatibility.
- * This is the production-ready version.
- */
 export function Panel({
   children,
   label,
@@ -159,7 +37,7 @@ export function Panel({
   className = "",
   style,
   id,
-}: VectorFrameProps) {
+}: PanelProps) {
   const cornerSize = CLIP;
   const glowColor = alert ? "rgba(255, 43, 214, 0.55)" : "rgba(0, 229, 255, 0.45)";
   const showGlow = active || alert;
@@ -189,8 +67,7 @@ export function Panel({
         ...style,
       }}
     >
-      {/* Inner border via inset pseudo-element approach using outline or box-shadow */}
-      {/* Since clip-path clips box-shadow, we use a position:absolute SVG */}
+      {/* Border + corner accents via absolute SVG (clip-path eats box-shadow) */}
       <svg
         aria-hidden="true"
         style={{
@@ -205,7 +82,7 @@ export function Panel({
         preserveAspectRatio="none"
         viewBox="0 0 100 100"
       >
-        {/* Main 1px border using polygon in percentage coordinates */}
+        {/* Main 1px border — polygon in percentage coordinates */}
         <polygon
           points={`
             ${cornerSize},0.5

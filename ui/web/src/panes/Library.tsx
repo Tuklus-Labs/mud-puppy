@@ -173,10 +173,10 @@ export function Library() {
                 </div>
               )}
 
-              {/* Save time */}
-              {ckpt.save_time && (
+              {/* Save time — save_time_s is seconds since epoch; convert to ms for Date */}
+              {ckpt.save_time_s && (
                 <div style={{ fontSize: "10px", color: "var(--dim)", flexShrink: 0 }}>
-                  {fmtRelTime(ckpt.save_time * 1000)}
+                  {fmtRelTime(ckpt.save_time_s * 1000)}
                 </div>
               )}
 

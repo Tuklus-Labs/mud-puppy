@@ -73,7 +73,12 @@ export interface Checkpoint {
   path: string;
   step: number;
   loss?: number;
-  save_time?: number;
+  /**
+   * Unix epoch seconds (NOT milliseconds). Multiply by 1000 before
+   * feeding to JS Date. The C workstream must preserve this unit when
+   * regenerating types via `phos types`.
+   */
+  save_time_s?: number;
   is_lora: boolean;
 }
 
