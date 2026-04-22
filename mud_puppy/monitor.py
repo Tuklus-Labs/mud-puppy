@@ -504,11 +504,19 @@ class MonitorCallback:
 # ---------------------------------------------------------------------------
 
 def _get_memory_stats(device_index: int = 0) -> Dict[str, float]:
-    """Return torch allocator memory stats (GB) for the given device."""
+    """Return torch allocator memory stats (GB + fragmentation ratio).
+
+    Returns keys:
+      - allocated_gb: torch.cuda.memory_allocated (GB)
+      - reserved_gb:  torch.cuda.memory_reserved  (GB)
+      - active_gb:    active_bytes.all.current from memory_stats  (GB)
+      - fragmentation: (reserved - allocated) / reserved, 0.0 if reserved=0
+    """
     stats: Dict[str, float] = {
-        "mem_reserved_gb": 0.0,
-        "mem_allocated_gb": 0.0,
-        "mem_max_allocated_gb": 0.0,
+        "allocated_gb": 0.0,
+        "reserved_gb": 0.0,
+        "active_gb": 0.0,
+        "fragmentation": 0.0,
     }
     try:
         import torch  # noqa: delayed import
@@ -517,16 +525,31 @@ def _get_memory_stats(device_index: int = 0) -> Dict[str, float]:
         dev = min(device_index, torch.cuda.device_count() - 1)
         if dev < 0:
             return stats
-        stats["mem_reserved_gb"] = torch.cuda.memory_reserved(dev) / (1024 ** 3)
-        stats["mem_allocated_gb"] = torch.cuda.memory_allocated(dev) / (1024 ** 3)
-        stats["mem_max_allocated_gb"] = torch.cuda.max_memory_allocated(dev) / (1024 ** 3)
+        allocated = torch.cuda.memory_allocated(dev) / 1e9
+        reserved = torch.cuda.memory_reserved(dev) / 1e9
+        mem = torch.cuda.memory_stats(dev)
+        active = mem.get("active_bytes.all.current", 0) / 1e9
+        fragmentation = (reserved - allocated) / reserved if reserved > 0 else 0.0
+        stats["allocated_gb"] = allocated
+        stats["reserved_gb"] = reserved
+        stats["active_gb"] = active
+        stats["fragmentation"] = fragmentation
     except Exception as exc:
         log.debug("memory_stats failed: %s", exc)
     return stats
 
 
 def start_gpu_telemetry(server: MonitorServer, interval: float = 1.0) -> threading.Thread:
-    """Start a daemon thread that broadcasts GPU telemetry at *interval* seconds.
+    """Start a daemon thread that broadcasts telemetry at *interval* seconds.
+
+    Broadcasts two separate events per tick:
+      - ``{"type": "gpu", ...}``           pure GPU telemetry (vram, util,
+                                            temperature, power)
+      - ``{"type": "memory_stats", ...}``  torch allocator stats (allocated,
+                                            reserved, active, fragmentation)
+
+    The Phos WsBridge forwards each event to the webview as a distinct
+    event name, so they MUST stay as two frames (not merged).
 
     Returns the thread object (already started).
     """
@@ -534,10 +557,14 @@ def start_gpu_telemetry(server: MonitorServer, interval: float = 1.0) -> threadi
         while server.is_running():
             try:
                 data = get_gpu_telemetry()
-                mem = _get_memory_stats()
-                server.broadcast({"type": "gpu", **data, **mem})
+                server.broadcast({"type": "gpu", **data})
             except Exception as exc:
                 log.debug("gpu telemetry broadcast failed: %s", exc)
+            try:
+                mem = _get_memory_stats()
+                server.broadcast({"type": "memory_stats", **mem})
+            except Exception as exc:
+                log.debug("memory_stats broadcast failed: %s", exc)
             time.sleep(interval)
 
     t = threading.Thread(target=_loop, daemon=True, name="monitor-gpu-telem")
