@@ -7,7 +7,7 @@ specialized trainers for features like dynamic batching and layer streaming.
 import os
 
 # Favor ROCm-friendly allocator behavior by default
-os.environ.setdefault("PYTORCH_HIP_ALLOC_CONF", "max_split_size_mb:128")
+os.environ.setdefault("PYTORCH_HIP_ALLOC_CONF", "expandable_segments:True")
 
 from typing import Dict, List, Optional, Iterator, Any
 import random
