@@ -30,7 +30,7 @@ class PackedCollator:
     emitting:
 
     - ``input_ids``: shape (batch, seq)
-    - ``attention_mask``: shape (batch, seq, seq) -- block-diagonal, long
+    - ``attention_mask``: shape (batch, seq, seq) -- block-diagonal, int8
     - ``labels``: shape (batch, seq) -- preserves -100 from source
     - ``position_ids``: shape (batch, seq) -- resets per segment
 

@@ -43,6 +43,7 @@ def test_config_rejects_zero_learning_rate(tmp_path):
         TrainingConfig(**_baseline(tmp_path), learning_rate=0.0)
 
 
-def test_config_rejects_zero_lora_r_for_lora(tmp_path):
+@pytest.mark.parametrize("method", ["lora", "qlora"])
+def test_config_rejects_zero_lora_r_for_lora(tmp_path, method):
     with pytest.raises(ValueError, match="lora_r"):
-        TrainingConfig(**_baseline(tmp_path), lora_r=0)
+        TrainingConfig(**{**_baseline(tmp_path), "finetuning_method": method}, lora_r=0)

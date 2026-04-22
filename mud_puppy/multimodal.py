@@ -310,16 +310,6 @@ class MultimodalCollator:
                         )
                         pixel_values = None
 
-        # D3: raise if require_images=True and we ended up with no pixel_values.
-        # Text-only training with method=multimodal is almost always a bug.
-        if self.require_images and pixel_values is None:
-            raise RuntimeError(
-                "MultimodalCollator: require_images=True but pixel_values is None "
-                "after processor fallbacks. Ensure the processor is compatible with "
-                "the dataset's image format. If text-only training is intentional, "
-                "use a non-multimodal method."
-            )
-
         # --- Pad and stack input_ids / attention_mask / labels ---
         input_ids_list = [
             ex["input_ids"][: self.max_length] for ex in examples
@@ -331,8 +321,9 @@ class MultimodalCollator:
             ex["labels"][: self.max_length] for ex in examples
         ]
 
-        # D2: guard against empty batch or all-zero-length sequences. Without
-        # this check max() would raise ValueError("max() arg is an empty sequence").
+        # E1/D2: check for empty batch first -- it is the more fundamental
+        # problem. An empty input_ids_list means there is nothing to collate
+        # at all; require_images or pixel_values state is moot at that point.
         if not input_ids_list:
             raise ValueError(
                 "MultimodalCollator received an empty batch (no examples). "
@@ -345,6 +336,16 @@ class MultimodalCollator:
                 "after truncation to max_length=%d. This usually means the "
                 "tokenizer produced empty sequences. Check the dataset and "
                 "tokenization pipeline." % self.max_length
+            )
+
+        # D3: raise if require_images=True and we ended up with no pixel_values.
+        # Text-only training with method=multimodal is almost always a bug.
+        if self.require_images and pixel_values is None:
+            raise RuntimeError(
+                "MultimodalCollator: require_images=True but pixel_values is None "
+                "after processor fallbacks. Ensure the processor is compatible with "
+                "the dataset's image format. If text-only training is intentional, "
+                "use a non-multimodal method."
             )
 
         max_len = max(len(ids) for ids in input_ids_list)
