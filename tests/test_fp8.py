@@ -266,3 +266,33 @@ def test_amax_nan_weight_stays_finite():
     assert fp8.weight_amax.item() >= _AMAX_EPS, (
         f"weight_amax fell below _AMAX_EPS={_AMAX_EPS}: {fp8.weight_amax.item()}"
     )
+
+
+# ---------------------------------------------------------------------------
+# B1: NaN checkpoint recovery
+# ---------------------------------------------------------------------------
+
+
+def test_fp8_recovers_from_nan_checkpoint():
+    """Loading a checkpoint with NaN amax buffers must not poison forward passes.
+
+    A corrupted checkpoint may store NaN into input_amax / weight_amax. Without
+    sanitizing buf in _update_amax the EMA decayed term (NaN * momentum) stays
+    NaN, torch.maximum propagates it, and every subsequent forward is poisoned.
+    """
+    lin = nn.Linear(8, 8)
+    fp8 = FP8Linear(lin)
+    # Simulate corrupted checkpoint
+    with torch.no_grad():
+        fp8.input_amax.fill_(float("nan"))
+        fp8.weight_amax.fill_(float("nan"))
+    # One forward should recover the buffers to finite values
+    x = torch.randn(2, 8)
+    out = fp8(x)
+    assert torch.isfinite(fp8.input_amax).item(), (
+        f"input_amax still non-finite after forward: {fp8.input_amax.item()}"
+    )
+    assert torch.isfinite(fp8.weight_amax).item(), (
+        f"weight_amax still non-finite after forward: {fp8.weight_amax.item()}"
+    )
+    assert torch.isfinite(out).all().item(), "output contains non-finite values after NaN recovery"

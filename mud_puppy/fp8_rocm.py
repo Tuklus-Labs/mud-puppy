@@ -176,21 +176,48 @@ class FP8Linear(nn.Module):
         A1 fix: sanitize NaN/Inf in new_amax before the EMA. torch.clamp and
         torch.maximum both propagate NaN (clamp(NaN, min=x) == NaN), so a
         single NaN weight would permanently corrupt the amax buffer.
+
+        B1 fix: also sanitize buf itself. A corrupted checkpoint may have stored
+        NaN directly into input_amax or weight_amax. Without cleaning buf the
+        EMA decayed term (buf * momentum) is NaN, torch.maximum propagates it,
+        and every subsequent forward pass produces NaN forever regardless of
+        how clean new_amax is.
         """
-        new_amax = torch.nan_to_num(
+        buf_clean = torch.nan_to_num(
+            buf,
+            nan=_AMAX_EPS,
+            posinf=_FP8_E4M3_MAX,
+            neginf=_AMAX_EPS,
+        )
+        new_clean = torch.nan_to_num(
             new_amax.detach(),
             nan=_AMAX_EPS,
             posinf=_FP8_E4M3_MAX,
             neginf=_AMAX_EPS,
         )
-        decayed = buf * self.amax_momentum
-        buf.copy_(torch.maximum(decayed, new_amax).clamp(min=_AMAX_EPS))
+        decayed = buf_clean * self.amax_momentum
+        buf.copy_(torch.maximum(decayed, new_clean).clamp(min=_AMAX_EPS))
 
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Sanitize amax buffers in-place before computing scales. This handles
+        # corrupted checkpoints that stored NaN into input_amax / weight_amax:
+        # _update_amax cleans them at the END of forward, but we need finite
+        # scales at the TOP of forward for the current step to be valid.
+        with torch.no_grad():
+            for buf in (self.input_amax, self.weight_amax):
+                if not torch.isfinite(buf).all():
+                    buf.copy_(
+                        torch.nan_to_num(
+                            buf,
+                            nan=_AMAX_EPS,
+                            posinf=_FP8_E4M3_MAX,
+                            neginf=_AMAX_EPS,
+                        ).clamp(min=_AMAX_EPS)
+                    )
         # Keep fp32 scales; scaled_mm wants fp32 scales and the cast
         # itself is numerically insensitive to scale dtype.
         x_scale = self._compute_scale(self.input_amax.to(x.device)).to(torch.float32)
