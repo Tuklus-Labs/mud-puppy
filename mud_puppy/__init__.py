@@ -16,8 +16,14 @@ High-level usage::
 
     run_training(config)
 
-Lower-level helpers for quantization and ROCm kernels are also re-exported
-for convenience, but are considered experimental and may change.
+Lower-level helpers for quantization (`apply_qat`, `convert_qat`,
+`quantize_model_4bit`, `quantize_model_gptq`) and ROCm kernels are
+re-exported for convenience.
+
+Stability contract: items listed in ``__all__`` follow semver within
+0.x; the JAX/Flax submodule is a separate backend and may change more
+frequently (see ``mud_puppy.jax_config`` docstring for what it does
+and does not yet support).
 """
 
 from importlib.metadata import version, PackageNotFoundError

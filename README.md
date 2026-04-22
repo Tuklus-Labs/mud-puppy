@@ -407,9 +407,16 @@ mud-puppy large-model data.jsonl --stream --method lora
 # Combine with optimizer offloading
 mud-puppy large-model data.jsonl --stream --zero-offload --method lora
 
-# Use device_map for automatic model parallelism
+# Use device_map for automatic model parallelism (>=2 GPUs)
 mud-puppy large-model data.jsonl --device-map auto --method full
 ```
+
+> **Note on `--device-map pipeline`**: the pipeline-parallel path wraps the
+> deprecated `torch.distributed.pipeline.sync.Pipe` API and is kept only
+> for torch<2.4 on multi-GPU hosts. It raises a `RuntimeError` on
+> single-GPU setups (use `--stream` instead) and emits a
+> `DeprecationWarning` when active. A rewrite against
+> `torch.distributed.pipelining` is planned.
 
 ### For Limited VRAM
 
@@ -470,19 +477,34 @@ optimizer.step()  # States automatically offloaded after step
 mud-puppy is designed to run efficiently on AMD GPUs:
 
 - Defaults to `bf16` precision with gradient checkpointing
-- Sets `PYTORCH_HIP_ALLOC_CONF=max_split_size_mb:128` for better memory allocation
+- Sets `PYTORCH_HIP_ALLOC_CONF=expandable_segments:True` for better memory allocation
 - Uses `torch.nn.functional.scaled_dot_product_attention` for flash attention on ROCm
 - All quantization kernels are pure PyTorch, no vendor-specific code required
 
 For CUDA users, mud-puppy works seamlessly and can use `auto-gptq` for GPTQ if installed.
 
-### Experimental FP8 Support
+### FP8 Training (RDNA4 / MI300+)
 
 ```bash
 mud-puppy model data.jsonl --precision fp8 --method full
 ```
 
-Requires PyTorch with FP8 support.
+Real FP8 training with the Transformer Engine style delayed-scaling recipe:
+every `nn.Linear` is swapped for an `FP8Linear` that casts weights and inputs
+to `float8_e4m3fn` and matmul via `torch._scaled_mm`. Uses per-tensor amax
+observers with EMA tracking.
+
+| GPU | Path | Speed |
+|---|---|---|
+| RDNA4 (e.g. 9070 XT) | hardware WMMA via `_scaled_mm` | Accelerated |
+| MI300+ (CDNA3) | hardware MFMA via `_scaled_mm` | Accelerated |
+| RDNA3 (7900 XTX) | emulated (cast-dequant + bf16 matmul) | No speedup, behavior-correct |
+| NVIDIA SM 8.9+ | hardware via `_scaled_mm` | Accelerated |
+| Everything else | emulated | No speedup, behavior-correct |
+
+The emulated path exists so you can prototype recipes on current hardware
+and land them on RDNA4 without code changes; it is *not* faster than bf16.
+See `mud_puppy/fp8_rocm.py` for the implementation.
 
 ## Version History
 
