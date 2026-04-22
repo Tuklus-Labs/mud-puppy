@@ -89,6 +89,25 @@ def test_streamer_rejects_zero_prefetch_layers():
         LayerStreamer(model, prefetch_layers=-1)
 
 
+def test_streamer_wrap_forwards_training_method():
+    """LayerStreamer.wrap must forward training_method to __init__.
+
+    Pass-3 regression: wrap() previously defaulted training_method to
+    "inference" and silently ignored anything a caller passed, letting
+    unsafe methods like "lora"/"full" slip past the guard. This test
+    locks in the contract.
+    """
+    model = ToyTransformer(n_layers=2, dim=16)
+    # Safe method: wrap() must not raise.
+    LayerStreamer.wrap(model, training_method="qlora")
+
+    # Unsafe method: wrap() must propagate the NotImplementedError raised
+    # by __init__ (not swallow it and fall back to inference).
+    model2 = ToyTransformer(n_layers=2, dim=16)
+    with pytest.raises(NotImplementedError, match="training_method"):
+        LayerStreamer.wrap(model2, training_method="lora")
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
 def test_streamer_pins_lora_adapters():
     """LoRA adapters must stay GPU-resident through eviction cycles."""

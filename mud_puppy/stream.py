@@ -455,11 +455,27 @@ class LayerStreamer:
     # ------------------------------------------------------------------
 
     @classmethod
-    def wrap(cls, model: nn.Module, prefetch_layers: int = 2) -> nn.Module:
+    def wrap(
+        cls,
+        model: nn.Module,
+        prefetch_layers: int = 2,
+        training_method: str = "inference",
+    ) -> nn.Module:
         """Attach a LayerStreamer to model and store it as model._streamer.
+
+        ``training_method`` must be one of the safe-for-streaming methods;
+        ``__init__`` raises ``NotImplementedError`` for unsafe ones (e.g.
+        ``"lora"``, ``"full"``, ``"preference"``). Callers in
+        ``run_training`` must forward ``config.finetuning_method`` so the
+        guard actually fires; defaulting to ``"inference"`` here used to
+        silently bypass the check (pass-3 audit finding, 2026-04-22).
 
         Returns the original model (mutated in-place with hooks).
         """
-        streamer = cls(model, prefetch_layers=prefetch_layers)
+        streamer = cls(
+            model,
+            prefetch_layers=prefetch_layers,
+            training_method=training_method,
+        )
         model._streamer = streamer
         return model

@@ -500,11 +500,17 @@ def load_model(config: TrainingConfig, calibration_data: Optional[List[torch.Ten
             print("[mud-puppy] Moving model to GPU...")
             model = model.to("cuda")
 
-    # Streaming: keep model on CPU and stream transformer blocks to GPU via prefetch ring
+    # Streaming: keep model on CPU and stream transformer blocks to GPU via prefetch ring.
+    # LayerStreamer raises NotImplementedError for unsafe training methods
+    # (anything that updates base-model weights or needs them for backward).
     if config.stream:
         model.to("cpu")
         from .stream import LayerStreamer
-        model = LayerStreamer.wrap(model, prefetch_layers=config.prefetch_layers)
+        model = LayerStreamer.wrap(
+            model,
+            prefetch_layers=config.prefetch_layers,
+            training_method=config.finetuning_method,
+        )
         print(f"[mud-puppy] LayerStreamer active (prefetch_layers={config.prefetch_layers})")
 
     # FP8 mixed-precision training via per-layer module replacement.
