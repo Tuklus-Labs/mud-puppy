@@ -49,10 +49,16 @@ export function Monitor() {
       ipc.onMemoryStats(setMemoryStats),
       ipc.onLogLine(appendLog),
       ipc.onRunComplete((e) => {
-        upsertRun({
-          run_id: e.run_id,
-          status: e.exit_code === 0 ? "complete" : "failed",
-        } as any);
+        // Update-only: never insert partial RunSummary objects.
+        // If the run doesn't exist locally, skip — run.list will surface it.
+        const existing = useStore.getState().runs.find((r) => r.run_id === e.run_id);
+        if (existing) {
+          upsertRun({
+            ...existing,
+            status: e.exit_code === 0 ? "complete" : "failed",
+            end_time: Date.now(),
+          });
+        }
       }),
     ];
     return () => unsubs.forEach((u) => u());
@@ -66,7 +72,10 @@ export function Monitor() {
   const handleStop = async () => {
     if (!activeRunId) return;
     await ipc.stopRun(activeRunId);
-    upsertRun({ run_id: activeRunId, status: "stopped" } as any);
+    const existing = useStore.getState().runs.find((r) => r.run_id === activeRunId);
+    if (existing) {
+      upsertRun({ ...existing, status: "stopped", end_time: Date.now() });
+    }
   };
 
   return (
