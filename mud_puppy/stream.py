@@ -53,6 +53,24 @@ def _find_layers(model: nn.Module) -> List[nn.Module]:
     return []
 
 
+def _is_lora_param_name(name: str) -> bool:
+    """Return True if a parameter name looks like a peft LoRA adapter.
+
+    Matches names produced by peft.tuners.lora (e.g. "...lora_A.default.weight",
+    "...lora_B.default.weight", "...lora_embedding_A.default").
+    """
+    return ("lora_A" in name) or ("lora_B" in name) or ("lora_embedding" in name)
+
+
+def _pin_lora_to_gpu(layer: nn.Module, device: torch.device) -> None:
+    """Force every LoRA parameter inside *layer* onto *device* in-place."""
+    for pname, param in layer.named_parameters():
+        if _is_lora_param_name(pname) and param.device != device:
+            param.data = param.data.to(device)
+            if param.grad is not None:
+                param.grad.data = param.grad.data.to(device)
+
+
 class LayerStreamer:
     """Stream transformer blocks between CPU pinned RAM and GPU.
 
@@ -84,11 +102,24 @@ class LayerStreamer:
         self._layers = _find_layers(model)
         n = len(self._layers)
 
-        # Pinned CPU copies of each block's state_dict.
-        self._cpu_weights: List[Dict[str, torch.Tensor]] = []
+        # Identify LoRA parameter names per layer. These stay GPU-resident
+        # and are skipped when snapshotting / reloading CPU state_dicts.
+        # Keys look like "self_attn.q_proj.lora_A.default.weight".
+        self._lora_param_names: List[set] = []
         for layer in self._layers:
+            names: set = set()
+            for pname, _ in layer.named_parameters():
+                if _is_lora_param_name(pname):
+                    names.add(pname)
+            self._lora_param_names.append(names)
+
+        # Pinned CPU copies of each block's state_dict. Skip LoRA entries.
+        self._cpu_weights: List[Dict[str, torch.Tensor]] = []
+        for layer, lora_names in zip(self._layers, self._lora_param_names):
             pinned = {}
             for name, tensor in layer.state_dict().items():
+                if name in lora_names:
+                    continue  # LoRA stays on GPU; not part of streamed weights
                 pinned_t = torch.empty_like(tensor, device=self._cpu, pin_memory=True)
                 pinned_t.copy_(tensor)
                 pinned[name] = pinned_t
@@ -113,10 +144,16 @@ class LayerStreamer:
         self._prefetch_misses: int = 0
         self._start_time: float = time.monotonic()
 
+        # Currently-executing layer (set by pre-forward hook). Used by
+        # _find_free_slot to avoid evicting the in-flight layer.
+        self._current_layer_idx: int = -1
+
         # Move all transformer layers to CPU; GPU-resident layers
-        # will be loaded into slots on demand.
+        # will be loaded into slots on demand. LoRA adapters are
+        # re-pinned to GPU immediately -- they are permanent residents.
         for layer in self._layers:
             layer.to(self._cpu)
+            _pin_lora_to_gpu(layer, self.device)
 
         # Move permanent-resident modules to GPU.
         self._move_permanent_to_gpu()
@@ -182,6 +219,9 @@ class LayerStreamer:
         empty slot, then the oldest evictable slot. When an occupied slot
         is selected, _free_slot is called on it first so the occupant's
         layer is moved back to CPU.
+
+        Never evicts the currently-executing layer (_current_layer_idx);
+        that would tear out the weights from under an in-flight forward.
         """
         # Already loaded?
         for s, li in enumerate(self._slot_layer):
@@ -193,17 +233,32 @@ class LayerStreamer:
             if li == -1:
                 return s
 
-        # Evict the slot whose layer is furthest behind us.
-        # Prefer slots holding layers < layer_idx - 1 (already executed).
-        best = 0
-        best_dist = -1
+        # Pick an eviction victim. Constraints:
+        #   1. Never evict the currently-executing layer.
+        #   2. Never evict layer_idx itself (handled above by "already
+        #      loaded" check, but defend anyway).
+        # Preference: layers furthest behind the request point (executed
+        # longest ago).
+        current = getattr(self, "_current_layer_idx", -1)
+        best = -1
+        best_score = None
         for s, li in enumerate(self._slot_layer):
-            if li < layer_idx - 1:
-                dist = layer_idx - li
-                if dist > best_dist:
-                    best_dist = dist
-                    best = s
-        # Free the evicted slot so the old layer goes back to CPU.
+            if li == current or li == layer_idx:
+                continue
+            # Score: how far behind layer_idx is this slot's occupant?
+            # Positive = already-executed (prefer these). Negative = future
+            # prefetch (last resort).
+            score = layer_idx - li
+            if best_score is None or score > best_score:
+                best_score = score
+                best = s
+
+        if best == -1:
+            # Every slot holds either the current or requested layer; fall
+            # back to slot 0 but do not evict. Caller will overwrite in
+            # place via copy_.
+            return 0
+
         if self._slot_layer[best] >= 0:
             self._free_slot(best)
         return best
@@ -241,10 +296,15 @@ class LayerStreamer:
         if gpu_sd is None:
             return
 
-        # Load state_dict into the layer (GPU tensors).
-        layer.load_state_dict(gpu_sd, strict=True)
+        # Load state_dict into the layer (GPU tensors). strict=False because
+        # LoRA adapter keys are NOT in the CPU snapshot; they stay GPU-resident
+        # and would be missing from gpu_sd.
+        layer.load_state_dict(gpu_sd, strict=False)
         # Ensure layer is on GPU device.
         layer.to(self.device)
+        # LoRA adapters should already be on GPU, but force-pin in case
+        # load_state_dict or .to() shuffled anything.
+        _pin_lora_to_gpu(layer, self.device)
 
     def _free_slot(self, slot: int) -> None:
         """Mark a ring slot as free and move the layer back to CPU."""
@@ -252,6 +312,9 @@ class LayerStreamer:
         if layer_idx >= 0:
             # Move the layer's parameters back to CPU so VRAM is freed.
             self._layers[layer_idx].to(self._cpu)
+            # Re-pin LoRA adapters to GPU -- they must NEVER leave the GPU
+            # per v0.4 spec (Section A: LoRA stays permanently GPU-resident).
+            _pin_lora_to_gpu(self._layers[layer_idx], self.device)
         self._slot_layer[slot] = -1
         self._ring_slots[slot] = None
 
@@ -263,6 +326,10 @@ class LayerStreamer:
         """Return the pre-forward hook for layer `idx`."""
         def hook(module: nn.Module, args: tuple) -> None:
             n_layers = len(self._layers)
+
+            # Mark this layer as "in flight" so the eviction policy does
+            # not rip its weights out while prefetching the next layer.
+            self._current_layer_idx = idx
 
             # 1. Ensure current layer (idx) is loaded and synced.
             slot = self._find_free_slot(idx)

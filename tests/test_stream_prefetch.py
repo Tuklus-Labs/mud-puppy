@@ -74,3 +74,55 @@ def test_streamer_respects_prefetch_depth():
     streamer = LayerStreamer(model, prefetch_layers=3)
     assert streamer.prefetch_layers == 3
     assert len(streamer._ring_slots) == 3
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
+def test_streamer_pins_lora_adapters():
+    """LoRA adapters must stay GPU-resident through eviction cycles."""
+    peft = pytest.importorskip("peft")
+
+    # Build the toy model and wrap with a peft LoRA config targeting the
+    # Linear inside each ToyBlock.
+    model = ToyTransformer(n_layers=4, dim=64)
+    lora_config = peft.LoraConfig(
+        r=4,
+        lora_alpha=8,
+        target_modules=["lin"],
+        lora_dropout=0.0,
+        bias="none",
+    )
+    model = peft.get_peft_model(model, lora_config)
+
+    # Peft wraps the model; _find_layers still needs model.model.layers.
+    # peft's PeftModel exposes the base model at .base_model.model so the
+    # layers live at model.base_model.model.model.layers. For the toy test,
+    # reach in and use the underlying ToyTransformer.
+    inner = model.base_model.model
+    streamer = LayerStreamer(inner, prefetch_layers=2)
+
+    def _assert_lora_on_gpu(stage: str) -> None:
+        found_any = False
+        for pname, param in inner.named_parameters():
+            if ("lora_A" in pname) or ("lora_B" in pname):
+                found_any = True
+                assert param.device.type == "cuda", (
+                    f"{stage}: LoRA param {pname} left GPU (device={param.device})"
+                )
+        assert found_any, "test bug: no LoRA params found on the model"
+
+    # After wrap, LoRA must be on GPU.
+    _assert_lora_on_gpu("post-wrap")
+
+    # Forward pass cycles layers through ring slots, triggering evictions.
+    x = torch.randint(0, 100, (2, 8), device="cuda")
+    out = inner(x)
+    _assert_lora_on_gpu("post-forward")
+
+    # Backward must also keep LoRA on GPU.
+    loss = out.sum()
+    loss.backward()
+    _assert_lora_on_gpu("post-backward")
+
+    # Second forward pass: full eviction cycle repeats.
+    _ = inner(x)
+    _assert_lora_on_gpu("post-second-forward")
