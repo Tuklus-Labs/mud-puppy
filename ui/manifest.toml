@@ -1,0 +1,79 @@
+[app]
+name = "mud-puppy-studio"
+title = "Mud-Puppy Studio"
+version = "0.4.0"
+
+[window]
+width = 1600
+height = 1000
+min_width = 1200
+min_height = 700
+decorated = true
+resizable = true
+background = "#05070d"
+
+[window.dev]
+devtools = true
+hot_reload = true
+
+[webview]
+devtools = true
+
+[assets]
+embed = true
+root = "web/dist"
+
+[threading]
+pool_size = 4
+
+[aegis]
+pensive = false
+engram = true
+nerve_center = true
+
+[[ipc]]
+name = "run.start"
+args = { config = "object" }
+returns = "object"
+
+[[ipc]]
+name = "run.stop"
+args = { run_id = "string" }
+returns = "object"
+
+[[ipc]]
+name = "run.list"
+returns = "array"
+
+[[ipc]]
+name = "hf.search_models"
+args = { query = "string" }
+returns = "array"
+
+[[ipc]]
+name = "checkpoint.list"
+args = { output_dir = "string" }
+returns = "array"
+
+[[ipc]]
+name = "dataset.preview"
+args = { path = "string", n = "int" }
+returns = "object"
+
+[[event]]
+name = "metrics"
+
+[[event]]
+name = "gpu"
+
+[[event]]
+name = "stream_stats"
+
+[[event]]
+name = "memory_stats"
+
+[[event]]
+name = "log_line"
+
+[[event]]
+name = "run_complete"
