@@ -41,7 +41,6 @@ Usage:
         optimizer.step()  # Handles CPU<->GPU transfers automatically
 """
 
-import warnings
 import torch
 import torch.nn as nn
 from torch.optim import Optimizer
@@ -401,83 +400,6 @@ class CPUOffloadOptimizer:
     def param_groups(self):
         """Access underlying optimizer param groups."""
         return self.optimizer.param_groups
-
-
-class PartitionedOptimizer:
-    """ZeRO-style optimizer that partitions states across CPU and GPU.
-
-    .. deprecated::
-        ``PartitionedOptimizer`` is deprecated and will be removed in v0.5.
-        Use ``CPUOffloadOptimizer`` together with ``LayerStreamer`` instead.
-        ``LayerStreamer`` renders partition-based streaming obsolete for
-        single-GPU targets.
-    """
-
-    def __init__(
-        self,
-        optimizer: Optimizer,
-        config: OffloadConfig = None,
-        partition_size: int = 500_000_000,  # 500M elements per partition
-    ):
-        warnings.warn(
-            "PartitionedOptimizer is deprecated; use CPUOffloadOptimizer + "
-            "LayerStreamer instead. Will be removed in v0.5.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        self.optimizer = optimizer
-        self.config = config or OffloadConfig()
-        self.partition_size = partition_size
-        self._cpu = torch.device("cpu")
-        self._gpu = torch.device("cuda") if torch.cuda.is_available() else self._cpu
-
-        # Partitioned storage
-        self._partitions: List[Dict] = []
-
-        self._setup_partitions()
-
-    def _setup_partitions(self):
-        """Partition parameters into manageable chunks."""
-        current_partition = {"params": [], "numel": 0}
-
-        for group in self.optimizer.param_groups:
-            for param in group["params"]:
-                if not param.requires_grad:
-                    continue
-
-                if current_partition["numel"] + param.numel() > self.partition_size:
-                    if current_partition["params"]:
-                        self._partitions.append(current_partition)
-                    current_partition = {"params": [], "numel": 0}
-
-                current_partition["params"].append(param)
-                current_partition["numel"] += param.numel()
-
-        if current_partition["params"]:
-            self._partitions.append(current_partition)
-
-        log.info("Created %d partitions for ZeRO optimizer", len(self._partitions))
-
-    def zero_grad(self, set_to_none: bool = True):
-        self.optimizer.zero_grad(set_to_none=set_to_none)
-
-    def step(self, closure=None):
-        """Step through partitions, streaming states as needed."""
-        if closure is not None:
-            raise NotImplementedError("Closure not supported")
-
-        for partition in self._partitions:
-            # Process this partition's parameters
-            # States for this partition are loaded to GPU
-            # Then we run optimizer step for just these params
-            # Then states are offloaded back to CPU
-
-            # This is a simplified version - full implementation would
-            # need custom optimizer kernels
-            pass
-
-        # For now, fall back to simple CPU offload
-        self.optimizer.step()
 
 
 def wrap_optimizer_for_offload(
