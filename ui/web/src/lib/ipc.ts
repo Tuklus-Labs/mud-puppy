@@ -6,6 +6,7 @@
  */
 import type {
   TrainingConfig,
+  RunHandle,
   RunSummary,
   HFModel,
   Checkpoint,
@@ -79,7 +80,7 @@ const mockPhos: PhosBridge = {
       case "run.list":
         return MOCK_RUNS as unknown as T;
       case "run.start":
-        return { run_id: `mock-run-${Date.now()}`, port: 5980 } as unknown as T;
+        return { run_id: `mock-run-${Date.now()}` } as unknown as T;
       case "run.stop":
         return { ok: true } as unknown as T;
       case "hf.search_models":
@@ -126,7 +127,7 @@ function getBridge(): PhosBridge {
 export const ipc = {
   // Commands
   startRun: (config: TrainingConfig) =>
-    getBridge().invoke<{ run_id: string; port: number }>("run.start", { config }),
+    getBridge().invoke<RunHandle>("run.start", { config }),
 
   stopRun: (run_id: string) =>
     getBridge().invoke<{ ok: boolean }>("run.stop", { run_id }),

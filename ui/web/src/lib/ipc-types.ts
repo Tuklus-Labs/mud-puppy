@@ -17,10 +17,12 @@ export interface TrainingConfig {
   model_name_or_path: string;
   dataset_path: string;
   output_dir: string;
-  finetuning_method: "full" | "lora" | "qlora" | "dpo" | "grpo" | "orpo" | "kto";
+  finetuning_method: "full" | "lora" | "qlora" | "gptq" | "qat" | "preference" | "rl" | "multimodal" | "rm" | "prm" | "embedding";
+  /** Sub-type for preference methods (dpo, ipo, kto, orpo). Only used when finetuning_method is "preference". */
+  preference?: "dpo" | "ipo" | "kto" | "orpo";
   num_epochs?: number;
   batch_size?: number;
-  gradient_accumulation_steps?: number;
+  gradient_accumulation?: number;
   learning_rate?: number;
   max_seq_length?: number;
   lora_r?: number;
@@ -38,7 +40,8 @@ export interface TrainingConfig {
 
 export interface RunHandle {
   run_id: string;
-  port: number;
+  /** pid is informational only; not used for monitor connection (async via port announcement). */
+  pid?: number;
 }
 
 export interface RunSummary {

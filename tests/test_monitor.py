@@ -81,11 +81,11 @@ def test_rocm_smi_parsing():
         ok = _monitor._read_rocm_smi(out, 0)
 
     assert ok is True
-    assert out["gpu_util"] == 95.0
-    assert out["temperature"] == 78.0  # junction preferred over edge
-    assert out["power_draw"] == 250.0
-    assert abs(out["vram_total"] - 24.0) < 0.01
-    assert abs(out["vram_used"] - 12.0) < 0.01
+    assert out["gpu_util_pct"] == 95.0
+    assert out["temp_c"] == 78.0  # junction preferred over edge
+    assert out["power_w"] == 250.0
+    assert abs(out["vram_total_gb"] - 24.0) < 0.01
+    assert abs(out["vram_used_gb"] - 12.0) < 0.01
 
 
 def test_nvidia_smi_parsing():
@@ -99,11 +99,11 @@ def test_nvidia_smi_parsing():
         ok = _monitor._read_nvidia_smi(out, 0)
 
     assert ok is True
-    assert abs(out["vram_used"] - 8.0) < 0.01       # 8192 MiB -> 8 GB
-    assert abs(out["vram_total"] - 24.0) < 0.01      # 24576 MiB -> 24 GB
-    assert out["gpu_util"] == 87.0
-    assert out["temperature"] == 72.0
-    assert out["power_draw"] == 310.5
+    assert abs(out["vram_used_gb"] - 8.0) < 0.01       # 8192 MiB -> 8 GB
+    assert abs(out["vram_total_gb"] - 24.0) < 0.01      # 24576 MiB -> 24 GB
+    assert out["gpu_util_pct"] == 87.0
+    assert out["temp_c"] == 72.0
+    assert out["power_w"] == 310.5
 
 
 # ------------------------------------------------------------------

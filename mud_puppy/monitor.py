@@ -30,7 +30,7 @@ log = logging.getLogger(__name__)
 # Public API
 # ---------------------------------------------------------------------------
 
-TELEMETRY_KEYS = ("vram_used", "vram_total", "gpu_util", "temperature", "power_draw")
+TELEMETRY_KEYS = ("vram_used_gb", "vram_total_gb", "gpu_util_pct", "temp_c", "power_w")
 
 
 def get_gpu_telemetry(device_index: int = 0) -> Dict[str, float]:
@@ -81,8 +81,8 @@ def _read_torch_vram(out: Dict[str, float], dev: int) -> bool:
         if dev < 0:
             return False
 
-        out["vram_used"] = torch.cuda.memory_allocated(dev) / (1024 ** 3)
-        out["vram_total"] = torch.cuda.get_device_properties(dev).total_memory / (1024 ** 3)
+        out["vram_used_gb"] = torch.cuda.memory_allocated(dev) / (1024 ** 3)
+        out["vram_total_gb"] = torch.cuda.get_device_properties(dev).total_memory / (1024 ** 3)
         return True
     except Exception as exc:
         log.debug("torch VRAM read failed: %s", exc)
@@ -120,28 +120,28 @@ def _read_rocm_smi(out: Dict[str, float], dev: int) -> bool:
             return True  # rocm-smi ran but returned nothing useful
 
     # --- GPU utilisation ---------------------------------------------------
-    out["gpu_util"] = _float(card.get("GPU use (%)"))
+    out["gpu_util_pct"] = _float(card.get("GPU use (%)"))
 
     # --- Temperature (prefer junction, fall back to edge) ------------------
     temp = card.get("Temperature (Sensor junction) (C)")
     if temp is None:
         temp = card.get("Temperature (Sensor edge) (C)")
-    out["temperature"] = _float(temp)
+    out["temp_c"] = _float(temp)
 
     # --- Power (key name varies between discrete and integrated GPUs) ------
     for key, val in card.items():
         if "Power (W)" in key:
-            out["power_draw"] = _float(val)
+            out["power_w"] = _float(val)
             break
 
     # --- VRAM (bytes -> GB) -- only overwrite if torch didn't already ------
-    if out["vram_total"] == 0.0:
+    if out["vram_total_gb"] == 0.0:
         total_b = card.get("VRAM Total Memory (B)")
         used_b = card.get("VRAM Total Used Memory (B)")
         if total_b is not None:
-            out["vram_total"] = _float(total_b) / (1024 ** 3)
+            out["vram_total_gb"] = _float(total_b) / (1024 ** 3)
         if used_b is not None:
-            out["vram_used"] = _float(used_b) / (1024 ** 3)
+            out["vram_used_gb"] = _float(used_b) / (1024 ** 3)
 
     return True
 
@@ -170,13 +170,13 @@ def _read_nvidia_smi(out: Dict[str, float], dev: int) -> bool:
         mem_used, mem_total, util, temp, power = parts[:5]
 
         # nvidia-smi reports memory in MiB.
-        if out["vram_used"] == 0.0:
-            out["vram_used"] = _float(mem_used) / 1024
-        if out["vram_total"] == 0.0:
-            out["vram_total"] = _float(mem_total) / 1024
-        out["gpu_util"] = _float(util)
-        out["temperature"] = _float(temp)
-        out["power_draw"] = _float(power)
+        if out["vram_used_gb"] == 0.0:
+            out["vram_used_gb"] = _float(mem_used) / 1024
+        if out["vram_total_gb"] == 0.0:
+            out["vram_total_gb"] = _float(mem_total) / 1024
+        out["gpu_util_pct"] = _float(util)
+        out["temp_c"] = _float(temp)
+        out["power_w"] = _float(power)
         return True
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
         log.debug("nvidia-smi failed: %s", exc)

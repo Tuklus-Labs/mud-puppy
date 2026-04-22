@@ -15,10 +15,19 @@ const METHODS: TrainingConfig["finetuning_method"][] = [
   "lora",
   "qlora",
   "full",
+  "preference",
+  "rl",
+  "multimodal",
+  "rm",
+  "prm",
+  "embedding",
+];
+
+const PREFERENCE_SUB: Array<NonNullable<TrainingConfig["preference"]>> = [
   "dpo",
-  "grpo",
-  "orpo",
+  "ipo",
   "kto",
+  "orpo",
 ];
 
 interface LaunchState {
@@ -26,6 +35,7 @@ interface LaunchState {
   dataset: string;
   output: string;
   method: TrainingConfig["finetuning_method"];
+  preference_sub: NonNullable<TrainingConfig["preference"]>;
   batch_size: number;
   grad_accum: number;
   learning_rate: number;
@@ -46,6 +56,7 @@ const DEFAULT: LaunchState = {
   dataset: "/data/instruct/alpaca-clean.jsonl",
   output: "outputs/llama3-finetune",
   method: "lora",
+  preference_sub: "dpo",
   batch_size: 4,
   grad_accum: 4,
   learning_rate: 2e-4,
@@ -131,9 +142,10 @@ export function Launch() {
       dataset_path: cfg.dataset,
       output_dir: cfg.output,
       finetuning_method: cfg.method,
+      ...(cfg.method === "preference" ? { preference: cfg.preference_sub } : {}),
       num_epochs: cfg.num_epochs,
       batch_size: cfg.batch_size,
-      gradient_accumulation_steps: cfg.grad_accum,
+      gradient_accumulation: cfg.grad_accum,
       learning_rate: cfg.learning_rate,
       max_seq_length: cfg.max_seq_length,
       lora_r: cfg.lora_r,
@@ -157,6 +169,7 @@ export function Launch() {
   };
 
   const isLoraMethod = cfg.method === "lora" || cfg.method === "qlora";
+  const isPreferenceMethod = cfg.method === "preference";
 
   return (
     <div className="pane">
@@ -255,6 +268,25 @@ export function Launch() {
                 </button>
               ))}
             </div>
+            {isPreferenceMethod && (
+              <div style={{ marginTop: 10 }}>
+                <div className="label" style={{ marginBottom: 8 }}>
+                  Preference algorithm
+                </div>
+                <div className="seg" style={{ display: "flex" }}>
+                  {PREFERENCE_SUB.map((s) => (
+                    <button
+                      key={s}
+                      className={cfg.preference_sub === s ? "active" : ""}
+                      onClick={() => update("preference_sub", s)}
+                      style={{ flex: 1 }}
+                    >
+                      {s.toUpperCase()}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
           </Panel>
 
           <Panel label="Hyperparameters">

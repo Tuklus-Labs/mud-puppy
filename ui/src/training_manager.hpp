@@ -20,6 +20,14 @@ namespace mp_studio {
 // reader thread; handler must be thread-safe and non-blocking.
 using PortReadyCb = std::function<void(const std::string& run_id, int port)>;
 
+// Run status as tracked by TrainingManager. Updated by reaper when a child exits.
+enum class RunStatus {
+    Running,
+    Complete,
+    Failed,
+    Stopped,
+};
+
 struct RunHandle {
     std::string run_id;
     pid_t pid;
@@ -65,6 +73,15 @@ private:
         std::thread stdout_thread;
         std::thread stderr_thread;
 
+        // Config snapshot stored at start() time for list() / RunSummary.
+        std::string model;
+        std::string method;
+        std::string dataset;
+        int64_t start_time_ms = 0;       // ms since epoch at fork time
+        int64_t end_time_ms = 0;         // 0 = still running
+        int exit_code = 0;
+        RunStatus status = RunStatus::Running;
+
         ActiveRun() = default;
         ActiveRun(ActiveRun&&) = default;
         ActiveRun& operator=(ActiveRun&&) = default;
@@ -72,9 +89,14 @@ private:
         ActiveRun& operator=(const ActiveRun&) = delete;
     };
 
+    // Completed runs kept for RunSummary display (capped at MAX_COMPLETED_RUNS).
+    static constexpr size_t MAX_COMPLETED_RUNS = 20;
+
     phos::Window& win_;
     mutable std::mutex mutex_;
     std::unordered_map<std::string, ActiveRun> runs_;
+    // Completed runs stored as RunSummary JSON, newest first. Capped at MAX_COMPLETED_RUNS.
+    std::vector<nlohmann::json> completed_runs_;
     PortReadyCb port_ready_cb_;  // fires when child announces its port
 
     // Monotonic counter for run-id disambiguation (protects against

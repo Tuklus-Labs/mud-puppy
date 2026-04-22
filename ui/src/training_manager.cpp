@@ -15,6 +15,7 @@
 
 #include <chrono>
 #include <cstring>
+#include <deque>
 #include <sstream>
 #include <stdexcept>
 
@@ -96,7 +97,18 @@ TrainingManager::~TrainingManager() {
         cleanup_run(run);
     }
 
-    // Stop the reaper thread by closing the self-pipe write end.
+    // B3 fix: reset SIGCHLD disposition BEFORE closing the self-pipe write end.
+    // A SIGCHLD arriving between shutting_down_.store and pipe close would write
+    // to a file descriptor we just closed (potentially recycled). Reset to SIG_DFL
+    // first so any late SIGCHLD is handled by the kernel default (no-op for us).
+    {
+        struct sigaction sa{};
+        sa.sa_handler = SIG_DFL;
+        sigemptyset(&sa.sa_mask);
+        ::sigaction(SIGCHLD, &sa, nullptr);
+    }
+
+    // Now close the self-pipe to wake and exit the reaper thread.
     shutting_down_.store(true);
     if (sigchld_pipe_[1] >= 0) {
         ::close(sigchld_pipe_[1]);
@@ -110,14 +122,11 @@ TrainingManager::~TrainingManager() {
         sigchld_pipe_[0] = -1;
     }
 
-    // Restore default SIGCHLD handler so a later manager re-install works.
-    struct sigaction sa{};
-    sa.sa_handler = SIG_DFL;
-    sigemptyset(&sa.sa_mask);
-    ::sigaction(SIGCHLD, &sa, nullptr);
-
     instance_ = nullptr;
 }
+
+// Note: SIGCHLD handler was already reset to SIG_DFL in the destructor before
+// closing the self-pipe (B3 fix). No secondary reset needed here.
 
 // ---------------------------------------------------------------------------
 // SIGCHLD: self-pipe pattern
@@ -181,6 +190,27 @@ void TrainingManager::on_child_exit(pid_t pid, int status) {
                 exit_code = WIFEXITED(status)  ? WEXITSTATUS(status)
                           : WIFSIGNALED(status) ? -WTERMSIG(status)
                           : -1;
+                run.exit_code = exit_code;
+                run.status = (exit_code == 0) ? RunStatus::Complete : RunStatus::Failed;
+                auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+                run.end_time_ms = static_cast<int64_t>(now_ms);
+
+                // Stash a RunSummary JSON in completed_runs_ for list().
+                const char* status_str = (exit_code == 0) ? "complete" : "failed";
+                nlohmann::json summary = {
+                    {"run_id",     run.run_id},
+                    {"model",      run.model},
+                    {"method",     run.method},
+                    {"dataset",    run.dataset},
+                    {"status",     status_str},
+                    {"start_time", run.start_time_ms},
+                    {"end_time",   run.end_time_ms},
+                };
+                completed_runs_.insert(completed_runs_.begin(), std::move(summary));
+                if (completed_runs_.size() > MAX_COMPLETED_RUNS) {
+                    completed_runs_.resize(MAX_COMPLETED_RUNS);
+                }
                 break;
             }
         }
@@ -250,10 +280,17 @@ std::string TrainingManager::resolve_sidecar_path() {
 }
 
 void TrainingManager::cleanup_run(ActiveRun& run) {
-    if (run.stdout_fd >= 0) { ::close(run.stdout_fd); run.stdout_fd = -1; }
-    if (run.stderr_fd >= 0) { ::close(run.stderr_fd); run.stderr_fd = -1; }
+    // B4 fix: join reader threads BEFORE closing the read-end fds.
+    // The reader calls read(fd, ...) in a blocking loop; read() returns 0
+    // (EOF) when the write end of the pipe is closed (which happens when
+    // the child exits). Once the thread has seen EOF and returned, we can
+    // safely close our (read-end) copy of the fd. Closing before join()
+    // risks a use-after-free if the fd number is recycled and the still-
+    // running reader reads from a different file entirely.
     if (run.stdout_thread.joinable()) run.stdout_thread.join();
     if (run.stderr_thread.joinable()) run.stderr_thread.join();
+    if (run.stdout_fd >= 0) { ::close(run.stdout_fd); run.stdout_fd = -1; }
+    if (run.stderr_fd >= 0) { ::close(run.stderr_fd); run.stderr_fd = -1; }
 }
 
 // ---------------------------------------------------------------------------
@@ -301,18 +338,44 @@ RunHandle TrainingManager::start(const nlohmann::json& config) {
             args_storage.push_back(std::to_string(config[key].get<double>()));
         }
     };
+    auto add_str_flag = [&](const std::string& key, const std::string& flag) {
+        if (config.contains(key) && config[key].is_string()) {
+            const auto val = config[key].get<std::string>();
+            if (!val.empty()) {
+                args_storage.push_back(flag);
+                args_storage.push_back(val);
+            }
+        }
+    };
     auto add_bool_flag = [&](const std::string& key, const std::string& flag) {
         if (config.contains(key) && config[key].get<bool>()) {
             args_storage.push_back(flag);
         }
     };
 
+    // A6: wire the flags that were previously missing.
     add_flag("num_epochs", "--epochs");
     add_flag("batch_size", "--batch-size");
+    add_flag("gradient_accumulation", "--gradient-accumulation");
     add_flag("learning_rate", "--learning-rate");
     add_flag("max_seq_length", "--max-seq-length");
     add_bool_flag("pack_sequences", "--pack-sequences");
     add_bool_flag("stream", "--stream");
+    add_str_flag("precision", "--precision");
+    add_bool_flag("compile", "--compile");
+    add_str_flag("compile_mode", "--compile-mode");
+    add_flag("lora_r", "--lora-r");
+    add_flag("lora_alpha", "--lora-alpha");
+    add_flag("lora_dropout", "--lora-dropout");
+    add_str_flag("quant_backend", "--quant-backend");
+    add_bool_flag("trust_remote_code", "--trust-remote-code");
+    add_bool_flag("zero_offload", "--zero-offload");
+    add_bool_flag("resume", "--resume");
+    add_flag("prefetch_layers", "--prefetch-layers");
+    add_bool_flag("merge_lora", "--merge-lora");
+    add_str_flag("merge_precision", "--merge-precision");
+    // preference sub-type (DPO/IPO/KTO/ORPO) -- only meaningful when method == "preference"
+    add_str_flag("preference", "--preference");
 
     args_storage.push_back("--monitor");
     args_storage.push_back("--monitor-port");
@@ -366,23 +429,56 @@ RunHandle TrainingManager::start(const nlohmann::json& config) {
     PHOS_LOG_INFO("TrainingManager: spawned run_id={} pid={} monitor_port={}",
                   run_id, pid, monitor_port);
 
-    ActiveRun run;
-    run.run_id = run_id;
-    run.pid = pid;
-    run.monitor_port = monitor_port;
-    run.stdout_fd = out_pipe[0];
-    run.stderr_fd = err_pipe[0];
+    // Capture config snapshot for RunSummary (list() / Runs pane).
+    std::string snap_model;
+    std::string snap_method;
+    std::string snap_dataset;
+    if (config.contains("model_name_or_path") && config["model_name_or_path"].is_string())
+        snap_model = config["model_name_or_path"].get<std::string>();
+    if (config.contains("finetuning_method") && config["finetuning_method"].is_string())
+        snap_method = config["finetuning_method"].get<std::string>();
+    if (config.contains("dataset_path") && config["dataset_path"].is_string())
+        snap_dataset = config["dataset_path"].get<std::string>();
 
-    run.stdout_thread = std::thread([this, fd = out_pipe[0], rid = run_id]() {
-        read_pipe(fd, rid, "stdout");
-    });
-    run.stderr_thread = std::thread([this, fd = err_pipe[0], rid = run_id]() {
-        read_pipe(fd, rid, "stderr");
-    });
+    auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
 
+    // B1 fix: emplace the ActiveRun under the lock BEFORE spawning reader
+    // threads. If the child prints MUD_PUPPY_MONITOR_PORT immediately after
+    // fork, on_port_announced must be able to find the entry in runs_.
+    // Previously the emplace happened AFTER thread spawn, creating a window
+    // where the port announcement would silently be dropped.
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        ActiveRun run;
+        run.run_id = run_id;
+        run.pid = pid;
+        run.monitor_port = monitor_port;
+        run.stdout_fd = out_pipe[0];
+        run.stderr_fd = err_pipe[0];
+        run.model = snap_model;
+        run.method = snap_method;
+        run.dataset = snap_dataset;
+        run.start_time_ms = static_cast<int64_t>(now_ms);
+        run.status = RunStatus::Running;
         runs_.emplace(run_id, std::move(run));
+    }
+
+    // Spawn reader threads after emplace so they can safely call
+    // on_port_announced and find the entry.
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = runs_.find(run_id);
+        if (it != runs_.end()) {
+            it->second.stdout_thread = std::thread(
+                [this, fd = out_pipe[0], rid = run_id]() {
+                    read_pipe(fd, rid, "stdout");
+                });
+            it->second.stderr_thread = std::thread(
+                [this, fd = err_pipe[0], rid = run_id]() {
+                    read_pipe(fd, rid, "stderr");
+                });
+        }
     }
 
     return RunHandle{run_id, pid, monitor_port};
@@ -401,25 +497,39 @@ bool TrainingManager::stop(const std::string& run_id) {
         ::kill(pid, SIGTERM);
     }
 
-    // Detached cleanup thread: keep stop() responsive for the UI.
+    // B5 fix: stop() must NOT call waitpid. The reaper thread is the sole
+    // authority for all waitpid calls. Double-waitpid between the detached
+    // cleanup thread and the reaper is a race that causes ECHILD errors and
+    // can reap an unrelated process if the pid was recycled.
+    //
+    // Strategy: send SIGTERM, then after 10 seconds send SIGKILL if the
+    // process still exists (kill(pid, 0) probes liveness without waitpid).
+    // The reaper thread handles the actual waitpid when the child exits.
+    // After we are confident the child is dead (or the reaper has cleaned up),
+    // we remove the runs_ entry and join reader threads.
     std::thread([this, run_id, pid]() {
         if (pid > 0) {
             auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-            bool reaped = false;
             while (std::chrono::steady_clock::now() < deadline) {
-                int status;
-                pid_t r = ::waitpid(pid, &status, WNOHANG);
-                if (r == pid) { reaped = true; break; }
-                if (r < 0 && errno == ECHILD) { reaped = true; break; }
+                // Check if child still exists (no waitpid -- just a signal 0 probe).
+                if (::kill(pid, 0) != 0 && errno == ESRCH) {
+                    break;  // process is gone (reaped by reaper or never existed)
+                }
+                // Also check if the reaper has already marked pid=-1.
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    auto it = runs_.find(run_id);
+                    if (it != runs_.end() && it->second.pid < 0) break;
+                    if (it == runs_.end()) return;  // already fully cleaned up
+                }
                 std::this_thread::sleep_for(std::chrono::milliseconds(200));
             }
-            if (!reaped) {
+            // Deadline expired: send SIGKILL. Let the reaper catch the exit.
+            if (::kill(pid, 0) == 0) {
                 ::kill(pid, SIGKILL);
-                ::waitpid(pid, nullptr, 0);
+                // Brief wait for reaper to catch up (not waitpid -- reaper owns that).
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
             }
-            // NOTE: the reaper thread (on_child_exit) may already have emitted
-            // run_complete by the time we get here; that's fine -- it marks
-            // run.pid = -1 but leaves the entry for us to finish cleanup.
         }
 
         // Remove the entry from the map and clean up its pipes / threads.
@@ -446,13 +556,25 @@ bool TrainingManager::stop(const std::string& run_id) {
 nlohmann::json TrainingManager::list() const {
     std::lock_guard<std::mutex> lock(mutex_);
     nlohmann::json result = nlohmann::json::array();
+
+    // Active runs first.
     for (const auto& [id, run] : runs_) {
-        result.push_back({
-            {"run_id", run.run_id},
-            {"pid", run.pid},
-            {"monitor_port", run.monitor_port}
-        });
+        nlohmann::json entry = {
+            {"run_id",     run.run_id},
+            {"model",      run.model},
+            {"method",     run.method},
+            {"dataset",    run.dataset},
+            {"status",     "running"},
+            {"start_time", run.start_time_ms},
+        };
+        result.push_back(std::move(entry));
     }
+
+    // Then completed runs (newest first, up to MAX_COMPLETED_RUNS).
+    for (const auto& summary : completed_runs_) {
+        result.push_back(summary);
+    }
+
     return result;
 }
 
