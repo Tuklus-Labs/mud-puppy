@@ -179,43 +179,70 @@ void TrainingManager::reaper_loop() {
 
 void TrainingManager::on_child_exit(pid_t pid, int status) {
     // Runs on reaper thread -- safe to lock, safe to emit.
+    //
+    // B1 fix: on_child_exit is now the sole place that moves a run from
+    // runs_ to completed_runs_ and calls cleanup_run. stop() no longer
+    // erases the entry; it only marks status=Stopped and sends SIGTERM/SIGKILL.
     std::string run_id;
     int exit_code = -1;
+    ActiveRun run_to_clean;
+    bool found = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        for (auto& [id, run] : runs_) {
-            if (run.pid == pid) {
-                run.pid = -1;  // mark reaped
-                run_id = run.run_id;
-                exit_code = WIFEXITED(status)  ? WEXITSTATUS(status)
-                          : WIFSIGNALED(status) ? -WTERMSIG(status)
-                          : -1;
-                run.exit_code = exit_code;
-                run.status = (exit_code == 0) ? RunStatus::Complete : RunStatus::Failed;
-                auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count();
-                run.end_time_ms = static_cast<int64_t>(now_ms);
+        for (auto it = runs_.begin(); it != runs_.end(); ++it) {
+            ActiveRun& run = it->second;
+            if (run.pid != pid) continue;
 
-                // Stash a RunSummary JSON in completed_runs_ for list().
-                const char* status_str = (exit_code == 0) ? "complete" : "failed";
-                nlohmann::json summary = {
-                    {"run_id",     run.run_id},
-                    {"model",      run.model},
-                    {"method",     run.method},
-                    {"dataset",    run.dataset},
-                    {"status",     status_str},
-                    {"start_time", run.start_time_ms},
-                    {"end_time",   run.end_time_ms},
-                };
-                completed_runs_.insert(completed_runs_.begin(), std::move(summary));
-                if (completed_runs_.size() > MAX_COMPLETED_RUNS) {
-                    completed_runs_.resize(MAX_COMPLETED_RUNS);
-                }
-                break;
+            run.pid = -1;  // mark reaped
+            run_id = run.run_id;
+            exit_code = WIFEXITED(status)  ? WEXITSTATUS(status)
+                      : WIFSIGNALED(status) ? -WTERMSIG(status)
+                      : -1;
+            run.exit_code = exit_code;
+
+            // Determine final status: user-requested stop is "stopped",
+            // clean exit is "complete", everything else is "failed".
+            const char* status_str;
+            if (run.status == RunStatus::Stopped) {
+                status_str = "stopped";
+                // Keep RunStatus::Stopped -- already set by stop()
+            } else if (exit_code == 0) {
+                run.status = RunStatus::Complete;
+                status_str = "complete";
+            } else {
+                run.status = RunStatus::Failed;
+                status_str = "failed";
             }
+
+            auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            run.end_time_ms = static_cast<int64_t>(now_ms);
+
+            // Stash a RunSummary JSON in completed_runs_ for list().
+            nlohmann::json summary = {
+                {"run_id",     run.run_id},
+                {"model",      run.model},
+                {"method",     run.method},
+                {"dataset",    run.dataset},
+                {"status",     status_str},
+                {"start_time", run.start_time_ms},
+                {"end_time",   run.end_time_ms},
+            };
+            completed_runs_.insert(completed_runs_.begin(), std::move(summary));
+            if (completed_runs_.size() > MAX_COMPLETED_RUNS) {
+                completed_runs_.resize(MAX_COMPLETED_RUNS);
+            }
+
+            // Move the run out for cleanup outside the lock.
+            run_to_clean = std::move(run);
+            runs_.erase(it);
+            found = true;
+            break;
         }
     }
-    if (!run_id.empty()) {
+    if (found) {
+        // cleanup_run joins reader threads; must be called outside the lock.
+        cleanup_run(run_to_clean);
         win_.emit("run_complete", {{"run_id", run_id}, {"exit_code", exit_code}});
         PHOS_LOG_INFO("TrainingManager: run_id={} exited code={}", run_id, exit_code);
     }
@@ -491,22 +518,27 @@ bool TrainingManager::stop(const std::string& run_id) {
         auto it = runs_.find(run_id);
         if (it == runs_.end()) return false;
         pid = it->second.pid;
+        // B1 fix: mark as Stopped now so on_child_exit can distinguish a
+        // user-requested stop from a spontaneous failure. This must happen
+        // before SIGTERM so that the reaper sees the intent even if the
+        // child exits before the cleanup thread runs.
+        it->second.status = RunStatus::Stopped;
     }
 
     if (pid > 0) {
         ::kill(pid, SIGTERM);
     }
 
-    // B5 fix: stop() must NOT call waitpid. The reaper thread is the sole
-    // authority for all waitpid calls. Double-waitpid between the detached
-    // cleanup thread and the reaper is a race that causes ECHILD errors and
-    // can reap an unrelated process if the pid was recycled.
+    // B1 fix: stop() must NOT erase the runs_ entry. The reaper's
+    // on_child_exit is the sole authority for moving an entry to
+    // completed_runs_ and emitting run_complete. If stop() erases first,
+    // on_child_exit finds no entry and the run silently disappears from
+    // the completed list with no event fired.
     //
     // Strategy: send SIGTERM, then after 10 seconds send SIGKILL if the
     // process still exists (kill(pid, 0) probes liveness without waitpid).
-    // The reaper thread handles the actual waitpid when the child exits.
-    // After we are confident the child is dead (or the reaper has cleaned up),
-    // we remove the runs_ entry and join reader threads.
+    // The reaper thread handles the actual waitpid when the child exits,
+    // and will call cleanup_run + erase the entry there.
     std::thread([this, run_id, pid]() {
         if (pid > 0) {
             auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
@@ -515,39 +547,23 @@ bool TrainingManager::stop(const std::string& run_id) {
                 if (::kill(pid, 0) != 0 && errno == ESRCH) {
                     break;  // process is gone (reaped by reaper or never existed)
                 }
-                // Also check if the reaper has already marked pid=-1.
+                // Also check if the reaper has already marked pid=-1 (reaped).
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
                     auto it = runs_.find(run_id);
-                    if (it != runs_.end() && it->second.pid < 0) break;
-                    if (it == runs_.end()) return;  // already fully cleaned up
+                    if (it == runs_.end()) return;  // reaper already cleaned up
+                    if (it->second.pid < 0) return; // reaper reaped, will erase
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(200));
             }
             // Deadline expired: send SIGKILL. Let the reaper catch the exit.
             if (::kill(pid, 0) == 0) {
                 ::kill(pid, SIGKILL);
-                // Brief wait for reaper to catch up (not waitpid -- reaper owns that).
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                // No erase here -- reaper owns the entry until on_child_exit.
             }
         }
-
-        // Remove the entry from the map and clean up its pipes / threads.
-        // We must NOT hold mutex_ while joining reader threads.
-        ActiveRun run;
-        bool found = false;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            auto it = runs_.find(run_id);
-            if (it != runs_.end()) {
-                run = std::move(it->second);
-                runs_.erase(it);
-                found = true;
-            }
-        }
-        if (found) {
-            cleanup_run(run);
-        }
+        // Do NOT erase runs_ entry here. The reaper's on_child_exit handles
+        // the move-to-completed, cleanup_run, and erase.
     }).detach();
 
     return true;
