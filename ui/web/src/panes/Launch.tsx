@@ -339,12 +339,14 @@ export function Launch() {
                 type="number"
                 value={(config as any)[key] ?? ""}
                 {...attrs}
-                onChange={(e) =>
+                onChange={(e) => {
+                  // NaN-safe: empty string / garbage -> undefined (removes key)
+                  const v = parseFloat(e.target.value);
                   setConfig((c) => ({
                     ...c,
-                    [key]: parseFloat(e.target.value),
-                  }))
-                }
+                    [key]: Number.isFinite(v) ? v : undefined,
+                  }));
+                }}
               />
             </div>
           ))}
@@ -373,9 +375,13 @@ export function Launch() {
                   style={inputStyle}
                   type="number"
                   value={(config as any)[key] ?? ""}
-                  onChange={(e) =>
-                    setConfig((c) => ({ ...c, [key]: parseFloat(e.target.value) }))
-                  }
+                  onChange={(e) => {
+                    const v = parseFloat(e.target.value);
+                    setConfig((c) => ({
+                      ...c,
+                      [key]: Number.isFinite(v) ? v : undefined,
+                    }));
+                  }}
                 />
               </div>
             ))}
