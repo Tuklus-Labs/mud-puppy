@@ -20,6 +20,10 @@ const LEVEL_COLORS: Record<LogEntry["level"], string> = {
 
 const LEVEL_LABELS: LogEntry["level"][] = ["info", "warn", "error"];
 
+// Virtualization constants
+const ROW_HEIGHT = 18;      // px, fixed monospace row height
+const OVERSCAN  = 10;       // extra rows buffered on each end
+
 export function Logs() {
   const logs = useStore((s) => s.logs);
   const logFilter = useStore((s) => s.logFilter);
@@ -32,6 +36,10 @@ export function Logs() {
   const [autoScroll, setAutoScroll] = useState(true);
   const listRef = useRef<HTMLDivElement>(null);
 
+  // Windowing state
+  const [scrollTop, setScrollTop] = useState(0);
+  const [viewportH, setViewportH] = useState(400);
+
   const filteredLogs = useMemo(() => {
     return logs.filter((entry) => {
       if (!levelFilter.has(entry.level)) return false;
@@ -41,17 +49,39 @@ export function Logs() {
     });
   }, [logs, logFilter, levelFilter, activeRunId]);
 
-  // Auto-scroll to bottom
+  // Track viewport height via ResizeObserver
+  useEffect(() => {
+    const el = listRef.current;
+    if (!el) return;
+    setViewportH(el.clientHeight);
+    const ro = new ResizeObserver(() => {
+      if (listRef.current) setViewportH(listRef.current.clientHeight);
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  // Auto-scroll to bottom when new lines arrive
   useEffect(() => {
     if (autoScroll && listRef.current) {
       listRef.current.scrollTop = listRef.current.scrollHeight;
     }
-  }, [filteredLogs, autoScroll]);
+  }, [filteredLogs.length, autoScroll]);
+
+  // Window slice
+  const total = filteredLogs.length;
+  const visibleCount = Math.ceil(viewportH / ROW_HEIGHT) + OVERSCAN;
+  const firstVisible = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN);
+  const lastVisible = Math.min(total, firstVisible + visibleCount + OVERSCAN);
+  const windowSlice = filteredLogs.slice(firstVisible, lastVisible);
+  const padTop = firstVisible * ROW_HEIGHT;
+  const padBottom = Math.max(0, (total - lastVisible) * ROW_HEIGHT);
 
   const handleScroll = () => {
     if (!listRef.current) return;
-    const { scrollTop, scrollHeight, clientHeight } = listRef.current;
-    const atBottom = scrollHeight - scrollTop - clientHeight < 40;
+    const el = listRef.current;
+    setScrollTop(el.scrollTop);
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
     setAutoScroll(atBottom);
   };
 
@@ -211,16 +241,22 @@ export function Logs() {
               {logs.length === 0 ? "NO LOGS YET" : "NO MATCHING LOGS"}
             </div>
           ) : (
-            filteredLogs.map((entry) => (
+            <>
+              {/* Top spacer preserves total scroll height */}
+              {padTop > 0 && <div style={{ height: padTop }} />}
+              {windowSlice.map((entry) => (
               <div
                 key={entry.id}
                 style={{
                   display: "flex",
                   gap: 8,
-                  padding: "1px 12px",
+                  padding: "0 12px",
                   fontFamily: "'JetBrains Mono', monospace",
                   fontSize: "11px",
-                  lineHeight: 1.5,
+                  lineHeight: `${ROW_HEIGHT}px`,
+                  height: ROW_HEIGHT,
+                  overflow: "hidden",
+                  whiteSpace: "nowrap",
                   borderLeft: entry.level !== "info"
                     ? `2px solid ${LEVEL_COLORS[entry.level]}`
                     : "2px solid transparent",
@@ -235,7 +271,6 @@ export function Logs() {
                       fontSize: "9px",
                       textTransform: "uppercase",
                       letterSpacing: "1px",
-                      paddingTop: 2,
                     }}
                   >
                     {entry.level}
@@ -245,14 +280,18 @@ export function Logs() {
                 <span
                   style={{
                     color: LEVEL_COLORS[entry.level],
-                    wordBreak: "break-all",
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
                     flex: 1,
                   }}
                 >
                   {entry.line}
                 </span>
               </div>
-            ))
+            ))}
+              {/* Bottom spacer preserves total scroll height */}
+              {padBottom > 0 && <div style={{ height: padBottom }} />}
+            </>
           )}
         </div>
       </Panel>
