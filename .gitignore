@@ -48,3 +48,7 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
+
+# Web frontend
+ui/web/node_modules/
+ui/web/dist/
