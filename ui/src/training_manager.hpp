@@ -40,8 +40,10 @@ private:
         std::string run_id;
         pid_t pid;
         int monitor_port;
-        int stderr_fd;       // read end of pipe
-        std::thread log_thread;
+        int stdout_fd;              // read end of stdout pipe
+        int stderr_fd;              // read end of stderr pipe
+        std::thread stdout_thread;
+        std::thread stderr_thread;
     };
 
     phos::Window& win_;
@@ -54,8 +56,9 @@ private:
     // Generate a short unique run ID.
     static std::string make_run_id();
 
-    // Background thread: reads stderr from child, emits log_line events.
-    void read_stderr(int fd, const std::string& run_id);
+    // Background thread: reads from a child pipe and emits log_line events
+    // tagged with stream = "stdout" or "stderr".
+    void read_pipe(int fd, const std::string& run_id, const char* stream);
 
     // SIGCHLD handler reaps zombies and emits run_complete.
     static void install_sigchld(TrainingManager* self);

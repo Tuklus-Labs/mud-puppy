@@ -47,12 +47,12 @@ TrainingManager::~TrainingManager() {
         ::kill(run.pid, SIGKILL);
         ::waitpid(run.pid, nullptr, 0);
     }
-    // Join log threads.
+    // Close pipe fds (unblocks reader threads) and join them.
     for (auto& [id, run] : runs_) {
-        if (run.log_thread.joinable()) {
-            close(run.stderr_fd);
-            run.log_thread.join();
-        }
+        if (run.stdout_fd >= 0) { ::close(run.stdout_fd); run.stdout_fd = -1; }
+        if (run.stderr_fd >= 0) { ::close(run.stderr_fd); run.stderr_fd = -1; }
+        if (run.stdout_thread.joinable()) run.stdout_thread.join();
+        if (run.stderr_thread.joinable()) run.stderr_thread.join();
     }
     instance_ = nullptr;
 }
@@ -165,25 +165,32 @@ RunHandle TrainingManager::start(const nlohmann::json& config) {
     }
     argv.push_back(nullptr);
 
-    // Create stderr pipe (stdout will be inherited).
-    int pipefd[2];
-    if (::pipe2(pipefd, O_CLOEXEC) != 0) {
-        throw std::runtime_error("pipe2 failed: " + std::string(strerror(errno)));
+    // Create separate pipes for stdout and stderr.
+    int out_pipe[2];
+    int err_pipe[2];
+    if (::pipe2(out_pipe, O_CLOEXEC) != 0) {
+        throw std::runtime_error("pipe2(stdout) failed: " + std::string(strerror(errno)));
+    }
+    if (::pipe2(err_pipe, O_CLOEXEC) != 0) {
+        ::close(out_pipe[0]);
+        ::close(out_pipe[1]);
+        throw std::runtime_error("pipe2(stderr) failed: " + std::string(strerror(errno)));
     }
 
     pid_t pid = ::fork();
     if (pid < 0) {
-        ::close(pipefd[0]);
-        ::close(pipefd[1]);
+        ::close(out_pipe[0]); ::close(out_pipe[1]);
+        ::close(err_pipe[0]); ::close(err_pipe[1]);
         throw std::runtime_error("fork failed: " + std::string(strerror(errno)));
     }
 
     if (pid == 0) {
         // Child process.
-        // Redirect stderr to write end of pipe.
-        ::dup2(pipefd[1], STDERR_FILENO);
-        ::close(pipefd[0]);
-        ::close(pipefd[1]);
+        // Redirect stdout and stderr to their respective pipes.
+        ::dup2(out_pipe[1], STDOUT_FILENO);
+        ::dup2(err_pipe[1], STDERR_FILENO);
+        ::close(out_pipe[0]); ::close(out_pipe[1]);
+        ::close(err_pipe[0]); ::close(err_pipe[1]);
 
         // Exec the sidecar.
         ::execv(argv[0], const_cast<char* const*>(argv.data()));
@@ -191,8 +198,9 @@ RunHandle TrainingManager::start(const nlohmann::json& config) {
         ::_exit(127);
     }
 
-    // Parent.
-    ::close(pipefd[1]);  // close write end
+    // Parent: close write ends.
+    ::close(out_pipe[1]);
+    ::close(err_pipe[1]);
 
     PHOS_LOG_INFO("TrainingManager: spawned run_id={} pid={} monitor_port={}",
                   run_id, pid, monitor_port);
@@ -202,11 +210,15 @@ RunHandle TrainingManager::start(const nlohmann::json& config) {
     run.run_id = run_id;
     run.pid = pid;
     run.monitor_port = monitor_port;
-    run.stderr_fd = pipefd[0];
+    run.stdout_fd = out_pipe[0];
+    run.stderr_fd = err_pipe[0];
 
-    // Start log reader thread.
-    run.log_thread = std::thread([this, fd = pipefd[0], rid = run_id]() {
-        read_stderr(fd, rid);
+    // Start reader threads (one per pipe).
+    run.stdout_thread = std::thread([this, fd = out_pipe[0], rid = run_id]() {
+        read_pipe(fd, rid, "stdout");
+    });
+    run.stderr_thread = std::thread([this, fd = err_pipe[0], rid = run_id]() {
+        read_pipe(fd, rid, "stderr");
     });
 
     {
@@ -254,8 +266,8 @@ nlohmann::json TrainingManager::list() const {
     return result;
 }
 
-void TrainingManager::read_stderr(int fd, const std::string& run_id) {
-    // Read lines from the child's stderr and emit log_line events.
+void TrainingManager::read_pipe(int fd, const std::string& run_id, const char* stream) {
+    // Read lines from the child pipe and emit log_line events tagged with stream.
     std::string buf;
     char chunk[4096];
     while (true) {
@@ -270,15 +282,23 @@ void TrainingManager::read_stderr(int fd, const std::string& run_id) {
             std::string line = buf.substr(0, pos);
             buf.erase(0, pos + 1);
             if (!line.empty()) {
-                win_.emit("log_line", {{"run_id", run_id}, {"line", line}});
+                win_.emit("log_line", {
+                    {"run_id", run_id},
+                    {"stream", stream},
+                    {"line", line}
+                });
             }
         }
     }
     // Emit any remaining partial line.
     if (!buf.empty()) {
-        win_.emit("log_line", {{"run_id", run_id}, {"line", buf}});
+        win_.emit("log_line", {
+            {"run_id", run_id},
+            {"stream", stream},
+            {"line", buf}
+        });
     }
-    ::close(fd);
+    // Note: fd is closed by the caller (either via ActiveRun cleanup or destructor).
 }
 
 void TrainingManager::install_sigchld(TrainingManager* self) {
