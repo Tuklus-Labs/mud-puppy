@@ -3,14 +3,13 @@
  *
  * Thicken briefly on matching IPC events (stroke-width 1->3->1 over 400ms).
  * Opacity 0.4 -> 1 -> 0.4.
+ *
+ * Active state lives in a ref (not useState) so the recalculate callback
+ * never closes over a stale snapshot. Rendering is triggered via a plain
+ * forceUpdate tick when activity changes.
  */
 import React, { useEffect, useRef, useState, useCallback } from "react";
 import { useStore } from "../lib/store";
-
-interface WireAnchor {
-  id: string;        // DOM element id for source/target
-  event?: string;    // IPC event name that triggers this wire
-}
 
 interface Wire {
   from: string;  // element id
@@ -18,10 +17,9 @@ interface Wire {
   event?: string;
 }
 
-interface WireState {
+interface WireGeom {
   key: string;
-  points: string; // SVG polyline points
-  active: boolean;
+  points: string;
 }
 
 interface VectorWiresProps {
@@ -42,70 +40,77 @@ function buildPolylinePoints(
   from: { x: number; y: number },
   to: { x: number; y: number }
 ): string {
-  // Elbow routing: horizontal then vertical midpoint
   const mx = (from.x + to.x) / 2;
   return `${from.x},${from.y} ${mx},${from.y} ${mx},${to.y} ${to.x},${to.y}`;
 }
 
 export function VectorWires({ wires }: VectorWiresProps) {
   const svgRef = useRef<SVGSVGElement>(null);
-  const [wireStates, setWireStates] = useState<WireState[]>([]);
   const lastEvent = useStore((s) => s.lastEvent);
-  const activeTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+
+  // Geometry (points per wire) lives in ref + state for render.
+  const [geom, setGeom] = useState<WireGeom[]>([]);
+
+  // Active-state ref: source of truth; never a stale closure.
+  const activeRef = useRef<Map<string, boolean>>(new Map());
+  const timersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+
+  // Tick counter used solely to force a render when active flags change.
+  const [, setTick] = useState(0);
+  const bumpTick = useCallback(() => setTick((t) => (t + 1) & 0xffff), []);
 
   const recalculate = useCallback(() => {
     if (!svgRef.current) return;
     const svgRect = svgRef.current.getBoundingClientRect();
-    const states: WireState[] = wires.map((w, i) => {
+    const next: WireGeom[] = wires.map((w, i) => {
       const from = getCenter(w.from, svgRect);
       const to = getCenter(w.to, svgRect);
       const key = `wire-${i}`;
-      if (!from || !to) return { key, points: "", active: false };
-      return {
-        key,
-        points: buildPolylinePoints(from, to),
-        active: wireStates.find((s) => s.key === key)?.active ?? false,
-      };
+      if (!from || !to) return { key, points: "" };
+      return { key, points: buildPolylinePoints(from, to) };
     });
-    setWireStates(states);
-  }, [wires]); // eslint-disable-line react-hooks/exhaustive-deps
+    setGeom(next);
+  }, [wires]);
 
-  // Recalculate on resize
+  // Recalculate on resize + mount
   useEffect(() => {
     recalculate();
     const ro = new ResizeObserver(recalculate);
-    if (svgRef.current?.parentElement) {
-      ro.observe(svgRef.current.parentElement);
-    }
+    const parent = svgRef.current?.parentElement;
+    if (parent) ro.observe(parent);
     return () => ro.disconnect();
   }, [recalculate]);
 
-  // Flash wires on matching events
+  // Flash wires on matching events. Writes into activeRef directly.
   useEffect(() => {
     if (!lastEvent) return;
     wires.forEach((w, i) => {
       if (w.event && w.event === lastEvent) {
         const key = `wire-${i}`;
-        // Clear existing timer
-        const existing = activeTimers.current.get(key);
-        if (existing) clearTimeout(existing);
+        const prev = timersRef.current.get(key);
+        if (prev) clearTimeout(prev);
 
-        // Activate
-        setWireStates((prev) =>
-          prev.map((s) => (s.key === key ? { ...s, active: true } : s))
-        );
+        activeRef.current.set(key, true);
+        bumpTick();
 
-        // Deactivate after 400ms
         const t = setTimeout(() => {
-          setWireStates((prev) =>
-            prev.map((s) => (s.key === key ? { ...s, active: false } : s))
-          );
-          activeTimers.current.delete(key);
+          activeRef.current.set(key, false);
+          timersRef.current.delete(key);
+          bumpTick();
         }, 400);
-        activeTimers.current.set(key, t);
+        timersRef.current.set(key, t);
       }
     });
-  }, [lastEvent, wires]);
+  }, [lastEvent, wires, bumpTick]);
+
+  // I12: clear all pending timers on unmount.
+  useEffect(() => {
+    const timers = timersRef.current;
+    return () => {
+      timers.forEach((t) => clearTimeout(t));
+      timers.clear();
+    };
+  }, []);
 
   return (
     <svg
@@ -130,18 +135,19 @@ export function VectorWires({ wires }: VectorWiresProps) {
           </feMerge>
         </filter>
       </defs>
-      {wireStates.map((ws) => {
-        if (!ws.points) return null;
+      {geom.map((g) => {
+        if (!g.points) return null;
+        const active = activeRef.current.get(g.key) === true;
         return (
           <polyline
-            key={ws.key}
-            points={ws.points}
+            key={g.key}
+            points={g.points}
             fill="none"
             stroke="var(--cyan)"
-            strokeWidth={ws.active ? 2.5 : 1}
-            opacity={ws.active ? 0.9 : 0.35}
-            strokeDasharray={ws.active ? undefined : "4,6"}
-            filter={ws.active ? "url(#wire-glow)" : undefined}
+            strokeWidth={active ? 2.5 : 1}
+            opacity={active ? 0.9 : 0.35}
+            strokeDasharray={active ? undefined : "4,6"}
+            filter={active ? "url(#wire-glow)" : undefined}
             style={{
               transition: "stroke-width 0.15s ease, opacity 0.15s ease",
             }}

@@ -190,21 +190,23 @@ export function LossChart({ runId }: LossChartProps) {
         const [mx] = d3.pointer(event);
         const xVal = xScale.invert(mx);
 
-        // Find nearest point
+        // Find nearest point and its index in one pass.
         let nearest: MetricsEvent | null = null;
-        let nearestDist = Infinity;
+        let nearestIdx = -1;
+        let bestDist = Infinity;
         primaryData.forEach((d, i) => {
           const xd = xMode === "step" ? d.step : i;
           const dist = Math.abs(xd - xVal);
-          if (dist < nearestDist) {
-            nearestDist = dist;
+          if (dist < bestDist) {
+            bestDist = dist;
             nearest = d;
+            nearestIdx = i;
           }
         });
 
-        if (nearest) {
+        if (nearest && nearestIdx >= 0) {
           const ne = nearest as MetricsEvent;
-          const xPx = xScale(xMode === "step" ? ne.step : primaryData.indexOf(ne));
+          const xPx = xScale(xMode === "step" ? ne.step : nearestIdx);
           vLine.attr("x1", xPx).attr("x2", xPx).attr("opacity", 0.8);
           setCrosshair({
             x: xPx + MARGIN.left,
