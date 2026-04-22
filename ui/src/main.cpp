@@ -10,7 +10,6 @@
 
 #include <csignal>
 #include <filesystem>
-#include <memory>
 #include <unistd.h>
 
 // Global pointers for SIGTERM handler.
@@ -64,10 +63,19 @@ int main(int /*argc*/, char** argv) {
         phos::log::set_level(phos::log::Level::Debug);
     }
 
-    // Instantiate subsystems.
-    mp_studio::TrainingManager tm(win);
+    // Instantiate subsystems. WsBridge is constructed first so its ref
+    // can be bound into the TrainingManager port-announcement callback.
     mp_studio::WsBridge ws(win);
+    mp_studio::TrainingManager tm(win);
     mp_studio::HfClient hf;
+
+    // When a child sidecar announces its bound monitor port (via the
+    // stdout marker), connect the WsBridge. This replaces the older
+    // pre-allocate-port-and-pass-it dance which had a TOCTOU race.
+    tm.set_port_ready_callback(
+        [&ws](const std::string& run_id, int port) {
+            ws.connect(run_id, port);
+        });
 
     // Store for SIGTERM handler (signal-safe pointers).
     g_tm = &tm;
@@ -76,16 +84,16 @@ int main(int /*argc*/, char** argv) {
     // --- IPC handlers ---
     // Only handlers declared in manifest.toml are registered here.
 
-    // run.start: spawn a training sidecar and connect WsBridge to its monitor port.
+    // run.start: spawn a training sidecar. The monitor port is not
+    // known at return time; WsBridge is connected asynchronously via
+    // the port_ready_cb once the child announces its bound port.
     win.handle("run.start", phos::safe_handler([&](const phos::Json& req) -> phos::Json {
         // Accept either { config: {...} } or the config object directly.
         const auto& config = req.contains("config") ? req["config"] : req;
         auto handle = tm.start(config);
-        ws.connect(handle.run_id, handle.monitor_port);
         return {
             {"run_id", handle.run_id},
-            {"pid", static_cast<int>(handle.pid)},
-            {"monitor_port", handle.monitor_port}
+            {"pid", static_cast<int>(handle.pid)}
         };
     }));
 

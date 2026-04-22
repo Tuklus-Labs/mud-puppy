@@ -20,9 +20,11 @@
 
 namespace mp_studio {
 
-// Fallback port when bind-to-port-0 fails; WsBridge's retry loop will still
-// surface the failure via run_complete if this port is already taken.
-constexpr int DEFAULT_MONITOR_PORT_FALLBACK = 5980;
+// Marker prefix printed by the Python sidecar as its first stdout line
+// once the monitor's aiohttp server has bound a port. We parse it out of
+// the stdout stream and route the port to the WsBridge via the
+// registered callback. See mud_puppy/trainer.py.
+static constexpr const char* MONITOR_PORT_MARKER = "MUD_PUPPY_MONITOR_PORT=";
 
 // Static members.
 TrainingManager* TrainingManager::instance_ = nullptr;
@@ -193,34 +195,24 @@ void TrainingManager::on_child_exit(pid_t pid, int status) {
 // Helpers
 // ---------------------------------------------------------------------------
 
-int TrainingManager::find_free_port() {
-    // Classic bind-to-port-0 trick.  NOTE: there is an unavoidable TOCTOU race
-    // between the close(fd) here and the child's call to listen(); another
-    // process could grab this port in the window between them.  WsBridge's
-    // retry loop (with its retry cap) surfaces the failure via a
-    // run_complete error payload.
-    //
-    // TODO: have the Python child print its actual bound port to stdout on
-    // startup and have the parent read the port from the stdout pipe instead
-    // of assigning it here.
-    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return DEFAULT_MONITOR_PORT_FALLBACK;
+void TrainingManager::set_port_ready_callback(PortReadyCb cb) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    port_ready_cb_ = std::move(cb);
+}
 
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port = 0;
-
-    if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-        ::close(fd);
-        return DEFAULT_MONITOR_PORT_FALLBACK;
+void TrainingManager::on_port_announced(const std::string& run_id, int port) {
+    PortReadyCb cb;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = runs_.find(run_id);
+        if (it != runs_.end()) {
+            it->second.monitor_port = port;
+        }
+        cb = port_ready_cb_;
     }
-
-    socklen_t len = sizeof(addr);
-    ::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len);
-    int port = ntohs(addr.sin_port);
-    ::close(fd);
-    return port;
+    PHOS_LOG_INFO("TrainingManager: run_id={} bound monitor port {}",
+                  run_id, port);
+    if (cb) cb(run_id, port);
 }
 
 std::string TrainingManager::make_run_id() {
@@ -271,7 +263,11 @@ void TrainingManager::cleanup_run(ActiveRun& run) {
 RunHandle TrainingManager::start(const nlohmann::json& config) {
     std::string venv_python = resolve_sidecar_path();
 
-    int monitor_port = find_free_port();
+    // Pass --monitor-port 0 so the child OS-binds an ephemeral port;
+    // it announces the bound port via a stdout marker line which we
+    // parse in read_pipe(). This eliminates the bind(0)/close/rebind
+    // TOCTOU race the previous find_free_port() path had.
+    int monitor_port = 0;
     std::string run_id = make_run_id();
 
     // Build argv from config JSON fields.
@@ -455,8 +451,40 @@ nlohmann::json TrainingManager::list() const {
 // ---------------------------------------------------------------------------
 
 void TrainingManager::read_pipe(int fd, const std::string& run_id, const char* stream) {
+    // Only scan for the monitor-port marker on the stdout stream; we
+    // don't expect Python to print it on stderr, and scanning stderr
+    // would be extra work on every error line.
+    const bool scan_port = (std::strcmp(stream, "stdout") == 0);
+
     std::string buf;
     char chunk[4096];
+    auto dispatch_line = [&](const std::string& line) {
+        // Check for the bound-port announcement before emitting. We
+        // still emit the marker line as a regular log_line so the user
+        // sees it in the Logs pane — it's a perfectly valid progress
+        // message.
+        if (scan_port && line.rfind(MONITOR_PORT_MARKER, 0) == 0) {
+            try {
+                int port = std::stoi(
+                    line.substr(std::strlen(MONITOR_PORT_MARKER)));
+                if (port > 0 && port < 65536) {
+                    on_port_announced(run_id, port);
+                }
+            } catch (const std::exception& exc) {
+                PHOS_LOG_WARN("TrainingManager: bad port marker '{}' ({})",
+                              line, exc.what());
+            }
+        }
+
+        if (!line.empty()) {
+            win_.emit("log_line", {
+                {"run_id", run_id},
+                {"stream", stream},
+                {"line", line}
+            });
+        }
+    };
+
     while (true) {
         ssize_t n = ::read(fd, chunk, sizeof(chunk) - 1);
         if (n <= 0) break;
@@ -467,21 +495,11 @@ void TrainingManager::read_pipe(int fd, const std::string& run_id, const char* s
         while ((pos = buf.find('\n')) != std::string::npos) {
             std::string line = buf.substr(0, pos);
             buf.erase(0, pos + 1);
-            if (!line.empty()) {
-                win_.emit("log_line", {
-                    {"run_id", run_id},
-                    {"stream", stream},
-                    {"line", line}
-                });
-            }
+            dispatch_line(line);
         }
     }
     if (!buf.empty()) {
-        win_.emit("log_line", {
-            {"run_id", run_id},
-            {"stream", stream},
-            {"line", buf}
-        });
+        dispatch_line(buf);
     }
     // fd is closed by caller (cleanup_run) to avoid double-close.
 }

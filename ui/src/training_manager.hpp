@@ -7,12 +7,18 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
 
 namespace mp_studio {
+
+// Callback fired when a sidecar announces its bound monitor port via its
+// stdout marker line "MUD_PUPPY_MONITOR_PORT=<n>". Runs on the stdout
+// reader thread; handler must be thread-safe and non-blocking.
+using PortReadyCb = std::function<void(const std::string& run_id, int port)>;
 
 struct RunHandle {
     std::string run_id;
@@ -25,8 +31,17 @@ public:
     explicit TrainingManager(phos::Window& win);
     ~TrainingManager();
 
+    // Install a callback invoked when a sidecar announces its bound
+    // monitor port. Typically WsBridge::connect. Must be set before
+    // start() is called; calling start() before this is set means the
+    // port announcement is silently dropped.
+    void set_port_ready_callback(PortReadyCb cb);
+
     // Spawn a new training sidecar. config is the JSON training config.
-    // Returns a RunHandle with the assigned run_id and monitor port.
+    // Returns a RunHandle with the assigned run_id. Note: monitor_port
+    // is 0 at return time — the child binds to port 0 and announces its
+    // actual port via the stdout marker, which fires the PortReadyCb
+    // on the stdout reader thread.
     RunHandle start(const nlohmann::json& config);
 
     // Send SIGTERM to the sidecar for run_id. Returns false if not found.
@@ -60,6 +75,7 @@ private:
     phos::Window& win_;
     mutable std::mutex mutex_;
     std::unordered_map<std::string, ActiveRun> runs_;
+    PortReadyCb port_ready_cb_;  // fires when child announces its port
 
     // Monotonic counter for run-id disambiguation (protects against
     // millisecond collisions when two runs start within the same ms).
@@ -75,9 +91,10 @@ private:
     std::thread reaper_thread_;
 
     // Helpers.
-    static int find_free_port();
     std::string make_run_id();
     void read_pipe(int fd, const std::string& run_id, const char* stream);
+    // Record a child's bound port and invoke port_ready_cb_.
+    void on_port_announced(const std::string& run_id, int port);
 
     // SIGCHLD plumbing.
     void start_reaper();
