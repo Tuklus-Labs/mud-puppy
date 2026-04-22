@@ -36,7 +36,11 @@ except ImportError as _jax_import_err:
 from datasets import load_dataset
 from transformers import AutoTokenizer, FlaxAutoModelForCausalLM
 
-from .config import TrainingConfig
+# JAX trainer uses the JAX-specific TrainingConfig (has setup_xla_flags,
+# mesh/sharding fields, etc.), NOT the PyTorch TrainingConfig from
+# mud_puppy/config.py. Importing the wrong one left setup_xla_flags()
+# unreachable and advertised a mismatched type annotation.
+from .jax_config import JaxTrainingConfig as TrainingConfig
 
 
 # Type aliases
