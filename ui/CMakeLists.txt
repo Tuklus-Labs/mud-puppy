@@ -11,7 +11,14 @@ find_package(Phos REQUIRED)
 
 # libsoup-3.0 for WebSocket client (not provided by Phos::Phos)
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(SOUP REQUIRED libsoup-3.0)
+pkg_check_modules(SOUP libsoup-3.0)
+if(NOT SOUP_FOUND)
+    message(FATAL_ERROR
+        "libsoup-3.0 not found. Install with:\n"
+        "  Arch:   sudo pacman -S libsoup3\n"
+        "  Debian: sudo apt install libsoup-3.0-dev\n"
+        "  Fedora: sudo dnf install libsoup3-devel")
+endif()
 
 # libcurl for HF API calls
 find_package(CURL REQUIRED)
