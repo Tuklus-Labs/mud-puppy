@@ -20,7 +20,7 @@ class TrainingConfig:
 
     # High-level method selection
     finetuning_method: str = "full"  # full, lora, qlora, gptq, qat, preference, rl, multimodal, rm, prm, embedding
-    precision: str = "bf16"  # fp16, bf16, fp8
+    precision: str = "bf16"  # fp16, bf16, fp8, fp32
 
     # Optimization hyperparameters
     batch_size: int = 1
@@ -127,7 +127,7 @@ class TrainingConfig:
         if self.finetuning_method not in supported:
             raise ValueError(f"Unsupported finetuning method: {self.finetuning_method}")
 
-        if self.precision not in {"fp16", "bf16", "fp8"}:
+        if self.precision not in {"fp16", "bf16", "fp8", "fp32"}:
             raise ValueError(f"Unsupported precision: {self.precision}")
 
         schedulers = {"linear", "cosine", "cosine_with_restarts", "polynomial"}
