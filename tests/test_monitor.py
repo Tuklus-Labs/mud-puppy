@@ -246,11 +246,21 @@ def test_cli_parser_has_monitor_flags():
 
     build_parser = _cli_mod.build_parser
     parser = build_parser()
-    args = parser.parse_args(["model.bin", "data.jsonl", "--monitor", "--monitor-port", "5981"])
+    # v0.4: --monitor-tui removed, new flags: --pack-sequences, --prefetch-layers, --compile-mode
+    args = parser.parse_args([
+        "model.bin", "data.jsonl",
+        "--monitor", "--monitor-port", "5981",
+        "--pack-sequences",
+        "--prefetch-layers", "3",
+        "--compile-mode", "reduce-overhead",
+    ])
     assert args.monitor is True
     assert args.monitor_port == 5981
-    args2 = parser.parse_args(["model.bin", "data.jsonl", "--monitor-tui"])
-    assert args2.monitor_tui is True
+    assert args.pack_sequences is True
+    assert args.prefetch_layers == 3
+    assert args.compile_mode == "reduce-overhead"
+    # --monitor-tui must NOT exist in v0.4
+    assert not hasattr(args, "monitor_tui")
 
 
 # ------------------------------------------------------------------

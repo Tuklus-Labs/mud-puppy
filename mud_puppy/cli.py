@@ -51,6 +51,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="enable torch.compile for extra speed",
     )
     parser.add_argument(
+        "--compile-mode",
+        dest="compile_mode",
+        default="reduce-overhead",
+        choices=["reduce-overhead", "default", "max-autotune"],
+        help="torch.compile mode (default: reduce-overhead)",
+    )
+    parser.add_argument(
+        "--pack-sequences",
+        dest="pack_sequences",
+        action="store_true",
+        help="enable sequence packing (bin-packs short examples into rows, "
+             "uses block-diagonal attention mask)",
+    )
+    parser.add_argument(
+        "--prefetch-layers",
+        dest="prefetch_layers",
+        type=int,
+        default=2,
+        help="number of transformer layers to keep resident in GPU ring "
+             "when --stream is active (default: 2)",
+    )
+    parser.add_argument(
         "--num-workers",
         dest="num_workers",
         type=int,
@@ -87,6 +109,30 @@ def build_parser() -> argparse.ArgumentParser:
         "--lora-targets",
         dest="lora_targets",
         help="comma separated list of LoRA target modules",
+    )
+    parser.add_argument(
+        "--lora-r",
+        dest="lora_r",
+        type=int,
+        help="LoRA rank (overrides config default)",
+    )
+    parser.add_argument(
+        "--lora-alpha",
+        dest="lora_alpha",
+        type=int,
+        help="LoRA alpha (overrides config default)",
+    )
+    parser.add_argument(
+        "--lora-dropout",
+        dest="lora_dropout",
+        type=float,
+        help="LoRA dropout (overrides config default)",
+    )
+    parser.add_argument(
+        "--no-gradient-checkpointing",
+        dest="no_gradient_checkpointing",
+        action="store_true",
+        help="disable gradient checkpointing",
     )
     parser.add_argument(
         "--resume",
@@ -154,8 +200,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--monitor", dest="monitor", action="store_true",
         help="enable real-time web training dashboard (port 5980)")
-    parser.add_argument("--monitor-tui", dest="monitor_tui", action="store_true",
-        help="enable terminal (Rich) training monitor")
     parser.add_argument("--monitor-port", dest="monitor_port", type=int, default=5980,
         help="port for web training monitor (default: 5980)")
     parser.add_argument(
@@ -213,6 +257,10 @@ def main() -> None:
         precision=args.precision,
         preference=args.preference,
         compile=args.compile,
+        compile_mode=args.compile_mode,
+        pack_sequences=args.pack_sequences,
+        prefetch_layers=args.prefetch_layers,
+        use_gradient_checkpointing=not args.no_gradient_checkpointing,
         dataloader_workers=args.num_workers,
         preprocessing_workers=args.preprocess_workers,
         max_seq_length=args.max_seq_length,
@@ -229,7 +277,6 @@ def main() -> None:
         merge_lora=args.merge_lora,
         merge_precision=args.merge_precision,
         monitor=args.monitor,
-        monitor_tui=args.monitor_tui,
         monitor_port=args.monitor_port,
         distributed=args.distributed,
         local_rank=args.local_rank,
@@ -245,6 +292,12 @@ def main() -> None:
         config_kwargs["learning_rate"] = args.learning_rate
     if args.num_epochs is not None:
         config_kwargs["num_epochs"] = args.num_epochs
+    if args.lora_r is not None:
+        config_kwargs["lora_r"] = args.lora_r
+    if args.lora_alpha is not None:
+        config_kwargs["lora_alpha"] = args.lora_alpha
+    if args.lora_dropout is not None:
+        config_kwargs["lora_dropout"] = args.lora_dropout
 
     if args.lora_targets:
         config_kwargs["lora_target_modules"] = args.lora_targets.split(",")
@@ -263,6 +316,10 @@ def main() -> None:
         from .reward import train_reward_model
 
         train_reward_model(config)
+    elif config.finetuning_method == "embedding":
+        from .embedding import run_embedding_training
+
+        run_embedding_training(config)
     else:
         run_training(config)
 

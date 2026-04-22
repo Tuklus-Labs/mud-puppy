@@ -19,7 +19,7 @@ class TrainingConfig:
     output_dir: str
 
     # High-level method selection
-    finetuning_method: str = "full"  # full, lora, qlora, gptq, qat, preference, rl, multimodal, rm, prm
+    finetuning_method: str = "full"  # full, lora, qlora, gptq, qat, preference, rl, multimodal, rm, prm, embedding
     precision: str = "bf16"  # fp16, bf16, fp8
 
     # Optimization hyperparameters
@@ -32,6 +32,7 @@ class TrainingConfig:
     # LoRA / QLoRA
     lora_r: int = 8
     lora_alpha: int = 16
+    lora_dropout: float = 0.05
     lora_target_modules: Optional[List[str]] = field(
         default_factory=lambda: [
             "q_proj",
@@ -57,13 +58,18 @@ class TrainingConfig:
 
     # Data / preprocessing
     max_seq_length: int = 0  # 0 = use model default (capped at 2048)
+    response_only: bool = True  # Mask prompt tokens in loss (train on response only)
     use_chat_template: bool = True
     trust_remote_code: bool = False
     dataloader_workers: int = 0
     preprocessing_workers: int = 1
 
+    # Sequence packing
+    pack_sequences: bool = False  # Greedy bin-packing collator (v0.4, default-on v0.5)
+
     # System / runtime behavior
     compile: bool = False
+    compile_mode: str = "reduce-overhead"  # torch.compile mode: reduce-overhead, default, max-autotune
     resume: bool = False
     log_with: str = "none"  # none, tensorboard, wandb
     tokens_per_batch: int = 0
@@ -71,6 +77,7 @@ class TrainingConfig:
     early_stopping_patience: int = 0
     device_map: str = "auto"  # auto, pipeline, or HF accelerate-style map
     stream: bool = False
+    prefetch_layers: int = 2  # Number of layers to keep resident in GPU ring
     zero_offload: bool = False
     max_grad_norm: float = 1.0
     distributed: bool = False
@@ -80,9 +87,8 @@ class TrainingConfig:
     merge_lora: bool = False
     merge_precision: str = "bf16"  # fp16, bf16, fp32
 
-    # Monitor
+    # Monitor (web dashboard via WebSocket)
     monitor: bool = False
-    monitor_tui: bool = False
     monitor_port: int = 5980
 
     def _validate_paths(self) -> None:
@@ -92,11 +98,6 @@ class TrainingConfig:
 
     def _validate_combinations(self) -> None:
         """Validate combinations of options that are known to be invalid."""
-        if self.finetuning_method in ("lora", "qlora") and self.stream:
-            raise ValueError(
-                f"Streaming is not supported with {self.finetuning_method.upper()}. "
-                "LoRA modules are added after streaming hooks and won't be properly streamed."
-            )
         if self.tokens_per_batch < 0:
             raise ValueError("tokens_per_batch must be non-negative")
         if self.max_seq_length < 0:
@@ -117,6 +118,7 @@ class TrainingConfig:
             "multimodal",
             "rm",
             "prm",
+            "embedding",
         }
         if self.finetuning_method not in supported:
             raise ValueError(f"Unsupported finetuning method: {self.finetuning_method}")
@@ -135,6 +137,8 @@ class TrainingConfig:
 
         if self.log_with not in {"none", "tensorboard", "wandb"}:
             raise ValueError(f"Unsupported logging backend: {self.log_with}")
+        if not 0.0 <= self.lora_dropout <= 1.0:
+            raise ValueError("lora_dropout must be between 0.0 and 1.0")
 
         self._validate_paths()
         self._validate_combinations()
