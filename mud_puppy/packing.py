@@ -50,6 +50,20 @@ class PackedCollator:
 
     def __call__(self, examples: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         """Collate a list of examples into a packed batch."""
+        # --- Fail loudly if upstream tokenization forgot to produce labels ---
+        for i, ex in enumerate(examples):
+            if "labels" not in ex:
+                raise KeyError(
+                    f"example {i} missing 'labels' key; upstream tokenizer "
+                    "must populate labels before packing. "
+                    "See mud_puppy.trainer.tokenize_chat, which clones "
+                    "input_ids into labels."
+                )
+            if "input_ids" not in ex:
+                raise KeyError(
+                    f"example {i} missing 'input_ids' key"
+                )
+
         # --- Greedy first-fit bin-packing ---
         rows: List[List[Dict[str, Any]]] = []
         cur: List[Dict[str, Any]] = []

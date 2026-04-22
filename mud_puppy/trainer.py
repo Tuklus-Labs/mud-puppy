@@ -637,6 +637,14 @@ def load_and_preprocess_dataset(
         # Add length column for dynamic batching
         tokenized["length"] = [len(ids) for ids in tokenized["input_ids"]]
 
+        # Populate labels for causal LM training. PackedCollator (and the
+        # standard data collator without label shifting) requires labels to
+        # exist up-front; HuggingFace's Trainer shifts internally at loss
+        # time, so we clone input_ids here and let the model handle the
+        # shift. Downstream masking (response-only, prompt masking) can
+        # overwrite these values with -100 as needed.
+        tokenized["labels"] = [list(ids) for ids in tokenized["input_ids"]]
+
         return tokenized
 
     # Apply tokenization
@@ -648,8 +656,13 @@ def load_and_preprocess_dataset(
         desc="Tokenizing dataset",
     )
 
-    # Set format for PyTorch
-    dataset.set_format(type="torch", columns=["input_ids", "attention_mask"])
+    # Set format for PyTorch. Retain "labels" (required by collators +
+    # PackedCollator) and "length" (required by DynamicBatchSampler when
+    # tokens_per_batch > 0).
+    format_columns = ["input_ids", "attention_mask", "labels"]
+    if getattr(config, "tokens_per_batch", 0) > 0:
+        format_columns.append("length")
+    dataset.set_format(type="torch", columns=format_columns)
 
     return dataset
 
