@@ -296,86 +296,6 @@ class DynamicBatchSampler(Sampler):
         return max(1, total_tokens // self.tokens_per_batch)
 
 
-class ZeroOffloadCallback(TrainerCallback):
-    """Callback to offload optimizer states to CPU memory.
-
-    This is a ROCm-native implementation of ZeRO-Offload that doesn't
-    require DeepSpeed (which is CUDA-only).
-
-    The approach:
-    - After each optimizer step, move optimizer states to CPU
-    - Before each step, states are automatically moved back as needed
-    - This saves VRAM between steps (optimizer states are 2x model size for Adam)
-    """
-
-    def __init__(self):
-        self._optimizer_wrapped = False
-        self._cpu_states = {}
-        self._cpu = torch.device("cpu")
-        self._gpu = torch.device("cuda") if torch.cuda.is_available() else self._cpu
-
-    def on_train_begin(self, args, state, control, model=None, **kwargs):
-        """Initialize CPU offload structures."""
-        print("[mud-puppy] ZeRO-Offload enabled (ROCm-native)")
-
-    def on_step_end(self, args, state, control, model=None, optimizer=None, **kwargs):
-        """After optimizer step, offload states to CPU."""
-        if optimizer is None:
-            return
-
-        # Move optimizer states to CPU to free VRAM
-        for group in optimizer.param_groups:
-            for param in group["params"]:
-                if param not in optimizer.state:
-                    continue
-
-                opt_state = optimizer.state[param]
-                pid = id(param)
-
-                # Initialize CPU storage for this param
-                if pid not in self._cpu_states:
-                    self._cpu_states[pid] = {}
-
-                # Move each state tensor to CPU
-                for key, val in opt_state.items():
-                    if isinstance(val, torch.Tensor) and val.device.type == "cuda":
-                        # Move to CPU (pinned memory for faster transfer back)
-                        if pid not in self._cpu_states or key not in self._cpu_states[pid]:
-                            cpu_tensor = torch.empty(
-                                val.shape, dtype=val.dtype, device=self._cpu,
-                                pin_memory=True
-                            )
-                            self._cpu_states[pid][key] = cpu_tensor
-
-                        self._cpu_states[pid][key].copy_(val, non_blocking=True)
-                        opt_state[key] = self._cpu_states[pid][key]
-
-        # Sync before clearing cache: non-blocking copies above must complete
-        # before the CPU tensors are read in on_step_begin.
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-
-    def on_step_begin(self, args, state, control, model=None, optimizer=None, **kwargs):
-        """Before optimizer step, move states back to GPU."""
-        if optimizer is None:
-            return
-
-        # Move optimizer states back to GPU for the step
-        for group in optimizer.param_groups:
-            for param in group["params"]:
-                if param not in optimizer.state:
-                    continue
-
-                opt_state = optimizer.state[param]
-
-                for key, val in opt_state.items():
-                    if isinstance(val, torch.Tensor) and val.device.type == "cpu":
-                        # Move back to GPU
-                        gpu_tensor = val.to(self._gpu, non_blocking=True)
-                        opt_state[key] = gpu_tensor
-
-
 class LoggingCallback(TrainerCallback):
     """Enhanced logging callback for mud-puppy."""
 
@@ -390,11 +310,22 @@ class LoggingCallback(TrainerCallback):
 
 
 class MudPuppyTrainer(Trainer):
-    """Trainer with optional token-budget dynamic batching."""
+    """Trainer with optional token-budget dynamic batching and CPU offload."""
 
-    def __init__(self, *args, tokens_per_batch: int = 0, **kwargs):
+    def __init__(self, *args, tokens_per_batch: int = 0,
+                 mudpuppy_zero_offload: bool = False, **kwargs):
         self.tokens_per_batch = tokens_per_batch
+        self._mudpuppy_zero_offload = mudpuppy_zero_offload
         super().__init__(*args, **kwargs)
+
+    def create_optimizer(self):
+        """Create optimizer, wrapping with CPUOffloadOptimizer when requested."""
+        opt = super().create_optimizer()
+        if self._mudpuppy_zero_offload:
+            from .zero_offload import wrap_optimizer_for_offload
+            opt = wrap_optimizer_for_offload(opt)
+            print("[mud-puppy] ZeRO-Offload enabled via CPUOffloadOptimizer")
+        return opt
 
     def get_train_dataloader(self) -> DataLoader:
         if self.train_dataset is None:
@@ -963,8 +894,7 @@ def run_training(config: TrainingConfig) -> None:
             EarlyStoppingCallback(early_stopping_patience=config.early_stopping_patience)
         )
 
-    if config.zero_offload:
-        callbacks.append(ZeroOffloadCallback())
+    # zero_offload is wired via MudPuppyTrainer.create_optimizer, not a callback
 
     # Monitor callback (web dashboard and/or TUI)
     monitor_server = None
@@ -1024,6 +954,7 @@ def run_training(config: TrainingConfig) -> None:
 
     trainer = MudPuppyTrainer(
         tokens_per_batch=config.tokens_per_batch,
+        mudpuppy_zero_offload=config.zero_offload,
         **trainer_kwargs,
     )
 
