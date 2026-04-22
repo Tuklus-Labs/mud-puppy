@@ -9,7 +9,9 @@
 #include <curl/curl.h>
 
 #include <csignal>
+#include <filesystem>
 #include <memory>
+#include <unistd.h>
 
 // Global pointers for SIGTERM handler.
 static mp_studio::TrainingManager* g_tm = nullptr;
@@ -25,7 +27,19 @@ static void handle_sigterm(int) {
     }, nullptr);
 }
 
-int main(int /*argc*/, char** /*argv*/) {
+int main(int /*argc*/, char** argv) {
+    // Phos resolves asset_dir and manifest paths relative to the CWD.
+    // To make the binary runnable from any directory, chdir to the
+    // directory containing argv[0] (where manifest.toml and web/dist/
+    // are staged by CMake).
+    try {
+        std::filesystem::path exe_path = std::filesystem::canonical(argv[0]);
+        std::filesystem::current_path(exe_path.parent_path());
+    } catch (const std::exception& exc) {
+        // Non-fatal: fall back to whatever CWD the user supplied.
+        PHOS_LOG_WARN("Could not chdir to binary directory: {}", exc.what());
+    }
+
     // Ignore SIGPIPE (broken pipe from sidecar stderr).
     signal(SIGPIPE, SIG_IGN);
 
