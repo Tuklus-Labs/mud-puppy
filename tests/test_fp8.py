@@ -232,3 +232,37 @@ def test_amax_never_decays_below_epsilon():
     # Verify the scale is still finite (not inf).
     scale = fp8._compute_scale(fp8.input_amax)
     assert torch.isfinite(scale), f"scale is not finite after amax floor: {scale}"
+
+
+# ---------------------------------------------------------------------------
+# A1: NaN amax protection
+# ---------------------------------------------------------------------------
+
+
+def test_amax_nan_weight_stays_finite():
+    """Feeding a NaN weight must not corrupt the amax buffer.
+
+    torch.clamp and torch.maximum both propagate NaN, so without nan_to_num
+    in _update_amax a single NaN in the weight tensor would permanently
+    poison the stored amax and all subsequent forward passes.
+    """
+    from mud_puppy.fp8_rocm import _AMAX_EPS
+
+    torch.manual_seed(6)
+    lin = nn.Linear(8, 8)
+    fp8 = FP8Linear(lin)
+
+    # Inject NaN directly into the master weight.
+    with torch.no_grad():
+        fp8.weight[0, 0] = float("nan")
+
+    x = torch.randn(4, 8)
+    # Must not raise; amax buffers must stay finite after the forward pass.
+    _ = fp8(x)
+
+    assert torch.isfinite(fp8.weight_amax), (
+        f"weight_amax became non-finite after NaN weight: {fp8.weight_amax.item()}"
+    )
+    assert fp8.weight_amax.item() >= _AMAX_EPS, (
+        f"weight_amax fell below _AMAX_EPS={_AMAX_EPS}: {fp8.weight_amax.item()}"
+    )

@@ -172,9 +172,19 @@ class FP8Linear(nn.Module):
         weights during warmup), the exponential decay drives buf -> 0 after
         ~150 steps, which makes _compute_scale blow up to infinity and poisons
         all subsequent forward passes with NaN/Inf outputs.
+
+        A1 fix: sanitize NaN/Inf in new_amax before the EMA. torch.clamp and
+        torch.maximum both propagate NaN (clamp(NaN, min=x) == NaN), so a
+        single NaN weight would permanently corrupt the amax buffer.
         """
+        new_amax = torch.nan_to_num(
+            new_amax.detach(),
+            nan=_AMAX_EPS,
+            posinf=_FP8_E4M3_MAX,
+            neginf=_AMAX_EPS,
+        )
         decayed = buf * self.amax_momentum
-        buf.copy_(torch.maximum(decayed, new_amax.detach()).clamp(min=_AMAX_EPS))
+        buf.copy_(torch.maximum(decayed, new_amax).clamp(min=_AMAX_EPS))
 
     # ------------------------------------------------------------------
     # Forward

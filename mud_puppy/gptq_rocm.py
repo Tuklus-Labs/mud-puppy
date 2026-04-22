@@ -183,6 +183,10 @@ def unpack_int4(
     w:
         Tensor [out_features, in_features], dtype int8, values in [-8, 7].
     """
+    # A2: guard against empty tensors (mirrors pack_int4's empty-tensor guard).
+    if packed.numel() == 0:
+        return torch.empty(out_features, in_features, dtype=torch.int8, device=packed.device)
+
     even = (packed & 0x0F).to(torch.int32) - 8
     odd = ((packed >> 4) & 0x0F).to(torch.int32) - 8
     # Interleave: [even0, odd0, even1, odd1, ...]

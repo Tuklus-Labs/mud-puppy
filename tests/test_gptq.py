@@ -142,6 +142,17 @@ class TestInt4PackUnpack:
         assert unpacked.shape == (out_f, in_f)
         assert (unpacked == w).all(), "Odd-column pack/unpack lost values"
 
+    def test_pack_unpack_empty_tensor_roundtrip(self):
+        """A2: pack_int4 -> unpack_int4 on an empty tensor must not crash."""
+        out_f, in_f = 0, 0
+        w = torch.empty(out_f, in_f, dtype=torch.int8)
+        packed = pack_int4(w)
+        assert packed.numel() == 0, "pack_int4 of empty tensor must return empty"
+        unpacked = unpack_int4(packed, out_f, in_f)
+        assert unpacked.shape == (out_f, in_f), (
+            f"unpack_int4 of empty tensor returned wrong shape: {unpacked.shape}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # 3. Group-size quantization
