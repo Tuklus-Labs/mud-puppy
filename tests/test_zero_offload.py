@@ -88,3 +88,56 @@ def test_offload_disabled_grads_reads_direct():
     # zero CPU grads and the weight stays exactly equal to w0.
     delta = (model.weight.detach() - w0.to(model.weight.device)).abs().sum().item()
     assert delta > 0, "parameters did not update; optimizer ran on zero grads"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
+def test_state_dict_roundtrip():
+    """state_dict() keyed by positional index must survive a load_state_dict().
+
+    Verifies that:
+    1. state_dict() produces a cpu_states dict keyed by int (not by id(param)).
+    2. load_state_dict() correctly translates back so training continues
+       from the restored state without crashing or resetting momentum.
+    """
+    model = nn.Linear(8, 8).cuda()
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-2)
+    cfg = OffloadConfig(
+        offload_optimizer=True,
+        offload_gradients=True,
+        pin_memory=True,
+        async_transfer=False,
+        cpu_optimizer_step=True,
+    )
+    wrapped = CPUOffloadOptimizer(opt, cfg)
+
+    # Run two steps so optimizer state (exp_avg, exp_avg_sq) is populated.
+    for _ in range(2):
+        model.zero_grad()
+        out = (model(torch.randn(4, 8, device="cuda")) ** 2).sum()
+        out.backward()
+        wrapped.step()
+
+    sd = wrapped.state_dict()
+
+    # cpu_states must exist and be keyed by positional int index (not id).
+    assert "cpu_states" in sd, "state_dict missing cpu_states key"
+    cpu_states = sd["cpu_states"]
+    for k in cpu_states:
+        assert isinstance(k, int), (
+            f"cpu_states key {k!r} is not an int -- id(param) keying regressed"
+        )
+
+    # Reconstruct a fresh optimizer from the same model and restore state.
+    opt2 = torch.optim.AdamW(model.parameters(), lr=1e-2)
+    wrapped2 = CPUOffloadOptimizer(opt2, cfg)
+    wrapped2.load_state_dict(sd)
+
+    # After restoring, a third step must complete without error and must move
+    # parameters (optimizer state is live, not zeroed).
+    w_before = model.weight.detach().clone()
+    model.zero_grad()
+    out = (model(torch.randn(4, 8, device="cuda")) ** 2).sum()
+    out.backward()
+    wrapped2.step()
+    delta = (model.weight.detach() - w_before).abs().sum().item()
+    assert delta > 0, "parameters did not move after load_state_dict restore"

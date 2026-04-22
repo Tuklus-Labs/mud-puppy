@@ -139,3 +139,33 @@ def test_streamer_pins_lora_adapters():
     # Second forward pass: full eviction cycle repeats.
     _ = inner(x)
     _assert_lora_on_gpu("post-second-forward")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
+def test_streamer_stats_returns_expected_keys():
+    """LayerStreamer.stats() must return the keys consumed by the Monitor pane.
+
+    Verifies the contract between LayerStreamer and the frontend StreamStatsEvent
+    shape (layers_total, layers_resident, h2d_bandwidth_gbps, prefetch_hit_rate).
+    """
+    model = ToyTransformer(n_layers=4, dim=64)
+    streamer = LayerStreamer(model, prefetch_layers=2)
+
+    s = streamer.stats()
+
+    required_keys = {"layers_total", "layers_resident", "h2d_bandwidth_gbps", "prefetch_hit_rate"}
+    missing = required_keys - set(s.keys())
+    assert not missing, f"stats() missing keys: {missing}"
+
+    assert isinstance(s["layers_total"], int), "layers_total must be int"
+    assert isinstance(s["layers_resident"], int), "layers_resident must be int"
+    assert isinstance(s["h2d_bandwidth_gbps"], float), "h2d_bandwidth_gbps must be float"
+    assert isinstance(s["prefetch_hit_rate"], float), "prefetch_hit_rate must be float"
+
+    assert s["layers_total"] == 4, f"Expected 4 layers, got {s['layers_total']}"
+    assert 0.0 <= s["prefetch_hit_rate"] <= 1.0, (
+        f"prefetch_hit_rate {s['prefetch_hit_rate']} out of [0,1] range"
+    )
+    assert s["h2d_bandwidth_gbps"] >= 0.0, (
+        f"h2d_bandwidth_gbps {s['h2d_bandwidth_gbps']} should be non-negative"
+    )
