@@ -220,18 +220,32 @@ class MonitorServer:
         self._thread: Optional[threading.Thread] = None
         self._runner: Any = None  # aiohttp.web.AppRunner
         self._running = threading.Event()
+        # Captured from the worker thread on startup failure (e.g. aiohttp
+        # missing) so start() can re-raise synchronously.
+        self._start_error: Optional[BaseException] = None
 
     # -- lifecycle ----------------------------------------------------------
 
     def start(self) -> None:
-        """Start the server in a background daemon thread."""
+        """Start the server in a background daemon thread.
+
+        If the worker thread fails during import/setup (e.g. aiohttp
+        missing), the captured exception is re-raised here so the caller
+        sees a real error instead of a silent no-op.
+        """
         if self._thread is not None and self._thread.is_alive():
             return
 
+        self._start_error = None
         self._thread = threading.Thread(target=self._run, daemon=True, name="monitor-ws")
         self._thread.start()
-        # Wait for the server to be ready (up to 5s)
+        # Wait for the server to be ready (up to 5s); _running is set on
+        # both success and startup-failure paths so we unblock promptly.
         self._running.wait(timeout=5.0)
+        if self._start_error is not None:
+            err, self._start_error = self._start_error, None
+            self._running.clear()
+            raise err
 
     def stop(self) -> None:
         """Gracefully shut down the server."""
@@ -261,7 +275,14 @@ class MonitorServer:
         """Entry point for the daemon thread."""
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
-        self._loop.run_until_complete(self._serve())
+        try:
+            self._loop.run_until_complete(self._serve())
+        except BaseException as exc:  # noqa: BLE001 -- capture for main thread
+            # Record the failure and unblock start()'s wait so the caller
+            # can re-raise. Using _running.set() here is a signal only;
+            # start() checks _start_error first.
+            self._start_error = exc
+            self._running.set()
 
     async def _serve(self) -> None:
         """Set up and run the aiohttp application."""
@@ -275,6 +296,13 @@ class MonitorServer:
         await self._runner.setup()
         site = web.TCPSite(self._runner, "0.0.0.0", self.port)
         await site.start()
+        # Record the actual bound port (useful when port=0 is passed).
+        try:
+            sockets = site._server.sockets if site._server is not None else []
+            if sockets:
+                self.port = sockets[0].getsockname()[1]
+        except Exception as exc:
+            log.debug("could not read bound socket port: %s", exc)
         log.info("MonitorServer listening on port %d", self.port)
         self._running.set()
 
