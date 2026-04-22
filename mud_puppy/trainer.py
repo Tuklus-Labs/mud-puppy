@@ -6,6 +6,7 @@ specialized trainers for features like dynamic batching and layer streaming.
 
 import os
 import logging
+import warnings
 
 # Favor ROCm-friendly allocator behavior by default
 os.environ.setdefault("PYTORCH_HIP_ALLOC_CONF", "expandable_segments:True")
@@ -829,39 +830,64 @@ def setup_distributed(config: TrainingConfig) -> bool:
 
 
 def setup_pipeline_parallelism(model: nn.Module, config: TrainingConfig) -> nn.Module:
-    """Set up pipeline parallelism if requested."""
+    """Set up pipeline parallelism if requested.
+
+    .. deprecated::
+        The ``torch.distributed.pipeline.sync.Pipe`` API this helper wraps
+        is deprecated upstream in PyTorch 2.4+ (replaced by
+        ``torch.distributed.pipelining``). Single-GPU is the primary
+        target for mud-puppy on the 7900 XTX; real multi-GPU pipeline
+        parallelism will be re-implemented against the new API in a
+        future release.
+
+    Current behavior is a hard fail if the host has fewer than 2 GPUs
+    or if the deprecated API is not importable. This replaces the
+    previous silent-fallback path that looked like it was doing
+    something when it wasn't.
+    """
     if config.device_map != "pipeline":
         return model
 
-    if Pipe is None:
-        print(
-            "[mud-puppy] Warning: torch.distributed.pipeline not available, "
-            "falling back to standard model parallelism"
+    num_gpus = torch.cuda.device_count()
+    if num_gpus < 2:
+        raise RuntimeError(
+            "Pipeline parallelism requires >=2 GPUs; detected "
+            f"{num_gpus}. On single-GPU setups use --stream for layer "
+            "streaming instead."
         )
-        return model
 
-    # Get the model's layers
+    if Pipe is None:
+        raise RuntimeError(
+            "Pipeline parallelism requires torch.distributed.pipeline.sync.Pipe "
+            "which is not available in this PyTorch build. This API is also "
+            "deprecated upstream in torch>=2.4; support for the new "
+            "torch.distributed.pipelining will land in a future mud-puppy "
+            "release."
+        )
+
+    warnings.warn(
+        "setup_pipeline_parallelism uses the deprecated "
+        "torch.distributed.pipeline.sync.Pipe API. It works on torch<2.4 but "
+        "will be removed when PyTorch drops the old API. Prefer LayerStreamer "
+        "(--stream) on single-GPU or wait for the torch.distributed.pipelining "
+        "port.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+
+    # Find the layer list.
     if hasattr(model, "model") and hasattr(model.model, "layers"):
         layers = model.model.layers
     elif hasattr(model, "transformer") and hasattr(model.transformer, "h"):
         layers = model.transformer.h
     else:
-        print(
-            "[mud-puppy] Warning: Could not identify model layers for pipeline "
-            "parallelism, falling back to standard parallelism"
+        raise RuntimeError(
+            "Pipeline parallelism: could not identify transformer block "
+            "list (looked for model.model.layers and model.transformer.h). "
+            "Architecture not supported by this path."
         )
-        return model
 
-    # Determine number of GPUs
-    num_gpus = torch.cuda.device_count()
-    if num_gpus < 2:
-        print("[mud-puppy] Pipeline parallelism requires at least 2 GPUs")
-        return model
-
-    # Split layers across GPUs
     layers_per_gpu = len(layers) // num_gpus
-
-    # Create sequential module for pipeline
     chunks = []
     for i in range(num_gpus):
         start_idx = i * layers_per_gpu
@@ -869,13 +895,10 @@ def setup_pipeline_parallelism(model: nn.Module, config: TrainingConfig) -> nn.M
         chunk_layers = nn.Sequential(*[layers[j] for j in range(start_idx, end_idx)])
         chunks.append(chunk_layers.to(f"cuda:{i}"))
 
-    try:
-        pipe_model = Pipe(nn.Sequential(*chunks), chunks=num_gpus)
-        print(f"[mud-puppy] Pipeline parallelism enabled across {num_gpus} GPUs")
-        return pipe_model
-    except Exception as e:
-        print(f"[mud-puppy] Failed to create pipeline: {e}")
-        return model
+    pipe_model = Pipe(nn.Sequential(*chunks), chunks=num_gpus)
+    print(f"[mud-puppy] Pipeline parallelism enabled across {num_gpus} GPUs "
+          "(DEPRECATED API path)")
+    return pipe_model
 
 
 def run_training(config: TrainingConfig) -> None:

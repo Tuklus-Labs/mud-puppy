@@ -18,7 +18,7 @@ Read the [design whitepaper](https://tukluslabs.com/whitepaper-mud-puppy.html) f
 - **ROCm kernels** including qgemm/fbgemm, quantization helpers, and a quantized layernorm (naive but portable implementations)
 - **Preference tuning** with DPO, IPO, KTO, and ORPO using the `trl` library
 - **Reinforcement Learning** through native `GRPOTrainer` (with PPO fallback)
-- **Multimodal support** (experimental flag; currently routes through the standard trainer)
+- **Multimodal training** for vision-language models (LLaVA, Phi-3-vision, InternVL, Qwen2-VL) with full image-text collation via `AutoProcessor`
 - **Reward Modelling** / **Process Reward Modelling** for ranking models
 
 ## Installation
@@ -94,6 +94,97 @@ mud-puppy your-model rewards.jsonl --method rm --output ./reward-model
 # Process reward model
 mud-puppy your-model prm_data.jsonl --method prm --output ./prm-model
 ```
+
+### Multimodal Training
+
+Fine-tune vision-language models on image-text instruction datasets.
+
+```bash
+# LLaVA-1.5 fine-tuning on LLaVA-conversations JSONL
+mud-puppy llava-hf/llava-1.5-7b-hf data.jsonl \
+    --method multimodal --output ./multimodal-out
+
+# Phi-3-vision (requires trust_remote_code)
+mud-puppy microsoft/Phi-3-vision-128k-instruct data.jsonl \
+    --method multimodal --trust-remote-code --output ./phi3-vision-out
+
+# Qwen2-VL
+mud-puppy Qwen/Qwen2-VL-7B-Instruct data.jsonl \
+    --method multimodal --output ./qwen2vl-out
+
+# With LoRA for memory-efficient multimodal fine-tuning (coming: multimodal+lora)
+mud-puppy llava-hf/llava-1.5-7b-hf data.jsonl \
+    --method multimodal --precision bf16 \
+    --batch-size 1 --gradient-accumulation 16 \
+    --output ./multimodal-lora
+```
+
+#### Supported Models
+
+| Model | Hub path | trust-remote-code |
+|-------|----------|:-----------------:|
+| LLaVA-1.5 7B | `llava-hf/llava-1.5-7b-hf` | no |
+| LLaVA-1.5 13B | `llava-hf/llava-1.5-13b-hf` | no |
+| Phi-3-vision 128k | `microsoft/Phi-3-vision-128k-instruct` | yes |
+| Qwen2-VL 7B | `Qwen/Qwen2-VL-7B-Instruct` | no |
+| InternVL2 8B | `OpenGVLab/InternVL2-8B` | yes |
+
+#### Dataset Formats
+
+Three JSONL schemas are auto-detected by column names.
+
+**LLaVA-conversations** (`image` + `conversations` columns):
+
+```json
+{"image": "coco/000001.jpg", "conversations": [
+  {"from": "human", "value": "<image>\nWhat is in this image?"},
+  {"from": "gpt",   "value": "A cat on a windowsill."}
+]}
+```
+
+**HF chat-messages with image refs** (`messages` column):
+
+```json
+{"messages": [
+  {"role": "user", "content": [
+    {"type": "image", "image": "path/to/file.png"},
+    {"type": "text",  "text": "Describe this."}
+  ]},
+  {"role": "assistant", "content": [{"type": "text", "text": "A cat."}]}
+]}
+```
+
+**Simple instruction-with-image** (`image` + `instruction`/`response` columns):
+
+```json
+{"image": "file.jpg", "instruction": "What is in this image?", "response": "A cat."}
+```
+
+Relative image paths are resolved against the directory of the JSONL file.
+Absolute paths and `data:image/...;base64,...` URIs are also supported.
+
+#### Memory Estimates (7B VLM, bf16)
+
+| Config | Approx VRAM |
+|--------|-------------|
+| Full fine-tune, batch 1 | ~22 GB |
+| Full fine-tune + gradient checkpointing | ~18 GB |
+| QLoRA base + LoRA on language head only | ~12 GB |
+
+The 7900 XTX (24 GB) handles 7B multimodal full fine-tuning with gradient
+checkpointing enabled (the default).
+
+#### Caveats
+
+- LoRA/QLoRA combined with `--method multimodal` is not yet supported
+  (the LoRA target-module autodetect does not cover vision encoder layers).
+  Use full fine-tuning or file a PR with your VLM's target module list.
+- Mixed image-text streaming training (`--stream`) is not tested with
+  multimodal; the `MultimodalCollator` must have all images accessible on
+  the local filesystem before a training step.
+- `--pack-sequences` is mutually exclusive with multimodal; variable image
+  sizes make token packing non-trivial. The CLI will fall back to
+  `MultimodalCollator` automatically even if `--pack-sequences` is set.
 
 ### Quantization
 
