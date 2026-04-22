@@ -5,12 +5,15 @@ specialized trainers for features like dynamic batching and layer streaming.
 """
 
 import os
+import logging
 
 # Favor ROCm-friendly allocator behavior by default
 os.environ.setdefault("PYTORCH_HIP_ALLOC_CONF", "expandable_segments:True")
 
 from typing import Dict, List, Optional, Iterator, Any
 import random
+
+log = logging.getLogger(__name__)
 from torch.utils.data import Sampler, DataLoader, Dataset
 
 import torch
@@ -754,6 +757,18 @@ def run_training(config: TrainingConfig) -> None:
     # Create output directory
     os.makedirs(config.output_dir, exist_ok=True)
 
+    # Streaming + gradient_checkpointing is unsafe. During backward,
+    # checkpoint recomputation re-invokes the forward hooks installed by
+    # LayerStreamer; a concurrent prefetch/eviction can rip weights out
+    # from under an in-flight recomputation. Fail fast rather than silently
+    # training on corrupted gradients.
+    if config.stream and config.use_gradient_checkpointing:
+        raise RuntimeError(
+            "LayerStreamer is incompatible with gradient checkpointing "
+            "(recomputation races against ring eviction). "
+            "Disable --use-gradient-checkpointing or --stream."
+        )
+
     # Load model and tokenizer
     model, tokenizer = load_model(config)
 
@@ -776,7 +791,7 @@ def run_training(config: TrainingConfig) -> None:
         print(f"[mud-puppy] Compiling model with torch.compile (mode={config.compile_mode})...")
         model = torch.compile(model, mode=config.compile_mode)
     elif config.compile and config.stream:
-        print("[mud-puppy] torch.compile disabled when --stream is active")
+        log.warning("torch.compile disabled when --stream is active")
 
     # Load and preprocess dataset
     dataset = load_and_preprocess_dataset(config, tokenizer)
