@@ -135,3 +135,61 @@ def test_packed_collator_truncates_mixed_oversized_and_normal():
     assert batch["input_ids"][0, :max_seq].tolist() == list(range(100, 100 + max_seq)), (
         "Oversized example not truncated to first max_seq tokens"
     )
+
+
+# ---------------------------------------------------------------------------
+# E1: empty examples guard
+# ---------------------------------------------------------------------------
+
+def test_packed_collator_raises_on_empty_batch():
+    """PackedCollator must raise ValueError (not crash with cryptic error) when
+    given an empty list of examples."""
+    coll = PackedCollator(max_seq_length=16, pad_to_multiple_of=8)
+    with pytest.raises(ValueError, match="empty"):
+        coll([])
+
+
+# ---------------------------------------------------------------------------
+# E2: attention mask dtype is int8 (memory-efficient)
+# ---------------------------------------------------------------------------
+
+def test_packed_collator_attention_mask_dtype_is_int8():
+    """The block-diagonal attention mask must use int8 dtype, not int64.
+
+    At large sequence lengths (e.g. seq=8192, B=32), int64 uses 16 GB while
+    int8 uses 2 GB. The dtype change cuts mask memory by 8x.
+    """
+    examples = [
+        {"input_ids": [1, 2, 3], "attention_mask": [1, 1, 1], "labels": [1, 2, 3]},
+        {"input_ids": [4, 5],   "attention_mask": [1, 1],   "labels": [4, 5]},
+    ]
+    coll = PackedCollator(max_seq_length=16, pad_to_multiple_of=8)
+    batch = coll(examples)
+    assert batch["attention_mask"].dtype == torch.int8, (
+        f"Expected int8 attention_mask, got {batch['attention_mask'].dtype}"
+    )
+
+
+def test_packed_collator_all_oversized_mask_dtype_and_bounded():
+    """All-oversized examples: each goes in its own row (truncated to max_seq).
+    Verify dtype stays int8 and the batch doesn't balloon in size.
+    """
+    max_seq = 4
+    batch_size = 8
+    # 8 examples each of length 10 -- all exceed max_seq, each truncated to 4
+    examples = [
+        {
+            "input_ids": list(range(i * 10, i * 10 + 10)),
+            "attention_mask": [1] * 10,
+            "labels": list(range(i * 10, i * 10 + 10)),
+        }
+        for i in range(batch_size)
+    ]
+    coll = PackedCollator(max_seq_length=max_seq, pad_to_multiple_of=1)
+    batch = coll(examples)
+
+    mask = batch["attention_mask"]
+    assert mask.dtype == torch.int8, f"Expected int8, got {mask.dtype}"
+    # Memory: 8 rows * 4 * 4 * 1 byte = 128 bytes; not the 4+ KB int64 would use
+    assert mask.numel() == batch_size * max_seq * max_seq
+    assert mask.element_size() == 1  # int8 is 1 byte

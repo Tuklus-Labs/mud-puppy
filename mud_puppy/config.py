@@ -150,5 +150,24 @@ class TrainingConfig:
                 "Must be one of: default, reduce-overhead, max-autotune"
             )
 
+        # G1: numeric sanity checks -- catch obvious mis-configs before any
+        # GPU memory is allocated.
+        if self.batch_size <= 0:
+            raise ValueError(f"batch_size must be > 0, got {self.batch_size}")
+        if self.num_epochs <= 0:
+            raise ValueError(f"num_epochs must be > 0, got {self.num_epochs}")
+        if self.learning_rate <= 0:
+            raise ValueError(f"learning_rate must be > 0, got {self.learning_rate}")
+        if self.finetuning_method in {"lora", "qlora"} and self.lora_r <= 0:
+            raise ValueError(
+                f"lora_r must be > 0 for method={self.finetuning_method!r}, "
+                f"got {self.lora_r}"
+            )
+        if self.max_seq_length < 0:
+            raise ValueError(
+                f"max_seq_length must be >= 0 (0 means use model default), "
+                f"got {self.max_seq_length}"
+            )
+
         self._validate_paths()
         self._validate_combinations()

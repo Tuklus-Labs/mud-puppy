@@ -165,11 +165,16 @@ class FP8Linear(nn.Module):
 
     @torch.no_grad()
     def _update_amax(self, buf: torch.Tensor, new_amax: torch.Tensor) -> None:
-        """EMA update of an amax buffer with the observed max."""
-        # Use max() rather than EMA for conservatism on spikes, then
-        # decay slowly so the scale can recover after a transient.
+        """EMA update of an amax buffer with the observed max.
+
+        C6 fix: clamp the stored amax at _AMAX_EPS so it can never decay to
+        exactly zero. Without the floor, if new_amax stays at 0 (e.g. all-zero
+        weights during warmup), the exponential decay drives buf -> 0 after
+        ~150 steps, which makes _compute_scale blow up to infinity and poisons
+        all subsequent forward passes with NaN/Inf outputs.
+        """
         decayed = buf * self.amax_momentum
-        buf.copy_(torch.maximum(decayed, new_amax.detach()))
+        buf.copy_(torch.maximum(decayed, new_amax.detach()).clamp(min=_AMAX_EPS))
 
     # ------------------------------------------------------------------
     # Forward

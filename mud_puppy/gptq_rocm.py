@@ -144,6 +144,10 @@ def pack_int4(w: torch.Tensor) -> torch.Tensor:
     packed:
         Tensor [out_features, ceil(in_features / 2)], dtype uint8.
     """
+    if w.numel() == 0:
+        # C8: empty tensor -- return an appropriately-shaped empty uint8 tensor.
+        out_f = w.shape[0] if w.ndim >= 1 else 0
+        return torch.empty((out_f, 0), dtype=torch.uint8, device=w.device)
     out_f, in_f = w.shape
     pad = in_f % 2
     if pad:
@@ -224,8 +228,32 @@ def _gptq_quantize_layer(
     out_f, in_f = W.shape
     device = W.device
 
+    # C7: reject NaN/Inf in weights before starting. A corrupt weight matrix
+    # would silently produce a garbage quantized model.
+    if not torch.isfinite(W).all():
+        raise RuntimeError(
+            "GPTQ: layer weights contain non-finite values (NaN/Inf). "
+            "Check that the model loaded correctly and that no prior "
+            "quantization or training step corrupted the weights."
+        )
+
     H = _compute_hessian(X, damp_percent=quantizer.damp_percent)
     H = H.to(device)
+
+    # C7: validate the Hessian. A zero or NaN diagonal means the calibration
+    # data did not activate this layer -- quantizing with a degenerate Hessian
+    # silently produces the wrong scales.
+    if not torch.isfinite(H).all():
+        raise RuntimeError(
+            "GPTQ calibration produced a Hessian with NaN/Inf values. "
+            "Ensure calibration activations are finite (no NaN inputs)."
+        )
+    if H.diag().max() == 0:
+        raise RuntimeError(
+            "GPTQ calibration produced a zero Hessian diagonal. "
+            "This usually means the calibration data never activated this "
+            "layer. Provide representative calibration data."
+        )
 
     # --- actorder: reorder columns by descending H diagonal ---
     perm: Optional[torch.Tensor] = None

@@ -197,3 +197,38 @@ def test_fp8_linear_state_dict_roundtrip():
     assert torch.allclose(fp8b.input_amax, fp8.input_amax)
     assert torch.allclose(fp8b.weight_amax, fp8.weight_amax)
     assert torch.allclose(fp8b.weight, fp8.weight)
+
+
+# ---------------------------------------------------------------------------
+# C6: amax floor prevents scale explosion on all-zero activations
+# ---------------------------------------------------------------------------
+
+
+def test_amax_never_decays_below_epsilon():
+    """amax must stay >= _AMAX_EPS even after many steps with zero activations.
+
+    Without the clamp(min=_AMAX_EPS) fix, an all-zero activation sequence
+    drives the EMA amax toward 0, making _compute_scale return +inf and
+    poisoning all subsequent forward passes with NaN/Inf outputs.
+    """
+    from mud_puppy.fp8_rocm import _AMAX_EPS
+
+    torch.manual_seed(5)
+    lin = nn.Linear(8, 8)
+    fp8 = FP8Linear(lin, amax_momentum=0.99)  # slow decay to stress the floor
+
+    zero_input = torch.zeros(4, 8)
+    for _ in range(300):  # enough steps for EMA to decay without floor
+        _ = fp8(zero_input)
+
+    assert fp8.input_amax.item() >= _AMAX_EPS, (
+        f"input_amax decayed below _AMAX_EPS={_AMAX_EPS}: "
+        f"got {fp8.input_amax.item()}"
+    )
+    assert fp8.weight_amax.item() >= _AMAX_EPS, (
+        f"weight_amax decayed below _AMAX_EPS={_AMAX_EPS}: "
+        f"got {fp8.weight_amax.item()}"
+    )
+    # Verify the scale is still finite (not inf).
+    scale = fp8._compute_scale(fp8.input_amax)
+    assert torch.isfinite(scale), f"scale is not finite after amax floor: {scale}"

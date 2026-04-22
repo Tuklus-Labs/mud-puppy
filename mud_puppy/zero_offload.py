@@ -41,6 +41,8 @@ Usage:
         optimizer.step()  # Handles CPU<->GPU transfers automatically
 """
 
+import threading
+
 import torch
 import torch.nn as nn
 from torch.optim import Optimizer
@@ -78,6 +80,20 @@ class CPUOffloadOptimizer:
 
     This enables training models that wouldn't fit in VRAM by keeping
     optimizer states (which are 2x model size for Adam) on CPU RAM.
+
+    Thread safety: zero_grad(), _transfer_grads_to_cpu(), state_dict(), and
+    load_state_dict() are guarded by a single instance lock. This class is
+    designed for use from a single training thread; the lock is a safety net
+    for incidental concurrent access (e.g. monitoring threads calling
+    state_dict() concurrently with a training step).
+
+    Note on id(param) keying: _cpu_grads, _cpu_states, _pinned_buffers, and
+    _param_map are keyed by id(param) at construction time. These IDs are
+    stable for the lifetime of a single CPUOffloadOptimizer instance. If two
+    instances are built in the same process from different models, Python MAY
+    reuse id values for dead objects, but since each instance has its own
+    dicts this is safe. Cross-session persistence uses positional index
+    (state_dict / load_state_dict) which is order-stable regardless of id.
     """
 
     def __init__(
@@ -89,6 +105,10 @@ class CPUOffloadOptimizer:
         self.config = config or OffloadConfig()
         self._cpu = torch.device("cpu")
         self._gpu = torch.device("cuda") if torch.cuda.is_available() else self._cpu
+
+        # C1/C2: single lock guards zero_grad, _transfer_grads_to_cpu, and
+        # state_dict / load_state_dict against concurrent access.
+        self._lock = threading.Lock()
 
         # CPU storage for optimizer states
         self._cpu_states: Dict[int, Dict[str, torch.Tensor]] = {}
@@ -186,15 +206,21 @@ class CPUOffloadOptimizer:
 
     def zero_grad(self, set_to_none: bool = True):
         """Zero gradients, optionally setting to None for memory savings."""
-        self.optimizer.zero_grad(set_to_none=set_to_none)
+        with self._lock:
+            self.optimizer.zero_grad(set_to_none=set_to_none)
 
-        # Also zero CPU gradient accumulators
-        if self.config.offload_gradients:
-            for cpu_grad in self._cpu_grads.values():
-                cpu_grad.zero_()
+            # Also zero CPU gradient accumulators
+            if self.config.offload_gradients:
+                for cpu_grad in self._cpu_grads.values():
+                    cpu_grad.zero_()
 
     def _transfer_grads_to_cpu(self):
         """Copy gradients from GPU to CPU storage, async on _grad_stream."""
+        with self._lock:
+            self._transfer_grads_to_cpu_locked()
+
+    def _transfer_grads_to_cpu_locked(self):
+        """Inner implementation; caller must hold self._lock."""
         stream = self._grad_stream
         if stream is not None and self.config.async_transfer:
             # Phase 1: launch all async D2H copies on the dedicated stream.
@@ -423,30 +449,32 @@ class CPUOffloadOptimizer:
         be loaded -- this is the same requirement as PyTorch's own optimizer
         state_dict().
         """
-        idx_map = self._param_index_map()
-        cpu_states_by_idx: Dict[int, Dict[str, Any]] = {}
-        for pid, state in self._cpu_states.items():
-            idx = idx_map.get(pid)
-            if idx is not None:
-                cpu_states_by_idx[idx] = state
-        return {
-            "optimizer": self.optimizer.state_dict(),
-            "cpu_states": cpu_states_by_idx,
-            "config": self.config,
-        }
+        with self._lock:
+            idx_map = self._param_index_map()
+            cpu_states_by_idx: Dict[int, Dict[str, Any]] = {}
+            for pid, state in self._cpu_states.items():
+                idx = idx_map.get(pid)
+                if idx is not None:
+                    cpu_states_by_idx[idx] = state
+            return {
+                "optimizer": self.optimizer.state_dict(),
+                "cpu_states": cpu_states_by_idx,
+                "config": self.config,
+            }
 
     def load_state_dict(self, state_dict: Dict):
         """Load optimizer state including CPU states keyed by positional index."""
-        self.optimizer.load_state_dict(state_dict["optimizer"])
-        saved = state_dict.get("cpu_states", {})
-        # Translate positional index back to id(param) for runtime lookup.
-        idx_map = self._param_index_map()
-        idx_to_pid = {v: k for k, v in idx_map.items()}
-        self._cpu_states = {}
-        for idx, state in saved.items():
-            pid = idx_to_pid.get(int(idx))
-            if pid is not None:
-                self._cpu_states[pid] = state
+        with self._lock:
+            self.optimizer.load_state_dict(state_dict["optimizer"])
+            saved = state_dict.get("cpu_states", {})
+            # Translate positional index back to id(param) for runtime lookup.
+            idx_map = self._param_index_map()
+            idx_to_pid = {v: k for k, v in idx_map.items()}
+            self._cpu_states = {}
+            for idx, state in saved.items():
+                pid = idx_to_pid.get(int(idx))
+                if pid is not None:
+                    self._cpu_states[pid] = state
 
     @property
     def param_groups(self):

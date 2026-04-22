@@ -50,6 +50,15 @@ class PackedCollator:
 
     def __call__(self, examples: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         """Collate a list of examples into a packed batch."""
+        # E1: fail loudly on empty batch rather than producing a confusing error
+        # from max() on an empty sequence several lines later.
+        if not examples:
+            raise ValueError(
+                "PackedCollator received an empty list of examples. "
+                "Check that the dataset is non-empty and that the DataLoader "
+                "is not dropping all examples."
+            )
+
         # --- Fail loudly if upstream tokenization forgot to produce labels ---
         for i, ex in enumerate(examples):
             if "labels" not in ex:
@@ -100,8 +109,11 @@ class PackedCollator:
         input_ids = torch.full((batch_size, seq), self.pad_token_id, dtype=torch.long)
         labels = torch.full((batch_size, seq), -100, dtype=torch.long)
         position_ids = torch.zeros((batch_size, seq), dtype=torch.long)
-        # Block-diagonal attention mask: long, shape (batch, seq, seq).
-        attn = torch.zeros((batch_size, seq, seq), dtype=torch.long)
+        # E2: block-diagonal attention mask as int8 (not int64) to reduce memory.
+        # At B=32, seq=8192: int64 = 16 GB, int8 = 2 GB. Models that need float
+        # masks will cast; models that accept integer masks (e.g. via additive
+        # attention bias) work directly with int8.
+        attn = torch.zeros((batch_size, seq, seq), dtype=torch.int8)
 
         for b, row in enumerate(rows):
             offset = 0
@@ -118,7 +130,9 @@ class PackedCollator:
                 )
                 # Block on the diagonal: all positions within this segment
                 # attend to all other positions in this segment.
-                attn[b, offset : offset + n, offset : offset + n] = 1
+                attn[b, offset : offset + n, offset : offset + n] = torch.ones(
+                    n, n, dtype=torch.int8
+                )
                 offset += n
 
         return {

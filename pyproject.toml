@@ -47,6 +47,17 @@ monitor = [
     "aiohttp>=3.9",
 ]
 
+# Experiment tracking backends (optional; each is lazily imported at runtime)
+logging-backends = [
+    "wandb",
+    "tensorboard",
+]
+
+# Multimodal / vision-language training
+multimodal = [
+    "Pillow",
+]
+
 [project.scripts]
 mud-puppy = "mud_puppy.cli:main"
 mud-puppy-interactive = "mud_puppy.interactive:main"

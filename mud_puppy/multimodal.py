@@ -34,8 +34,11 @@ from __future__ import annotations
 
 import base64
 import io
+import logging
 import os
 from typing import Any, Dict, List, Optional, Union
+
+_log = logging.getLogger(__name__)
 
 import torch
 from torch.utils.data import Dataset as TorchDataset
@@ -142,8 +145,26 @@ def load_image(
 
     # Resolve relative paths against base_dir
     path = path_or_uri
-    if not os.path.isabs(path) and base_dir is not None:
+    _was_relative = not os.path.isabs(path)
+    if _was_relative and base_dir is not None:
         path = os.path.join(base_dir, path)
+
+    # D1: path-traversal guard. Only applies when the original path was relative
+    # (and thus joined with base_dir). Absolute paths are taken at face value --
+    # the caller already controls the absolute path. For relative paths, resolve
+    # symlinks and ".." components then verify the result is still inside base_dir
+    # so a dataset row with "../../etc/passwd" can't escape the dataset root.
+    if _was_relative and base_dir is not None:
+        from pathlib import Path as _Path
+        resolved = _Path(path).resolve()
+        base_resolved = _Path(base_dir).resolve()
+        try:
+            resolved.relative_to(base_resolved)
+        except ValueError:
+            raise ValueError(
+                f"Image path escapes base_dir: {path_or_uri!r} resolves to "
+                f"{resolved!r} which is outside {base_resolved!r}"
+            )
 
     if not os.path.exists(path):
         raise FileNotFoundError(f"Image not found: {path}")
@@ -193,11 +214,15 @@ class MultimodalCollator:
         max_length: int = 2048,
         pad_token_id: int = 0,
         base_dir: Optional[str] = None,
+        require_images: bool = False,
     ) -> None:
         self.processor = processor
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.base_dir = base_dir
+        # D3: when require_images=True (set by the multimodal training path),
+        # a batch that ends up with pixel_values=None is an error, not a fallback.
+        self.require_images = require_images
 
         # Determine pad token ID
         if pad_token_id != 0:
@@ -263,7 +288,13 @@ class MultimodalCollator:
                         return_tensors="pt",
                     )
                     pixel_values = proc_out.pixel_values
-                except Exception:
+                except Exception as _exc1:
+                    # D3: log the primary failure before attempting the fallback.
+                    _log.warning(
+                        "MultimodalCollator: processor(..., text=texts) failed (%s); "
+                        "retrying without text argument.",
+                        _exc1,
+                    )
                     # Fallback: try without text argument (some processors)
                     try:
                         proc_out = self.processor(
@@ -271,8 +302,23 @@ class MultimodalCollator:
                             return_tensors="pt",
                         )
                         pixel_values = proc_out.pixel_values
-                    except Exception:
+                    except Exception as _exc2:
+                        _log.warning(
+                            "MultimodalCollator: fallback processor(images=...) also "
+                            "failed (%s). pixel_values will be None.",
+                            _exc2,
+                        )
                         pixel_values = None
+
+        # D3: raise if require_images=True and we ended up with no pixel_values.
+        # Text-only training with method=multimodal is almost always a bug.
+        if self.require_images and pixel_values is None:
+            raise RuntimeError(
+                "MultimodalCollator: require_images=True but pixel_values is None "
+                "after processor fallbacks. Ensure the processor is compatible with "
+                "the dataset's image format. If text-only training is intentional, "
+                "use a non-multimodal method."
+            )
 
         # --- Pad and stack input_ids / attention_mask / labels ---
         input_ids_list = [
@@ -284,6 +330,22 @@ class MultimodalCollator:
         labels_list = [
             ex["labels"][: self.max_length] for ex in examples
         ]
+
+        # D2: guard against empty batch or all-zero-length sequences. Without
+        # this check max() would raise ValueError("max() arg is an empty sequence").
+        if not input_ids_list:
+            raise ValueError(
+                "MultimodalCollator received an empty batch (no examples). "
+                "Check that the dataset is non-empty and that the DataLoader "
+                "is not dropping the last batch."
+            )
+        if all(len(ids) == 0 for ids in input_ids_list):
+            raise ValueError(
+                "MultimodalCollator: every example in the batch has zero tokens "
+                "after truncation to max_length=%d. This usually means the "
+                "tokenizer produced empty sequences. Check the dataset and "
+                "tokenization pipeline." % self.max_length
+            )
 
         max_len = max(len(ids) for ids in input_ids_list)
 

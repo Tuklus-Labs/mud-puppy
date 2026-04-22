@@ -85,7 +85,48 @@ class LayerStreamer:
     are pinned to the streamed layers and move with them.
     """
 
-    def __init__(self, model: nn.Module, prefetch_layers: int = 2) -> None:
+    def __init__(self, model: nn.Module, prefetch_layers: int = 2,
+                 training_method: str = "inference") -> None:
+        """Initialise the LayerStreamer.
+
+        Parameters
+        ----------
+        model:
+            The model to stream. Transformer blocks are moved to CPU; all
+            other modules (embeddings, lm_head, LoRA adapters) stay on GPU.
+        prefetch_layers:
+            Number of GPU ring slots (>= 1).
+        training_method:
+            The mud-puppy training method in use. Streaming is only safe when
+            backward does NOT need the base layer weights (they get evicted from
+            the ring after forward). This is true for ``"qlora"`` (frozen base,
+            only adapters train), ``"inference"`` (no backward at all), and
+            ``"embedding"`` (only the embedding head trains).
+
+            For full fine-tuning, LoRA, or any method where the base weights
+            participate in backward, you MUST keep the model fully on GPU --
+            streaming will silently produce wrong gradients or crash because
+            backward tries to access a layer that has been evicted from the
+            ring.
+
+            Raises ``NotImplementedError`` for unsafe method combinations.
+
+        .. note::
+            Thread safety: ``LayerStreamer`` is designed for single-threaded
+            training loops. Do not call ``forward()`` from multiple threads
+            simultaneously (``_current_layer_idx`` is not atomic).
+        """
+        _SAFE_STREAM_METHODS = {"qlora", "inference", "embedding"}
+        if training_method not in _SAFE_STREAM_METHODS:
+            raise NotImplementedError(
+                f"LayerStreamer is not safe for training_method={training_method!r}. "
+                "Streaming evicts base layer weights from GPU after forward; backward "
+                "for full/lora/preference/rl/etc. needs those weights and will either "
+                "crash or silently train on wrong gradients. "
+                f"Safe methods: {sorted(_SAFE_STREAM_METHODS)}. "
+                "Disable --stream or switch to --method qlora."
+            )
+
         if prefetch_layers < 1:
             raise ValueError(
                 f"prefetch_layers must be >= 1, got {prefetch_layers}. "
