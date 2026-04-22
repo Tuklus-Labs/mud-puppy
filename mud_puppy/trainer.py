@@ -1096,9 +1096,25 @@ def run_training(config: TrainingConfig) -> None:
             if d.startswith("checkpoint-")
         ]
         if checkpoints:
-            latest = max(checkpoints, key=lambda x: int(x.split("-")[1]))
-            resume_from = os.path.join(config.output_dir, latest)
-            print(f"[mud-puppy] Resuming from {resume_from}")
+            def _checkpoint_step(name: str) -> int:
+                parts = name.split("-", 1)
+                if len(parts) != 2 or not parts[1].isdigit():
+                    return -1  # skip non-numeric checkpoints (e.g. checkpoint-best)
+                return int(parts[1])
+            numeric_ckpts = [d for d in checkpoints if _checkpoint_step(d) >= 0]
+            if numeric_ckpts:
+                latest = max(numeric_ckpts, key=_checkpoint_step)
+                resume_from = os.path.join(config.output_dir, latest)
+                print(f"[mud-puppy] Resuming from {resume_from}")
+
+    # Collect calibration batches for GPTQ before training consumes the loader.
+    calibration_data: List[torch.Tensor] = []
+    if config.finetuning_method == "gptq":
+        loader = trainer.get_train_dataloader()
+        for i, batch in enumerate(loader):
+            if i >= 32:
+                break
+            calibration_data.append(batch["input_ids"])
 
     # Run training
     print("[mud-puppy] Starting training...")
@@ -1130,7 +1146,7 @@ def run_training(config: TrainingConfig) -> None:
         from .gptq_rocm import quantize_model_gptq, save_quantized
 
         print("[mud-puppy] Applying GPTQ quantization...")
-        model = quantize_model_gptq(model, bits=4)
+        model = quantize_model_gptq(model, calibration_data, bits=4)
         gptq_path = os.path.join(config.output_dir, "gptq")
         os.makedirs(gptq_path, exist_ok=True)
         save_quantized(model, gptq_path)
