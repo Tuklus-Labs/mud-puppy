@@ -272,6 +272,11 @@ def quantize_model_mx4(
     for name, module in list(model.named_modules()):
         if not isinstance(module, nn.Linear):
             continue
+        # LinearMX4 subclasses nn.Linear; skip already-quantized layers so
+        # calling quantize_model_mx4 twice on the same model does not
+        # re-quantize the dequantized weights and compound rounding error.
+        if isinstance(module, LinearMX4):
+            continue
 
         # Check skip patterns
         if any(skip in name.lower() for skip in skip_modules):
