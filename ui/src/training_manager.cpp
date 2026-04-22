@@ -14,6 +14,7 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <sstream>
@@ -392,11 +393,33 @@ RunHandle TrainingManager::start(const nlohmann::json& config) {
         args_storage.push_back(config["output_dir"].get<std::string>());
     }
 
+    // add_flag routes numeric JSON values to CLI strings. Floats get a
+    // compact repr (no trailing zeros); integers are emitted as-is. Using
+    // std::to_string(double) here was a bug: it produced "3.000000" for
+    // epochs etc., and argparse rejects those with type=int.
     auto add_flag = [&](const std::string& key, const std::string& flag) {
-        if (config.contains(key)) {
-            args_storage.push_back(flag);
-            args_storage.push_back(std::to_string(config[key].get<double>()));
+        if (!config.contains(key)) return;
+        const auto& v = config[key];
+        std::string s;
+        if (v.is_number_integer() || v.is_number_unsigned()) {
+            s = std::to_string(v.get<int64_t>());
+        } else if (v.is_number_float()) {
+            double d = v.get<double>();
+            // If the float is an exact integer, emit it without a decimal
+            // so argparse's int-typed flags accept it. Otherwise use a
+            // compact repr with up to 9 significant digits.
+            if (d == static_cast<double>(static_cast<int64_t>(d))) {
+                s = std::to_string(static_cast<int64_t>(d));
+            } else {
+                char buf[32];
+                std::snprintf(buf, sizeof(buf), "%.9g", d);
+                s = buf;
+            }
+        } else {
+            return;  // non-numeric values are ignored
         }
+        args_storage.push_back(flag);
+        args_storage.push_back(std::move(s));
     };
     auto add_str_flag = [&](const std::string& key, const std::string& flag) {
         if (config.contains(key) && config[key].is_string()) {
