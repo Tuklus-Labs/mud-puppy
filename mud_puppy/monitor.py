@@ -399,6 +399,11 @@ class MonitorCallback:
         elapsed = time.time() - (self._start_time or time.time())
         steps_per_sec = step / elapsed if elapsed > 0 and step > 0 else 0.0
 
+        # tokens_per_sec: HF Trainer logs this directly; fall back to
+        # steps_per_sec * batch_tokens if available, else 0.
+        tokens_per_sec = float(logs.get("tokens_per_second",
+                                        logs.get("train_tokens_per_second", 0.0)))
+
         msg = {
             "type": "metrics",
             "step": step,
@@ -409,9 +414,13 @@ class MonitorCallback:
             "grad_norm": grad_norm,
             "eta_seconds": eta,
             "steps_per_sec": steps_per_sec,
+            "tokens_per_sec": tokens_per_sec,
         }
         self.metrics_history.append(msg)
         self._emit(msg)
+
+        # Stream stats (if LayerStreamer is attached to model)
+        self._emit_stream_stats(step)
 
         # LoRA norms at interval
         if self.lora_norm_interval > 0 and step % self.lora_norm_interval == 0 and step > 0:
@@ -476,10 +485,45 @@ class MonitorCallback:
         if norms:
             self._emit({"type": "lora_norms", "step": step, "norms": norms})
 
+    def _emit_stream_stats(self, step: int) -> None:
+        """Emit LayerStreamer stats if a streamer is attached to the model."""
+        if self.model is None:
+            return
+        streamer = getattr(self.model, "_streamer", None)
+        if streamer is None:
+            return
+        try:
+            stats = streamer.stats()
+            self._emit({"type": "stream_stats", "step": step, **stats})
+        except Exception as exc:
+            log.debug("stream stats collection failed: %s", exc)
+
 
 # ---------------------------------------------------------------------------
 # GPU telemetry broadcaster
 # ---------------------------------------------------------------------------
+
+def _get_memory_stats(device_index: int = 0) -> Dict[str, float]:
+    """Return torch allocator memory stats (GB) for the given device."""
+    stats: Dict[str, float] = {
+        "mem_reserved_gb": 0.0,
+        "mem_allocated_gb": 0.0,
+        "mem_max_allocated_gb": 0.0,
+    }
+    try:
+        import torch  # noqa: delayed import
+        if not torch.cuda.is_available():
+            return stats
+        dev = min(device_index, torch.cuda.device_count() - 1)
+        if dev < 0:
+            return stats
+        stats["mem_reserved_gb"] = torch.cuda.memory_reserved(dev) / (1024 ** 3)
+        stats["mem_allocated_gb"] = torch.cuda.memory_allocated(dev) / (1024 ** 3)
+        stats["mem_max_allocated_gb"] = torch.cuda.max_memory_allocated(dev) / (1024 ** 3)
+    except Exception as exc:
+        log.debug("memory_stats failed: %s", exc)
+    return stats
+
 
 def start_gpu_telemetry(server: MonitorServer, interval: float = 1.0) -> threading.Thread:
     """Start a daemon thread that broadcasts GPU telemetry at *interval* seconds.
@@ -490,7 +534,8 @@ def start_gpu_telemetry(server: MonitorServer, interval: float = 1.0) -> threadi
         while server.is_running():
             try:
                 data = get_gpu_telemetry()
-                server.broadcast({"type": "gpu", **data})
+                mem = _get_memory_stats()
+                server.broadcast({"type": "gpu", **data, **mem})
             except Exception as exc:
                 log.debug("gpu telemetry broadcast failed: %s", exc)
             time.sleep(interval)
