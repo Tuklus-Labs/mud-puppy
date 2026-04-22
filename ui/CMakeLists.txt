@@ -50,18 +50,23 @@ configure_file(
     COPYONLY
 )
 
-# Sync web/dist next to the binary at build time (not configure time).
+# Sync web/dist next to the binary on every build (not just target relinks).
 # The web workstream builds ui/web/dist; we mirror it to ui/build/web/dist
 # so phos::AssetServer can resolve "web/dist/index.html" with a relative
 # asset_dir from the binary's working directory.
+#
+# An ALL custom target ensures the sync always runs, even when the main
+# binary didn't re-link (e.g. only web/dist changed). Without ALL the sync
+# would silently skip and the UI would serve stale assets.
 set(WEB_SRC_DIR  ${CMAKE_CURRENT_SOURCE_DIR}/web/dist)
 set(WEB_DEST_DIR ${CMAKE_CURRENT_BINARY_DIR}/web/dist)
 
-add_custom_command(
-    TARGET mud-puppy-studio POST_BUILD
+add_custom_target(sync_web_dist ALL
+    COMMAND ${CMAKE_COMMAND} -E rm -rf ${WEB_DEST_DIR}
     COMMAND ${CMAKE_COMMAND} -E make_directory ${WEB_DEST_DIR}
-    COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
             ${WEB_SRC_DIR} ${WEB_DEST_DIR}
     COMMENT "Syncing web/dist -> build/web/dist"
     VERBATIM
 )
+add_dependencies(mud-puppy-studio sync_web_dist)

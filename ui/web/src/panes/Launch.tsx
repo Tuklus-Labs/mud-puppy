@@ -1,502 +1,475 @@
 /**
- * Launch pane — configure and start a training run.
+ * Launch pane — model / dataset / method / hyperparameters with a sticky
+ * side column showing live VRAM estimate and run summary.
  *
- * Sections:
- * - Model picker (HF search + local path)
- * - Dataset picker (path + preview)
- * - Method (segmented control)
- * - Hyperparams
- * - Live VRAM estimate
- * - Start button
+ * Layout: .launch-grid (1fr + 300px, stacks <1100px).
+ * Mirrors the 2026-04-22 design handoff pixel-for-pixel.
  */
-import React, { useState, useCallback, useRef } from "react";
-import { ipc } from "../lib/ipc";
-import { useStore } from "../lib/store";
-import type { TrainingConfig } from "../lib/ipc-types";
-import type { HFModel } from "../lib/ipc-types";
+import React, { useEffect, useMemo, useState } from "react";
 import { Panel } from "../chrome/VectorFrame";
+import { ipc } from "../lib/ipc";
+import type { HFModel, TrainingConfig } from "../lib/ipc-types";
+import { useStore } from "../lib/store";
 
-const METHODS = ["lora", "qlora", "full", "dpo", "grpo", "orpo", "kto"] as const;
-type Method = (typeof METHODS)[number];
+const METHODS: TrainingConfig["finetuning_method"][] = [
+  "lora",
+  "qlora",
+  "full",
+  "dpo",
+  "grpo",
+  "orpo",
+  "kto",
+];
 
-// Rough VRAM heuristic
-function estimateVram(config: Partial<TrainingConfig>): number {
-  const modelName = (config.model_name_or_path || "").toLowerCase();
-  let params = 7; // Default 7B
-  if (modelName.includes("1b") || modelName.includes("tinyllama")) params = 1.1;
-  else if (modelName.includes("3b")) params = 3;
-  else if (modelName.includes("7b") || modelName.includes("mistral")) params = 7;
-  else if (modelName.includes("13b")) params = 13;
-  else if (modelName.includes("34b")) params = 34;
-  else if (modelName.includes("70b")) params = 70;
+interface LaunchState {
+  model: string;
+  dataset: string;
+  output: string;
+  method: TrainingConfig["finetuning_method"];
+  batch_size: number;
+  grad_accum: number;
+  learning_rate: number;
+  num_epochs: number;
+  max_seq_length: number;
+  lora_r: number;
+  lora_alpha: number;
+  lora_dropout: number;
+  pack: boolean;
+  stream: boolean;
+  compile: boolean;
+  zero_offload: boolean;
+  warmup_ratio: number;
+}
 
-  const dtype = config.finetuning_method === "qlora" ? 0.5 : 2; // bf16 = 2 bytes/param
-  const modelGb = (params * 1e9 * dtype) / 1e9;
+const DEFAULT: LaunchState = {
+  model: "meta-llama/Llama-3-8B-Instruct",
+  dataset: "/data/instruct/alpaca-clean.jsonl",
+  output: "outputs/llama3-finetune",
+  method: "lora",
+  batch_size: 4,
+  grad_accum: 4,
+  learning_rate: 2e-4,
+  num_epochs: 3,
+  max_seq_length: 2048,
+  lora_r: 16,
+  lora_alpha: 32,
+  lora_dropout: 0.05,
+  pack: true,
+  stream: false,
+  compile: false,
+  zero_offload: false,
+  warmup_ratio: 0.03,
+};
 
-  // Optimizer: AdamW = 2x model for fp32 states (rough)
-  const optGb = config.finetuning_method === "full" ? modelGb * 2 : modelGb * 0.1;
+function guessParams(model: string): number {
+  const mn = model.toLowerCase();
+  if (mn.includes("1b") || mn.includes("tiny")) return 1.1;
+  if (mn.includes("3b")) return 3;
+  if (mn.includes("8b") || mn.includes("9b")) return 8;
+  if (mn.includes("13b")) return 13;
+  if (mn.includes("70b")) return 70;
+  if (mn.includes("7b") || mn.includes("mistral")) return 7;
+  return 7;
+}
 
-  // Activations estimate
-  const seqLen = config.max_seq_length || 2048;
-  const bsz = config.batch_size || 1;
-  const actGb = (seqLen * bsz * 4096 * 4) / 1e9; // rough
-
-  return Math.round((modelGb + optGb + actGb) * 10) / 10;
+function estimateVram(s: LaunchState) {
+  const params = guessParams(s.model);
+  const dtypeBytes = s.method === "qlora" ? 0.5 : 2;
+  const modelGb = params * dtypeBytes;
+  const optGb = s.method === "full" ? modelGb * 2.2 : modelGb * 0.15;
+  const actGb =
+    ((s.max_seq_length * s.batch_size * 4096 * 4) / 1e9) *
+    (s.method === "qlora" ? 0.6 : 1);
+  const total = modelGb + optGb + actGb;
+  return {
+    model: Math.round(modelGb * 10) / 10,
+    opt: Math.round(optGb * 10) / 10,
+    act: Math.round(actGb * 10) / 10,
+    total: Math.round(total * 10) / 10,
+  };
 }
 
 export function Launch() {
+  const [cfg, setCfg] = useState<LaunchState>(DEFAULT);
+  const [showDrop, setShowDrop] = useState(false);
+  const [hfResults, setHfResults] = useState<HFModel[]>([]);
   const setActivePane = useStore((s) => s.setActivePane);
-  const setActiveRunId = useStore((s) => s.setActiveRunId);
-  const upsertRun = useStore((s) => s.upsertRun);
 
-  const [config, setConfig] = useState<Partial<TrainingConfig>>({
-    finetuning_method: "lora",
-    num_epochs: 1,
-    batch_size: 1,
-    gradient_accumulation_steps: 8,
-    learning_rate: 2e-4,
-    max_seq_length: 2048,
-    lora_r: 16,
-    lora_alpha: 32,
-    lora_dropout: 0.05,
-    pack_sequences: false,
-    stream: false,
-    prefetch_layers: 2,
-    compile: false,
-    zero_offload: false,
-    monitor: true,
-  });
+  const update = <K extends keyof LaunchState>(k: K, v: LaunchState[K]) =>
+    setCfg((c) => ({ ...c, [k]: v }));
 
-  const [modelQuery, setModelQuery] = useState("");
-  const [modelResults, setModelResults] = useState<HFModel[]>([]);
-  const [modelSearching, setModelSearching] = useState(false);
-  const [datasetPreview, setDatasetPreview] = useState<{ format: string; rows: unknown[] } | null>(null);
-  const [datasetPreviewing, setDatasetPreviewing] = useState(false);
-  const [starting, setStarting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  const searchTimeout = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-
-  const handleModelSearch = useCallback((q: string) => {
-    setModelQuery(q);
-    if (searchTimeout.current) clearTimeout(searchTimeout.current);
-    if (q.trim().length < 2) {
-      setModelResults([]);
+  useEffect(() => {
+    if (!cfg.model || cfg.model.length < 3) {
+      setHfResults([]);
       return;
     }
-    searchTimeout.current = setTimeout(async () => {
-      setModelSearching(true);
+    const h = setTimeout(async () => {
       try {
-        const results = await ipc.searchModels(q.trim());
-        setModelResults(results);
-      } catch (_e) {
-        setModelResults([]);
-      } finally {
-        setModelSearching(false);
+        const r = await ipc.searchModels(cfg.model);
+        setHfResults(Array.isArray(r) ? r.slice(0, 6) : []);
+      } catch {
+        setHfResults([]);
       }
-    }, 400);
-  }, []);
+    }, 260);
+    return () => clearTimeout(h);
+  }, [cfg.model]);
 
-  const handlePreviewDataset = useCallback(async () => {
-    if (!config.dataset_path) return;
-    setDatasetPreviewing(true);
-    try {
-      const preview = await ipc.previewDataset(config.dataset_path, 5);
-      setDatasetPreview(preview);
-    } catch (e) {
-      setDatasetPreview(null);
-    } finally {
-      setDatasetPreviewing(false);
-    }
-  }, [config.dataset_path]);
+  const vram = useMemo(() => estimateVram(cfg), [cfg]);
+  const budgetGb = 24;
+  const pct = Math.min(100, (vram.total / budgetGb) * 100);
+  const level = vram.total > 22 ? "danger" : vram.total > 16 ? "warn" : "";
+  const vramColor =
+    level === "danger"
+      ? "var(--magenta)"
+      : level === "warn"
+      ? "var(--amber)"
+      : "var(--lime)";
 
-  const handleStart = useCallback(async () => {
-    if (!config.model_name_or_path || !config.dataset_path || !config.output_dir) {
-      setError("Model, dataset, and output dir are required.");
-      return;
-    }
-    setError(null);
-    setStarting(true);
+  const start = async () => {
+    const config: TrainingConfig = {
+      model_name_or_path: cfg.model,
+      dataset_path: cfg.dataset,
+      output_dir: cfg.output,
+      finetuning_method: cfg.method,
+      num_epochs: cfg.num_epochs,
+      batch_size: cfg.batch_size,
+      gradient_accumulation_steps: cfg.grad_accum,
+      learning_rate: cfg.learning_rate,
+      max_seq_length: cfg.max_seq_length,
+      lora_r: cfg.lora_r,
+      lora_alpha: cfg.lora_alpha,
+      lora_dropout: cfg.lora_dropout,
+      pack_sequences: cfg.pack,
+      stream: cfg.stream,
+      compile: cfg.compile,
+      zero_offload: cfg.zero_offload,
+      monitor: true,
+    };
     try {
-      const handle = await ipc.startRun(config as TrainingConfig);
-      upsertRun({
-        run_id: handle.run_id,
-        model: config.model_name_or_path || "",
-        method: config.finetuning_method || "lora",
-        dataset: config.dataset_path || "",
-        status: "running",
-        start_time: Date.now(),
-      });
-      setActiveRunId(handle.run_id);
+      await ipc.startRun(config);
       setActivePane("monitor");
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to start run");
-    } finally {
-      setStarting(false);
+      console.error("[launch] startRun failed", e);
     }
-  }, [config, upsertRun, setActiveRunId, setActivePane]);
-
-  const vramEst = estimateVram(config);
-  const vramColor = vramEst > 22 ? "var(--magenta)" : vramEst > 16 ? "var(--amber)" : "var(--lime)";
-
-  const inputStyle: React.CSSProperties = {
-    width: "100%",
-    background: "var(--panel-hi)",
-    border: "1px solid var(--border)",
-    color: "var(--text)",
-    padding: "6px 10px",
-    fontSize: "12px",
-    fontFamily: "inherit",
-    outline: "none",
   };
 
-  const labelStyle: React.CSSProperties = {
-    display: "block",
-    fontSize: "9px",
-    fontFamily: "'Share Tech Mono', monospace",
-    letterSpacing: "2px",
-    textTransform: "uppercase",
-    color: "var(--dim)",
-    marginBottom: 4,
-  };
-
-  const fieldStyle: React.CSSProperties = { marginBottom: 14 };
+  const isLoraMethod = cfg.method === "lora" || cfg.method === "qlora";
 
   return (
-    <div
-      style={{
-        height: "100%",
-        overflowY: "auto",
-        padding: "16px",
-        display: "flex",
-        flexDirection: "column",
-        gap: 16,
-      }}
-    >
-      {/* Model picker */}
-      <Panel label="Model" style={{ padding: 14 }}>
-        <div style={fieldStyle}>
-          <label style={labelStyle}>Model ID or Local Path</label>
-          <input
-            style={inputStyle}
-            value={config.model_name_or_path || ""}
-            placeholder="meta-llama/Llama-3-8B"
-            onChange={(e) => {
-              setConfig((c) => ({ ...c, model_name_or_path: e.target.value }));
-              handleModelSearch(e.target.value);
-            }}
-          />
-          {/* Search results dropdown */}
-          {modelResults.length > 0 && (
-            <div
-              style={{
-                background: "var(--panel-hi)",
-                border: "1px solid var(--border)",
-                marginTop: 2,
-                maxHeight: 160,
-                overflowY: "auto",
-                zIndex: 20,
-                position: "relative",
-              }}
-            >
-              {modelResults.map((m) => (
-                <div
-                  key={m.id}
-                  style={{
-                    padding: "6px 10px",
-                    cursor: "pointer",
-                    fontSize: "11px",
-                    display: "flex",
-                    justifyContent: "space-between",
-                    borderBottom: "1px solid var(--grid)",
-                  }}
-                  onMouseEnter={(e) =>
-                    (e.currentTarget.style.background = "rgba(0,229,255,0.07)")
-                  }
-                  onMouseLeave={(e) => (e.currentTarget.style.background = "")}
-                  onClick={() => {
-                    setConfig((c) => ({ ...c, model_name_or_path: m.id }));
-                    setModelResults([]);
-                  }}
-                >
-                  <span style={{ color: "var(--text)" }}>{m.id}</span>
-                  <span style={{ color: "var(--dim)", fontSize: "10px" }}>
-                    {(m.downloads / 1000).toFixed(0)}k DL
-                  </span>
-                </div>
-              ))}
-            </div>
-          )}
-          {modelSearching && (
-            <div style={{ fontSize: "10px", color: "var(--dim)", marginTop: 4 }}>
-              searching...
-            </div>
-          )}
+    <div className="pane">
+      <div className="pane-title">
+        <h1>Launch</h1>
+        <div className="crumb">
+          MUD-PUPPY › <span>CONFIGURE RUN</span>
         </div>
-      </Panel>
+      </div>
 
-      {/* Dataset picker */}
-      <Panel label="Dataset" style={{ padding: 14 }}>
-        <div style={fieldStyle}>
-          <label style={labelStyle}>JSONL Path</label>
-          <div style={{ display: "flex", gap: 6 }}>
-            <input
-              style={{ ...inputStyle, flex: 1 }}
-              value={config.dataset_path || ""}
-              placeholder="/path/to/data.jsonl"
-              onChange={(e) => setConfig((c) => ({ ...c, dataset_path: e.target.value }))}
-            />
-            <button
-              onClick={handlePreviewDataset}
-              disabled={!config.dataset_path || datasetPreviewing}
-              style={{ padding: "6px 12px", whiteSpace: "nowrap", fontSize: "9px" }}
-            >
-              {datasetPreviewing ? "..." : "PREVIEW"}
-            </button>
-          </div>
-        </div>
-
-        {datasetPreview && (
-          <div
-            style={{
-              marginTop: 8,
-              background: "var(--grid)",
-              padding: 8,
-              fontSize: "10px",
-              fontFamily: "'JetBrains Mono', monospace",
-            }}
-          >
-            <div style={{ color: "var(--lime)", marginBottom: 4 }}>
-              format: {datasetPreview.format}
-            </div>
-            {datasetPreview.rows.slice(0, 2).map((row, i) => (
-              <div
-                key={i}
-                style={{
-                  color: "var(--dim)",
-                  overflow: "hidden",
-                  textOverflow: "ellipsis",
-                  whiteSpace: "nowrap",
-                  fontSize: "9px",
-                  borderTop: "1px solid var(--border)",
-                  paddingTop: 4,
-                  marginTop: 4,
-                }}
-              >
-                {JSON.stringify(row).slice(0, 80)}...
-              </div>
-            ))}
-          </div>
-        )}
-
-        <div style={{ ...fieldStyle, marginTop: 12 }}>
-          <label style={labelStyle}>Output Directory</label>
-          <input
-            style={inputStyle}
-            value={config.output_dir || ""}
-            placeholder="/path/to/outputs"
-            onChange={(e) => setConfig((c) => ({ ...c, output_dir: e.target.value }))}
-          />
-        </div>
-      </Panel>
-
-      {/* Method selector */}
-      <Panel label="Method" style={{ padding: 14 }}>
-        <div className="seg-ctrl">
-          {METHODS.map((m) => (
-            <button
-              key={m}
-              className={config.finetuning_method === m ? "active" : ""}
-              onClick={() => setConfig((c) => ({ ...c, finetuning_method: m as Method }))}
-              style={{ fontSize: "9px", padding: "5px 8px" }}
-            >
-              {m.toUpperCase()}
-            </button>
-          ))}
-        </div>
-      </Panel>
-
-      {/* Hyperparameters */}
-      <Panel label="Hyperparameters" style={{ padding: 14 }}>
-        <div
-          style={{
-            display: "grid",
-            gridTemplateColumns: "1fr 1fr",
-            gap: "10px 14px",
-          }}
-        >
-          {[
-            { key: "batch_size", label: "Batch Size", type: "number", min: 1 },
-            { key: "gradient_accumulation_steps", label: "Grad Accum", type: "number", min: 1 },
-            { key: "learning_rate", label: "Learning Rate", type: "number", step: "0.00001" },
-            { key: "num_epochs", label: "Epochs", type: "number", min: 1 },
-            { key: "max_seq_length", label: "Max Seq Length", type: "number", min: 64 },
-          ].map(({ key, label, type: _t, ...attrs }) => (
-            <div key={key}>
-              <label style={labelStyle}>{label}</label>
-              <input
-                style={inputStyle}
-                type="number"
-                value={(config as any)[key] ?? ""}
-                {...attrs}
-                onChange={(e) => {
-                  // NaN-safe: empty string / garbage -> undefined (removes key)
-                  const v = parseFloat(e.target.value);
-                  setConfig((c) => ({
-                    ...c,
-                    [key]: Number.isFinite(v) ? v : undefined,
-                  }));
-                }}
-              />
-            </div>
-          ))}
-        </div>
-
-        {/* LoRA params (shown when method is lora/qlora) */}
-        {(config.finetuning_method === "lora" || config.finetuning_method === "qlora") && (
-          <div
-            style={{
-              display: "grid",
-              gridTemplateColumns: "1fr 1fr 1fr",
-              gap: "10px 14px",
-              marginTop: 12,
-              paddingTop: 10,
-              borderTop: "1px solid var(--border)",
-            }}
-          >
-            {[
-              { key: "lora_r", label: "LoRA r" },
-              { key: "lora_alpha", label: "LoRA alpha" },
-              { key: "lora_dropout", label: "Dropout" },
-            ].map(({ key, label }) => (
-              <div key={key}>
-                <label style={labelStyle}>{label}</label>
+      <div className="launch-grid">
+        <div className="launch-main">
+          <Panel label="Model">
+            <div className="field">
+              <div className="label">Hugging Face ID or local path</div>
+              <div style={{ position: "relative" }}>
                 <input
-                  style={inputStyle}
-                  type="number"
-                  value={(config as any)[key] ?? ""}
+                  value={cfg.model}
                   onChange={(e) => {
-                    const v = parseFloat(e.target.value);
-                    setConfig((c) => ({
-                      ...c,
-                      [key]: Number.isFinite(v) ? v : undefined,
-                    }));
+                    update("model", e.target.value);
+                    setShowDrop(true);
                   }}
+                  onFocus={() => setShowDrop(true)}
+                  onBlur={() => setTimeout(() => setShowDrop(false), 140)}
+                  placeholder="meta-llama/Llama-3-8B"
                 />
-              </div>
-            ))}
-          </div>
-        )}
-
-        {/* Toggles */}
-        <div
-          style={{
-            display: "flex",
-            flexWrap: "wrap",
-            gap: "8px 16px",
-            marginTop: 12,
-            paddingTop: 10,
-            borderTop: "1px solid var(--border)",
-          }}
-        >
-          {[
-            { key: "pack_sequences", label: "Pack Sequences" },
-            { key: "stream", label: "Stream Layers" },
-            { key: "compile", label: "Torch Compile" },
-            { key: "zero_offload", label: "Zero Offload" },
-          ].map(({ key, label }) => (
-            <label
-              key={key}
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 6,
-                cursor: "pointer",
-                fontSize: "10px",
-                fontFamily: "'Share Tech Mono', monospace",
-                letterSpacing: "1px",
-                color: "var(--dim)",
-              }}
-            >
-              <div
-                style={{
-                  width: 14,
-                  height: 14,
-                  border: `1px solid ${(config as any)[key] ? "var(--cyan)" : "var(--border)"}`,
-                  background: (config as any)[key] ? "rgba(0,229,255,0.2)" : "transparent",
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  cursor: "pointer",
-                  transition: "all 0.15s",
-                }}
-                onClick={() => setConfig((c) => ({ ...c, [key]: !(c as any)[key] }))}
-              >
-                {(config as any)[key] && (
-                  <div
-                    style={{ width: 6, height: 6, background: "var(--cyan)" }}
-                  />
+                {showDrop && hfResults.length > 0 && (
+                  <div className="dropdown">
+                    {hfResults.map((r) => (
+                      <div
+                        key={r.id}
+                        className="dropdown-row"
+                        onMouseDown={() => {
+                          update("model", r.id);
+                          setShowDrop(false);
+                        }}
+                      >
+                        <span>{r.id}</span>
+                        <span className="meta">
+                          {(r.downloads / 1e6).toFixed(1)}M ↓
+                        </span>
+                      </div>
+                    ))}
+                  </div>
                 )}
               </div>
-              {label}
-            </label>
-          ))}
-        </div>
-      </Panel>
+            </div>
+          </Panel>
 
-      {/* VRAM estimate + Start */}
-      <Panel style={{ padding: 14 }}>
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-          <div>
-            <div style={{ fontSize: "9px", letterSpacing: "2px", textTransform: "uppercase", color: "var(--dim)", fontFamily: "'Share Tech Mono', monospace", marginBottom: 4 }}>
-              VRAM Estimate
+          <Panel label="Dataset">
+            <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+              <div className="field">
+                <div className="label">JSONL file</div>
+                <div className="row">
+                  <input
+                    value={cfg.dataset}
+                    onChange={(e) => update("dataset", e.target.value)}
+                    placeholder="/path/to/data.jsonl"
+                  />
+                  <button
+                    className="btn btn-ghost"
+                    onClick={async () => {
+                      try {
+                        const p = await ipc.previewDataset(cfg.dataset, 3);
+                        console.log("[launch] preview", p);
+                      } catch (e) {
+                        console.error(e);
+                      }
+                    }}
+                  >
+                    Preview
+                  </button>
+                </div>
+              </div>
+              <div className="field">
+                <div className="label">Output directory</div>
+                <input
+                  value={cfg.output}
+                  onChange={(e) => update("output", e.target.value)}
+                  placeholder="outputs/my-run"
+                />
+              </div>
             </div>
-            <div
-              className="num"
-              style={{
-                fontSize: "22px",
-                fontFamily: "'JetBrains Mono', monospace",
-                color: vramColor,
-              }}
-            >
-              ~{vramEst} GB
-              <span style={{ fontSize: "10px", color: "var(--dim)", marginLeft: 4 }}>
-                / 24 GB
-              </span>
+          </Panel>
+
+          <Panel label="Method">
+            <div className="seg" style={{ width: "100%", display: "flex" }}>
+              {METHODS.map((m) => (
+                <button
+                  key={m}
+                  className={cfg.method === m ? "active" : ""}
+                  onClick={() => update("method", m)}
+                  style={{ flex: 1 }}
+                >
+                  {m}
+                </button>
+              ))}
             </div>
-          </div>
+          </Panel>
+
+          <Panel label="Hyperparameters">
+            <div className="grid-2" style={{ marginBottom: 16 }}>
+              <NumField
+                label="Batch size"
+                value={cfg.batch_size}
+                onChange={(v) => update("batch_size", v)}
+              />
+              <NumField
+                label="Grad accum"
+                value={cfg.grad_accum}
+                onChange={(v) => update("grad_accum", v)}
+              />
+              <NumField
+                label="Learning rate"
+                value={cfg.learning_rate}
+                step={0.00001}
+                onChange={(v) => update("learning_rate", v)}
+              />
+              <NumField
+                label="Epochs"
+                value={cfg.num_epochs}
+                onChange={(v) => update("num_epochs", v)}
+              />
+              <NumField
+                label="Max seq length"
+                value={cfg.max_seq_length}
+                onChange={(v) => update("max_seq_length", v)}
+              />
+              <NumField
+                label="Warmup ratio"
+                value={cfg.warmup_ratio}
+                step={0.01}
+                onChange={(v) => update("warmup_ratio", v)}
+              />
+            </div>
+
+            {isLoraMethod && (
+              <>
+                <div className="label" style={{ marginBottom: 8 }}>
+                  LoRA configuration
+                </div>
+                <div className="grid-3" style={{ marginBottom: 16 }}>
+                  <NumField
+                    label="Rank (r)"
+                    value={cfg.lora_r}
+                    onChange={(v) => update("lora_r", v)}
+                  />
+                  <NumField
+                    label="Alpha"
+                    value={cfg.lora_alpha}
+                    onChange={(v) => update("lora_alpha", v)}
+                  />
+                  <NumField
+                    label="Dropout"
+                    value={cfg.lora_dropout}
+                    step={0.01}
+                    onChange={(v) => update("lora_dropout", v)}
+                  />
+                </div>
+              </>
+            )}
+
+            <div className="label" style={{ marginBottom: 10 }}>
+              Optimizations
+            </div>
+            <div className="toggle-row">
+              {(
+                [
+                  ["pack", "Pack sequences"],
+                  ["stream", "Stream layers"],
+                  ["compile", "Torch compile"],
+                  ["zero_offload", "ZeRO offload"],
+                ] as const
+              ).map(([k, lbl]) => (
+                <label
+                  key={k}
+                  className="toggle"
+                  onClick={() => update(k, !cfg[k])}
+                >
+                  <span className={`chk ${cfg[k] ? "on" : ""}`}></span>
+                  {lbl}
+                </label>
+              ))}
+            </div>
+          </Panel>
+        </div>
+
+        <div className="launch-side">
+          <Panel label="VRAM Estimate" active>
+            <div className="vram-card">
+              <div>
+                <div className="vram-num" style={{ color: vramColor }}>
+                  {vram.total.toFixed(1)}
+                  <small> / {budgetGb} GB</small>
+                </div>
+                <div style={{ marginTop: 10 }} className={`vram-bar ${level}`}>
+                  <div style={{ width: `${pct}%` }} />
+                </div>
+              </div>
+
+              <div className="breakdown">
+                <div className="breakdown-row">
+                  <span>Weights</span>
+                  <b>{vram.model.toFixed(1)} GB</b>
+                </div>
+                <div className="breakdown-row">
+                  <span>Optimizer</span>
+                  <b>{vram.opt.toFixed(1)} GB</b>
+                </div>
+                <div className="breakdown-row">
+                  <span>Activations</span>
+                  <b>{vram.act.toFixed(1)} GB</b>
+                </div>
+                <div
+                  className="breakdown-row"
+                  style={{
+                    marginTop: 6,
+                    paddingTop: 6,
+                    borderTop: "1px solid var(--border)",
+                  }}
+                >
+                  <span style={{ color: "var(--text)" }}>Peak estimate</span>
+                  <b style={{ color: vramColor }}>{vram.total.toFixed(1)} GB</b>
+                </div>
+              </div>
+
+              <div
+                className="help"
+                style={{
+                  fontSize: 10,
+                  color: "var(--dim)",
+                  fontFamily: "var(--font-num)",
+                }}
+              >
+                Target device: AMD 7900 XTX · 24 GB
+              </div>
+            </div>
+          </Panel>
+
+          <Panel label="Summary">
+            <div className="breakdown">
+              <div className="breakdown-row">
+                <span>Method</span>
+                <b
+                  style={{
+                    color: "var(--cyan)",
+                    textTransform: "uppercase",
+                    fontFamily: "var(--font-heading)",
+                    letterSpacing: "0.15em",
+                  }}
+                >
+                  {cfg.method}
+                </b>
+              </div>
+              <div className="breakdown-row">
+                <span>Est. total steps</span>
+                <b>
+                  {Math.max(
+                    1,
+                    Math.round(
+                      (12847 / Math.max(1, cfg.batch_size * cfg.grad_accum)) *
+                        cfg.num_epochs,
+                    ),
+                  ).toLocaleString()}
+                </b>
+              </div>
+              <div className="breakdown-row">
+                <span>Trainable params</span>
+                <b>
+                  {cfg.method === "full"
+                    ? `${guessParams(cfg.model).toFixed(1)} B`
+                    : `${(cfg.lora_r * 4.2).toFixed(1)} M`}
+                </b>
+              </div>
+            </div>
+          </Panel>
 
           <button
-            onClick={handleStart}
-            disabled={starting || !config.model_name_or_path || !config.dataset_path}
-            style={{
-              fontSize: "11px",
-              padding: "10px 28px",
-              background: starting ? "transparent" : "rgba(0,229,255,0.1)",
-              borderColor: "var(--cyan)",
-              color: "var(--cyan)",
-              letterSpacing: "3px",
-            }}
+            className="btn btn-primary"
+            onClick={start}
+            style={{ justifyContent: "center" }}
           >
-            {starting ? "LAUNCHING..." : "START TRAINING"}
+            <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+              <polygon points="2,1 11,6 2,11" fill="currentColor" />
+            </svg>
+            Start training
           </button>
         </div>
+      </div>
+    </div>
+  );
+}
 
-        {error && (
-          <div
-            style={{
-              marginTop: 10,
-              padding: "6px 10px",
-              background: "rgba(255,43,214,0.1)",
-              border: "1px solid var(--magenta)",
-              color: "var(--magenta)",
-              fontSize: "11px",
-            }}
-          >
-            {error}
-          </div>
-        )}
-      </Panel>
+function NumField({
+  label,
+  value,
+  onChange,
+  step,
+}: {
+  label: string;
+  value: number;
+  onChange: (v: number) => void;
+  step?: number;
+}) {
+  return (
+    <div className="field">
+      <div className="label">{label}</div>
+      <input
+        type="number"
+        value={value}
+        step={step}
+        onChange={(e) => {
+          const v = parseFloat(e.target.value);
+          if (Number.isFinite(v)) onChange(v);
+        }}
+      />
     </div>
   );
 }

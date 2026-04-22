@@ -1,267 +1,185 @@
 /**
- * Library pane — checkpoints and LoRA adapters.
+ * Library pane — LoRA adapters / checkpoints / merged models listing with
+ * path input, scan button, tabbed segmented control, and per-row actions.
  *
- * Two tabs: Checkpoints | LoRA Adapters
- * Row actions: Open (xdg-open), Merge, Delete (with confirm)
+ * Grid row layout from the 2026-04-22 design handoff:
+ *   20px icon · 1fr name/path · step · loss · rel-time · actions
  */
-import React, { useState, useEffect, useCallback } from "react";
-import { ipc } from "../lib/ipc";
-import { useStore } from "../lib/store";
+import React, { useState } from "react";
 import { Panel } from "../chrome/VectorFrame";
+import { ipc } from "../lib/ipc";
 import type { Checkpoint } from "../lib/ipc-types";
-import { fmtRelTime } from "../lib/format";
+import { fmtRelTime, fmtLoss } from "../lib/format";
 
-type Tab = "checkpoints" | "lora";
+type Tab = "lora" | "ckpt" | "merged";
 
 export function Library() {
-  const runs = useStore((s) => s.runs);
-  const [tab, setTab] = useState<Tab>("checkpoints");
-  const [outputDir, setOutputDir] = useState("");
+  const [tab, setTab] = useState<Tab>("lora");
+  const [outputDir, setOutputDir] = useState("outputs/llama3-finetune");
   const [checkpoints, setCheckpoints] = useState<Checkpoint[]>([]);
   const [loading, setLoading] = useState(false);
-  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
 
-  const handleLoadCheckpoints = useCallback(async () => {
+  const scan = async () => {
     if (!outputDir.trim()) return;
     setLoading(true);
     try {
-      const ckpts = await ipc.listCheckpoints(outputDir.trim());
-      setCheckpoints(ckpts);
-    } catch (_e) {
+      const r = await ipc.listCheckpoints(outputDir.trim());
+      setCheckpoints(Array.isArray(r) ? r : []);
+    } catch {
       setCheckpoints([]);
     } finally {
       setLoading(false);
     }
-  }, [outputDir]);
+  };
 
-  // Auto-fill from active run
-  const activeRunId = useStore((s) => s.activeRunId);
-  useEffect(() => {
-    // Runs don't carry output_dir in summary, but we can guess
-    // In real usage the C shell would provide this
-  }, [activeRunId, runs]);
-
-  const loraAdapters = checkpoints.filter((c) => c.is_lora);
-  const modelCheckpoints = checkpoints.filter((c) => !c.is_lora);
-
-  const displayed = tab === "checkpoints" ? modelCheckpoints : loraAdapters;
+  const loraItems = checkpoints.filter((c) => c.is_lora);
+  const ckptItems = checkpoints.filter((c) => !c.is_lora);
+  const displayed =
+    tab === "lora" ? loraItems : tab === "ckpt" ? ckptItems : [];
 
   return (
-    <div style={{ height: "100%", overflowY: "auto", padding: 16 }}>
-      {/* Path input */}
-      <Panel style={{ padding: 12, marginBottom: 12 }}>
-        <div
-          style={{
-            fontSize: "9px",
-            fontFamily: "'Share Tech Mono', monospace",
-            letterSpacing: "2px",
-            color: "var(--dim)",
-            textTransform: "uppercase",
-            marginBottom: 6,
-          }}
-        >
-          Output Directory
-        </div>
-        <div style={{ display: "flex", gap: 6 }}>
+    <div className="pane">
+      <div className="pane-title">
+        <h1>Library</h1>
+        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
           <input
-            style={{
-              flex: 1,
-              background: "var(--panel-hi)",
-              border: "1px solid var(--border)",
-              color: "var(--text)",
-              padding: "6px 10px",
-              fontSize: "12px",
-              fontFamily: "inherit",
-              outline: "none",
-            }}
+            style={{ width: 300 }}
             placeholder="/path/to/outputs"
             value={outputDir}
             onChange={(e) => setOutputDir(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && handleLoadCheckpoints()}
+            onKeyDown={(e) => e.key === "Enter" && scan()}
           />
-          <button onClick={handleLoadCheckpoints} disabled={loading}>
-            {loading ? "..." : "SCAN"}
+          <button className="btn btn-ghost" onClick={scan} disabled={loading}>
+            {loading ? "..." : "Scan"}
           </button>
         </div>
-      </Panel>
-
-      {/* Tabs */}
-      <div className="seg-ctrl" style={{ marginBottom: 12 }}>
-        {(["checkpoints", "lora"] as Tab[]).map((t) => (
-          <button
-            key={t}
-            className={tab === t ? "active" : ""}
-            onClick={() => setTab(t)}
-          >
-            {t === "checkpoints" ? `CHECKPOINTS (${modelCheckpoints.length})` : `LORA (${loraAdapters.length})`}
-          </button>
-        ))}
       </div>
 
-      {/* List */}
-      <Panel style={{ overflow: "hidden" }}>
-        {displayed.length === 0 ? (
-          <div
-            style={{
-              padding: 40,
-              textAlign: "center",
-              color: "var(--dim)",
-              fontFamily: "'Share Tech Mono', monospace",
-              fontSize: "11px",
-              letterSpacing: "2px",
-            }}
+      <div style={{ display: "flex", gap: 10, marginBottom: 16 }}>
+        <div className="seg">
+          <button
+            className={tab === "lora" ? "active" : ""}
+            onClick={() => setTab("lora")}
           >
-            {loading ? "SCANNING..." : "NO ITEMS FOUND"}
-          </div>
-        ) : (
-          displayed.map((ckpt) => (
-            <div
-              key={ckpt.path}
-              style={{
-                padding: "10px 14px",
-                borderBottom: "1px solid var(--grid)",
-                display: "flex",
-                alignItems: "center",
-                gap: 12,
-              }}
-            >
-              {/* Path */}
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <div
-                  style={{
-                    fontSize: "11px",
-                    color: "var(--text)",
-                    overflow: "hidden",
-                    textOverflow: "ellipsis",
-                    whiteSpace: "nowrap",
-                  }}
-                >
-                  {ckpt.path.split("/").pop()}
-                </div>
-                <div style={{ fontSize: "10px", color: "var(--dim)", marginTop: 2 }}>
-                  {ckpt.path}
-                </div>
-              </div>
-
-              {/* Step */}
-              {ckpt.step > 0 && (
-                <div
-                  className="num"
-                  style={{
-                    fontSize: "11px",
-                    fontFamily: "'JetBrains Mono', monospace",
-                    color: "var(--amber)",
-                    flexShrink: 0,
-                  }}
-                >
-                  step {ckpt.step}
-                </div>
-              )}
-
-              {/* Loss */}
-              {ckpt.loss !== undefined && ckpt.loss > 0 && (
-                <div
-                  className="num"
-                  style={{
-                    fontSize: "11px",
-                    fontFamily: "'JetBrains Mono', monospace",
-                    color: "var(--cyan)",
-                    flexShrink: 0,
-                  }}
-                >
-                  {ckpt.loss.toFixed(4)}
-                </div>
-              )}
-
-              {/* Save time — save_time_s is seconds since epoch; convert to ms for Date */}
-              {ckpt.save_time_s && (
-                <div style={{ fontSize: "10px", color: "var(--dim)", flexShrink: 0 }}>
-                  {fmtRelTime(ckpt.save_time_s * 1000)}
-                </div>
-              )}
-
-              {/* Actions */}
-              <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
-                {ckpt.is_lora && (
-                  <button
-                    style={{ fontSize: "9px", padding: "3px 8px" }}
-                    className="btn-amber"
-                    onClick={() => {
-                      // Merge action — calls CLI through IPC
-                      // For now, show path to user
-                      alert(`Merge command:\nmud-puppy --merge-lora ${ckpt.path}`);
-                    }}
-                  >
-                    MERGE
-                  </button>
-                )}
-                <button
-                  style={{ fontSize: "9px", padding: "3px 8px" }}
-                  onClick={async () => {
-                    // xdg-open via a dedicated IPC call (not yet in manifest, stub)
-                    console.log("open:", ckpt.path);
-                  }}
-                >
-                  OPEN
-                </button>
-                <button
-                  style={{ fontSize: "9px", padding: "3px 8px" }}
-                  className="btn-danger"
-                  onClick={() => setConfirmDelete(ckpt.path)}
-                >
-                  DEL
-                </button>
-              </div>
-            </div>
-          ))
-        )}
-      </Panel>
-
-      {/* Delete confirmation dialog */}
-      {confirmDelete && (
-        <div
-          style={{
-            position: "fixed",
-            inset: 0,
-            background: "rgba(0,0,0,0.7)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            zIndex: 100,
-          }}
-        >
-          <Panel style={{ padding: 24, maxWidth: 420 }}>
-            <div
-              style={{
-                fontFamily: "'Share Tech Mono', monospace",
-                fontSize: "13px",
-                letterSpacing: "2px",
-                textTransform: "uppercase",
-                color: "var(--magenta)",
-                marginBottom: 12,
-              }}
-            >
-              Confirm Delete
-            </div>
-            <div style={{ fontSize: "11px", color: "var(--text)", marginBottom: 16, wordBreak: "break-all" }}>
-              {confirmDelete}
-            </div>
-            <div style={{ display: "flex", gap: 10 }}>
-              <button
-                className="btn-danger"
-                onClick={() => {
-                  // Deletion is USER-only operation; report to user to execute
-                  alert(`To delete, run:\nrm -rf "${confirmDelete}"`);
-                  setConfirmDelete(null);
-                }}
-              >
-                CONFIRM DELETE
-              </button>
-              <button onClick={() => setConfirmDelete(null)}>CANCEL</button>
-            </div>
-          </Panel>
+            LoRA adapters ({loraItems.length})
+          </button>
+          <button
+            className={tab === "ckpt" ? "active" : ""}
+            onClick={() => setTab("ckpt")}
+          >
+            Checkpoints ({ckptItems.length})
+          </button>
+          <button
+            className={tab === "merged" ? "active" : ""}
+            onClick={() => setTab("merged")}
+          >
+            Merged models (0)
+          </button>
         </div>
-      )}
+      </div>
+
+      <Panel>
+        <div className="lib-list">
+          {displayed.length === 0 && (
+            <div
+              style={{
+                padding: 40,
+                textAlign: "center",
+                color: "var(--text-dim)",
+                fontFamily: "var(--font-heading)",
+                fontSize: 11,
+                letterSpacing: "2px",
+              }}
+            >
+              {loading
+                ? "SCANNING..."
+                : tab === "merged"
+                ? "NO MERGED MODELS YET"
+                : "NO ITEMS FOUND. RUN SCAN TO REFRESH."}
+            </div>
+          )}
+          {displayed.map((c) => {
+            const base = c.path.split("/").pop() || c.path;
+            return (
+              <div key={c.path} className="lib-row">
+                <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                  <rect
+                    x="1.5"
+                    y="2.5"
+                    width="13"
+                    height="11"
+                    stroke="var(--cyan)"
+                    strokeWidth="0.8"
+                    fill="none"
+                  />
+                  <line
+                    x1="1.5"
+                    y1="6"
+                    x2="14.5"
+                    y2="6"
+                    stroke="var(--cyan)"
+                    strokeWidth="0.8"
+                  />
+                  <circle cx="4" cy="4.25" r="0.6" fill="var(--amber)" />
+                </svg>
+                <div>
+                  <div className="lib-name">{base}</div>
+                  <div className="lib-path">{c.path}</div>
+                </div>
+                <div
+                  className="num"
+                  style={{ color: "var(--amber)", fontSize: 12 }}
+                >
+                  step {c.step}
+                </div>
+                <div
+                  className="num"
+                  style={{ color: "var(--cyan)", fontSize: 12 }}
+                >
+                  {c.loss != null ? `loss ${fmtLoss(c.loss)}` : "—"}
+                </div>
+                <div
+                  className="num"
+                  style={{ color: "var(--dim)", fontSize: 11 }}
+                >
+                  {c.save_time_s != null
+                    ? fmtRelTime(c.save_time_s * 1000)
+                    : "—"}
+                </div>
+                <div style={{ display: "flex", gap: 6 }}>
+                  {c.is_lora && (
+                    <button
+                      className="btn btn-amber"
+                      style={{ padding: "4px 10px", fontSize: 9 }}
+                      onClick={() =>
+                        alert(`Merge command:\nmud-puppy --merge-lora ${c.path}`)
+                      }
+                    >
+                      Merge
+                    </button>
+                  )}
+                  <button
+                    className="btn btn-ghost"
+                    style={{ padding: "4px 10px", fontSize: 9 }}
+                    onClick={() => console.log("open:", c.path)}
+                  >
+                    Open
+                  </button>
+                  <button
+                    className="btn btn-danger"
+                    style={{ padding: "4px 10px", fontSize: 9 }}
+                    onClick={() =>
+                      alert(`To delete, run:\nrm -rf "${c.path}"`)
+                    }
+                  >
+                    Del
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </Panel>
     </div>
   );
 }

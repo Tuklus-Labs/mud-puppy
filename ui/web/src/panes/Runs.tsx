@@ -1,269 +1,195 @@
 /**
- * Runs pane — history and comparison of past runs.
- *
- * Features:
- * - List of runs with name, method, model, final loss, duration, date
- * - Click to navigate to Monitor for that run
- * - Checkbox select for two-run compare overlay on LossChart
+ * Runs pane — proper <table> with method chips, status dots, compare
+ * checkboxes, and active-run highlighting that does NOT cross text (fixed
+ * in the 2026-04-22 design handoff by using border cells instead of
+ * :first-child inset-shadow).
  */
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
+import { Panel } from "../chrome/VectorFrame";
 import { ipc } from "../lib/ipc";
 import { useStore } from "../lib/store";
-import { Panel } from "../chrome/VectorFrame";
-import { fmtLoss, fmtDuration, fmtRelTime } from "../lib/format";
+import { fmtDuration, fmtRelTime, fmtLoss } from "../lib/format";
+
+type StatusFilter = "all" | "running" | "complete" | "failed";
 
 export function Runs() {
   const runs = useStore((s) => s.runs);
   const setRuns = useStore((s) => s.setRuns);
-  const activeRunId = useStore((s) => s.activeRunId);
   const setActiveRunId = useStore((s) => s.setActiveRunId);
-  const compareRunId = useStore((s) => s.compareRunId);
-  const setCompareRunId = useStore((s) => s.setCompareRunId);
   const setActivePane = useStore((s) => s.setActivePane);
-  const [loading, setLoading] = useState(false);
+
+  const [filter, setFilter] = useState<StatusFilter>("all");
+  const [compareSet, setCompareSet] = useState<Set<string>>(new Set());
 
   useEffect(() => {
-    setLoading(true);
-    ipc.listRuns().then((rs) => {
-      setRuns(rs);
-      setLoading(false);
-    }).catch(() => setLoading(false));
+    let alive = true;
+    ipc
+      .listRuns()
+      .then((r) => {
+        if (alive && Array.isArray(r)) setRuns(r);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
   }, [setRuns]);
 
-  const handleSelect = (runId: string) => {
-    setActiveRunId(runId);
+  const filtered = useMemo(() => {
+    if (filter === "all") return runs;
+    return runs.filter((r) => r.status === filter);
+  }, [runs, filter]);
+
+  const activeCount = runs.filter((r) => r.status === "running").length;
+
+  const toggleCompare = (id: string) => {
+    setCompareSet((s) => {
+      const n = new Set(s);
+      if (n.has(id)) n.delete(id);
+      else n.add(id);
+      return n;
+    });
+  };
+
+  const openRun = (run_id: string) => {
+    setActiveRunId(run_id);
     setActivePane("monitor");
   };
 
-  const handleCompareToggle = (runId: string) => {
-    if (compareRunId === runId) {
-      setCompareRunId(null);
-    } else {
-      setCompareRunId(runId);
-    }
-  };
-
-  if (loading) {
-    return (
-      <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          height: "100%",
-          color: "var(--dim)",
-          fontFamily: "'Share Tech Mono', monospace",
-          fontSize: "11px",
-          letterSpacing: "2px",
-        }}
-      >
-        LOADING RUNS...
-      </div>
-    );
-  }
-
   return (
-    <div style={{ height: "100%", overflowY: "auto", padding: 16 }}>
-      <Panel
-        label={`Runs (${runs.length})`}
-        style={{ height: "100%", overflow: "hidden" }}
-      >
-        {/* Header row */}
-        <div
-          style={{
-            display: "grid",
-            gridTemplateColumns: "24px 1fr 80px 80px 70px 80px 32px",
-            gap: 8,
-            padding: "8px 12px",
-            borderBottom: "1px solid var(--border)",
-            fontSize: "9px",
-            fontFamily: "'Share Tech Mono', monospace",
-            letterSpacing: "2px",
-            textTransform: "uppercase",
-            color: "var(--dim)",
-          }}
-        >
-          <span></span>
-          <span>Model</span>
-          <span>Method</span>
-          <span>Loss</span>
-          <span>Duration</span>
-          <span>Started</span>
-          <span>CMP</span>
-        </div>
-
-        {runs.length === 0 ? (
-          <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              padding: 40,
-              color: "var(--dim)",
-              fontFamily: "'Share Tech Mono', monospace",
-              fontSize: "11px",
-              letterSpacing: "2px",
-            }}
+    <div className="pane">
+      <div className="pane-title">
+        <h1>Runs</h1>
+        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+          <span
+            className="mono"
+            style={{ fontSize: "var(--f-micro)", color: "var(--dim)" }}
           >
-            NO RUNS YET
+            {runs.length} runs · {activeCount} active
+          </span>
+          <div className="seg">
+            {(["all", "running", "complete", "failed"] as const).map((s) => (
+              <button
+                key={s}
+                className={filter === s ? "active" : ""}
+                onClick={() => setFilter(s)}
+              >
+                {s}
+              </button>
+            ))}
           </div>
-        ) : (
-          <div style={{ overflowY: "auto", height: "calc(100% - 40px)" }}>
-            {runs.map((run) => {
-              const isActive = run.run_id === activeRunId;
-              const isCompare = run.run_id === compareRunId;
-
-              return (
-                <div
-                  key={run.run_id}
-                  style={{
-                    display: "grid",
-                    gridTemplateColumns: "24px 1fr 80px 80px 70px 80px 32px",
-                    gap: 8,
-                    padding: "8px 12px",
-                    borderBottom: "1px solid var(--grid)",
-                    cursor: "pointer",
-                    background: isActive ? "rgba(0,229,255,0.06)" : "transparent",
-                    transition: "background 0.15s",
-                    alignItems: "center",
-                  }}
-                  onMouseEnter={(e) => {
-                    if (!isActive) e.currentTarget.style.background = "rgba(255,255,255,0.03)";
-                  }}
-                  onMouseLeave={(e) => {
-                    e.currentTarget.style.background = isActive ? "rgba(0,229,255,0.06)" : "transparent";
-                  }}
-                  onClick={() => handleSelect(run.run_id)}
-                >
-                  {/* Status dot */}
-                  <div style={{ display: "flex", justifyContent: "center" }}>
-                    <div
-                      className={`status-dot ${run.status === "running" ? "running" : run.status === "failed" ? "error" : "idle"}`}
-                      style={{ width: 7, height: 7 }}
-                    />
-                  </div>
-
-                  {/* Model */}
-                  <div
-                    style={{
-                      fontSize: "11px",
-                      color: isActive ? "var(--cyan)" : "var(--text)",
-                      overflow: "hidden",
-                      textOverflow: "ellipsis",
-                      whiteSpace: "nowrap",
-                    }}
-                  >
-                    {run.model}
-                  </div>
-
-                  {/* Method */}
-                  <div
-                    style={{
-                      fontSize: "10px",
-                      fontFamily: "'Share Tech Mono', monospace",
-                      letterSpacing: "1px",
-                      textTransform: "uppercase",
-                      color: "var(--amber)",
-                    }}
-                  >
-                    {run.method}
-                  </div>
-
-                  {/* Loss */}
-                  <div
-                    className="num"
-                    style={{
-                      fontSize: "11px",
-                      fontFamily: "'JetBrains Mono', monospace",
-                      color: run.final_loss ? "var(--lime)" : "var(--dim)",
-                    }}
-                  >
-                    {run.final_loss ? fmtLoss(run.final_loss) : "--"}
-                  </div>
-
-                  {/* Duration */}
-                  <div
-                    className="num"
-                    style={{
-                      fontSize: "10px",
-                      fontFamily: "'JetBrains Mono', monospace",
-                      color: "var(--dim)",
-                    }}
-                  >
-                    {fmtDuration(run.start_time, run.end_time)}
-                  </div>
-
-                  {/* Started */}
-                  <div
-                    style={{ fontSize: "10px", color: "var(--dim)" }}
-                  >
-                    {fmtRelTime(run.start_time)}
-                  </div>
-
-                  {/* Compare checkbox */}
-                  <div
-                    style={{
-                      display: "flex",
-                      justifyContent: "center",
-                    }}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      handleCompareToggle(run.run_id);
-                    }}
-                  >
-                    <div
-                      style={{
-                        width: 14,
-                        height: 14,
-                        border: `1px solid ${isCompare ? "var(--magenta)" : "var(--border)"}`,
-                        background: isCompare ? "rgba(255,43,214,0.2)" : "transparent",
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "center",
-                      }}
-                    >
-                      {isCompare && (
-                        <div style={{ width: 6, height: 6, background: "var(--magenta)" }} />
-                      )}
-                    </div>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        )}
-      </Panel>
-
-      {compareRunId && (
-        <div
-          style={{
-            marginTop: 8,
-            padding: "6px 10px",
-            background: "rgba(255,43,214,0.1)",
-            border: "1px solid var(--magenta)",
-            fontSize: "10px",
-            fontFamily: "'Share Tech Mono', monospace",
-            letterSpacing: "1px",
-            color: "var(--magenta)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-          }}
-        >
-          <span>COMPARE MODE: {compareRunId.slice(0, 20)}</span>
-          <button
-            onClick={() => setCompareRunId(null)}
-            style={{
-              fontSize: "9px",
-              padding: "2px 8px",
-              borderColor: "var(--magenta)",
-              color: "var(--magenta)",
-            }}
-          >
-            CLEAR
+          <button className="btn btn-ghost" disabled={compareSet.size !== 2}>
+            Compare ({compareSet.size})
           </button>
         </div>
-      )}
+      </div>
+
+      <Panel>
+        <table className="runs-table">
+          <thead>
+            <tr>
+              <th style={{ width: 24 }}></th>
+              <th>Run</th>
+              <th>Model</th>
+              <th>Method</th>
+              <th>Final loss</th>
+              <th>Steps</th>
+              <th>Duration</th>
+              <th>Started</th>
+              <th style={{ width: 40, textAlign: "center" }}>CMP</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.map((r) => {
+              const active = r.status === "running";
+              const stepsCell =
+                r.status === "running"
+                  ? `${r.steps_done ?? 0}/${r.steps_total ?? "?"}`
+                  : r.status === "failed"
+                  ? "— (error)"
+                  : "complete";
+              const durMs =
+                r.end_time != null
+                  ? r.end_time - r.start_time
+                  : Date.now() - r.start_time;
+              return (
+                <tr
+                  key={r.run_id}
+                  className={active ? "active" : ""}
+                  onClick={() => openRun(r.run_id)}
+                >
+                  <td>
+                    <span
+                      className={`dot ${
+                        r.status === "running"
+                          ? "running"
+                          : r.status === "failed"
+                          ? "error"
+                          : "idle"
+                      }`}
+                    />
+                  </td>
+                  <td className="num" style={{ color: "var(--text-dim)" }}>
+                    {r.run_id}
+                  </td>
+                  <td>{r.model}</td>
+                  <td>
+                    <span className={`method-chip ${r.method}`}>
+                      {r.method}
+                    </span>
+                  </td>
+                  <td
+                    className="num"
+                    style={{
+                      color:
+                        r.final_loss != null ? "var(--lime)" : "var(--dim)",
+                    }}
+                  >
+                    {r.final_loss != null ? fmtLoss(r.final_loss) : "—"}
+                  </td>
+                  <td className="num dim">{stepsCell}</td>
+                  <td className="num dim">
+                    {durMs > 0 ? fmtDuration(0, durMs) : "—"}
+                  </td>
+                  <td className="dim">{fmtRelTime(r.start_time)}</td>
+                  <td
+                    style={{ textAlign: "center" }}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      toggleCompare(r.run_id);
+                    }}
+                  >
+                    <span
+                      className={`chk ${compareSet.has(r.run_id) ? "on" : ""}`}
+                      style={{
+                        borderColor: compareSet.has(r.run_id)
+                          ? "var(--magenta)"
+                          : undefined,
+                        background: compareSet.has(r.run_id)
+                          ? "rgba(255,43,214,0.18)"
+                          : undefined,
+                      }}
+                    />
+                  </td>
+                </tr>
+              );
+            })}
+            {filtered.length === 0 && (
+              <tr>
+                <td
+                  colSpan={9}
+                  style={{
+                    padding: 40,
+                    textAlign: "center",
+                    color: "var(--text-dim)",
+                  }}
+                >
+                  No runs match the current filter.
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </Panel>
     </div>
   );
 }

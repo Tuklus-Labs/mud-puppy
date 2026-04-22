@@ -1,13 +1,11 @@
 /**
- * App shell — sidebar navigation + active pane.
- *
- * Keyboard shortcuts:
- *   1-5: jump to panes (Launch, Monitor, Runs, Library, Logs)
- *   Ctrl+Shift+M: toggle WebGL background
+ * Shell — header, 180px nav rail, main pane area, 28px footer status bar.
+ * Layout per the 2026-04-22 design handoff.
  */
 import React, { useEffect, useCallback } from "react";
 import { useStore } from "./lib/store";
 import { Background } from "./chrome/Background";
+import { BrandMark, NavIcon } from "./chrome/BrandMark";
 import { Launch } from "./panes/Launch";
 import { Monitor } from "./panes/Monitor";
 import { Runs } from "./panes/Runs";
@@ -16,24 +14,13 @@ import { Logs } from "./panes/Logs";
 
 type Pane = "launch" | "monitor" | "runs" | "library" | "logs";
 
-const PANES: { id: Pane; label: string; key: string }[] = [
-  { id: "launch",  label: "LAUNCH",  key: "1" },
-  { id: "monitor", label: "MONITOR", key: "2" },
-  { id: "runs",    label: "RUNS",    key: "3" },
-  { id: "library", label: "LIBRARY", key: "4" },
-  { id: "logs",    label: "LOGS",    key: "5" },
+const NAV: { id: Pane; label: string; key: string }[] = [
+  { id: "launch",  label: "Launch",  key: "1" },
+  { id: "monitor", label: "Monitor", key: "2" },
+  { id: "runs",    label: "Runs",    key: "3" },
+  { id: "library", label: "Library", key: "4" },
+  { id: "logs",    label: "Logs",    key: "5" },
 ];
-
-function PaneContent({ pane }: { pane: Pane }) {
-  switch (pane) {
-    case "launch":  return <Launch />;
-    case "monitor": return <Monitor />;
-    case "runs":    return <Runs />;
-    case "library": return <Library />;
-    case "logs":    return <Logs />;
-    default:        return <Launch />;
-  }
-}
 
 export function App() {
   const activePane = useStore((s) => s.activePane);
@@ -47,22 +34,24 @@ export function App() {
 
   const handleKey = useCallback(
     (e: KeyboardEvent) => {
-      // Ctrl+Shift+M: toggle background
       if (e.ctrlKey && e.shiftKey && e.key === "M") {
         e.preventDefault();
         toggleBackground();
         return;
       }
-      // Number keys 1-5: switch panes
       if (!e.ctrlKey && !e.altKey && !e.metaKey) {
-        const pane = PANES.find((p) => p.key === e.key);
-        if (pane && !(e.target instanceof HTMLInputElement) && !(e.target instanceof HTMLTextAreaElement)) {
+        const hit = NAV.find((n) => n.key === e.key);
+        if (
+          hit &&
+          !(e.target instanceof HTMLInputElement) &&
+          !(e.target instanceof HTMLTextAreaElement)
+        ) {
           e.preventDefault();
-          setActivePane(pane.id);
+          setActivePane(hit.id);
         }
       }
     },
-    [setActivePane, toggleBackground]
+    [setActivePane, toggleBackground],
   );
 
   useEffect(() => {
@@ -70,191 +59,114 @@ export function App() {
     return () => window.removeEventListener("keydown", handleKey);
   }, [handleKey]);
 
+  let body: React.ReactNode = null;
+  if (activePane === "launch") body = <Launch />;
+  else if (activePane === "monitor") body = <Monitor />;
+  else if (activePane === "runs") body = <Runs />;
+  else if (activePane === "library") body = <Library />;
+  else body = <Logs />;
+
   return (
-    <div
-      className="scanlines"
-      style={{
-        display: "flex",
-        flexDirection: "column",
-        height: "100%",
-        width: "100%",
-        position: "relative",
-        zIndex: 1,
-      }}
-    >
-      {/* WebGL background */}
+    <div className="shell scanlines">
       <Background />
 
-      {/* Header bar */}
-      <header
-        style={{
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "space-between",
-          padding: "6px 16px",
-          borderBottom: "1px solid var(--border)",
-          background: "rgba(11, 18, 32, 0.95)",
-          zIndex: 10,
-          flexShrink: 0,
-        }}
-      >
-        {/* Title */}
-        <div
-          className="mono-heading"
-          style={{
-            fontSize: 14,
-            letterSpacing: 4,
-            color: "var(--cyan)",
-            display: "flex",
-            alignItems: "center",
-            gap: 10,
-          }}
-        >
-          <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-            <polygon
-              points="2,8 8,2 14,8 8,14"
-              stroke="var(--cyan)"
-              strokeWidth="1"
-              fill="none"
-            />
-            <circle cx="8" cy="8" r="2" fill="var(--amber)" />
-          </svg>
-          MUD-PUPPY STUDIO
+      <header className="header">
+        <div className="brand">
+          <BrandMark size={22} />
+          <div className="brand-name">MUD · PUPPY</div>
+          <div className="brand-sep" />
+          <div className="brand-sub">Fine-Tune Studio</div>
         </div>
-
-        {/* Status */}
-        <div style={{ display: "flex", alignItems: "center", gap: 16, fontSize: 10 }}>
-          {isRunning && (
-            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-              <div className="status-dot running" />
-              <span
-                style={{
-                  fontFamily: "'Share Tech Mono', monospace",
-                  letterSpacing: "2px",
-                  textTransform: "uppercase",
-                  color: "var(--lime)",
-                }}
-              >
-                TRAINING
+        <div className="header-right">
+          {isRunning && activeRun && (
+            <div className="header-stat">
+              <span className="dot running" />
+              <span className="label-inline" style={{ color: "var(--lime)" }}>
+                Training
               </span>
+              {activeRun.steps_total && activeRun.steps_done != null && (
+                <span className="val">
+                  step {activeRun.steps_done.toLocaleString()} /{" "}
+                  {activeRun.steps_total.toLocaleString()}
+                </span>
+              )}
             </div>
           )}
-          <span
-            style={{
-              fontFamily: "'Share Tech Mono', monospace",
-              letterSpacing: "1px",
-              color: "var(--dim)",
-            }}
-          >
-            v0.4.0
-          </span>
+          <div className="ver">v0.4.0</div>
         </div>
       </header>
 
-      {/* Body: sidebar + pane */}
-      <div style={{ display: "flex", flex: 1, overflow: "hidden" }}>
-        {/* Sidebar */}
-        <nav
-          style={{
-            width: 120,
-            flexShrink: 0,
-            borderRight: "1px solid var(--border)",
-            background: "rgba(11, 18, 32, 0.9)",
-            display: "flex",
-            flexDirection: "column",
-            padding: "8px 0",
-            zIndex: 5,
-          }}
+      <nav className="nav">
+        <div className="nav-section">Workspace</div>
+        {NAV.map((n) => {
+          const active = activePane === n.id;
+          return (
+            <button
+              key={n.id}
+              className={`nav-item ${active ? "active" : ""}`}
+              onClick={() => setActivePane(n.id)}
+            >
+              <NavIcon id={n.id} active={active} />
+              {n.label}
+              {n.id === "monitor" && isRunning ? (
+                <span className="nav-alert" />
+              ) : (
+                <span className="nav-key">{n.key}</span>
+              )}
+            </button>
+          );
+        })}
+        <div style={{ flex: 1 }} />
+        <div className="nav-section" style={{ marginTop: 0 }}>
+          System
+        </div>
+        <button
+          className="nav-item"
+          onClick={toggleBackground}
+          title="Toggle background (Ctrl+Shift+M)"
+          aria-label="Toggle background animation"
         >
-          {PANES.map((p) => {
-            const active = p.id === activePane;
-            const hasAlert = p.id === "monitor" && isRunning;
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+            <circle cx="7" cy="7" r="2.2" stroke="currentColor" strokeWidth="0.8" />
+            <circle cx="7" cy="7" r="5.5" stroke="currentColor" strokeWidth="0.8" />
+            <line x1="7" y1="0.5" x2="7" y2="2.5" stroke="currentColor" strokeWidth="0.8" />
+            <line x1="7" y1="11.5" x2="7" y2="13.5" stroke="currentColor" strokeWidth="0.8" />
+            <line x1="0.5" y1="7" x2="2.5" y2="7" stroke="currentColor" strokeWidth="0.8" />
+            <line x1="11.5" y1="7" x2="13.5" y2="7" stroke="currentColor" strokeWidth="0.8" />
+          </svg>
+          Display
+        </button>
+      </nav>
 
-            return (
-              <button
-                key={p.id}
-                onClick={() => setActivePane(p.id)}
-                style={{
-                  width: "100%",
-                  padding: "10px 12px",
-                  textAlign: "left",
-                  background: active ? "rgba(0,229,255,0.08)" : "transparent",
-                  border: "none",
-                  borderLeft: `2px solid ${active ? "var(--cyan)" : "transparent"}`,
-                  color: active ? "var(--cyan)" : "var(--dim)",
-                  fontFamily: "'Share Tech Mono', monospace",
-                  fontSize: "10px",
-                  letterSpacing: "2px",
-                  cursor: "pointer",
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 6,
-                  borderRadius: "0 !important",
-                  transition: "all 0.15s",
-                }}
-              >
-                {/* Key hint */}
-                <span
-                  style={{
-                    color: "var(--border)",
-                    fontSize: "8px",
-                    fontFamily: "'JetBrains Mono', monospace",
-                    flexShrink: 0,
-                  }}
-                >
-                  {p.key}
-                </span>
-                {p.label}
-                {hasAlert && (
-                  <div
-                    className="status-dot running"
-                    style={{ width: 5, height: 5, marginLeft: "auto" }}
-                  />
-                )}
-              </button>
-            );
-          })}
+      <main className="main">{body}</main>
 
-          {/* Spacer */}
-          <div style={{ flex: 1 }} />
-
-          {/* Background toggle */}
-          <button
-            onClick={toggleBackground}
-            aria-label="Toggle background animation"
-            style={{
-              width: "100%",
-              padding: "8px 12px",
-              textAlign: "left",
-              background: "transparent",
-              border: "none",
-              borderLeft: "2px solid transparent",
-              color: "var(--dim)",
-              fontFamily: "'Share Tech Mono', monospace",
-              fontSize: "8px",
-              letterSpacing: "1px",
-              cursor: "pointer",
-              opacity: 0.6,
-            }}
-            title="Ctrl+Shift+M"
-          >
-            [M] BG
-          </button>
-        </nav>
-
-        {/* Active pane */}
-        <main
-          style={{
-            flex: 1,
-            overflow: "hidden",
-            background: "rgba(5, 7, 13, 0.85)",
-            position: "relative",
-            zIndex: 2,
-          }}
-        >
-          <PaneContent pane={activePane} />
-        </main>
-      </div>
+      <footer className="foot">
+        <div className="foot-group">
+          <span>
+            <b>mud-puppy</b>
+          </span>
+          <span className="foot-sep">·</span>
+          <span>
+            daemon{" "}
+            <span style={{ color: "var(--lime)" }}>
+              {isRunning ? "active" : "idle"}
+            </span>
+          </span>
+        </div>
+        <div className="foot-group">
+          <span>ROCm 7.1</span>
+          <span className="foot-sep">·</span>
+          <span>torch 2.10</span>
+          <span className="foot-sep">·</span>
+          <span>
+            <span className="kbd">1</span>–<span className="kbd">5</span> navigate
+          </span>
+          <span className="foot-sep">·</span>
+          <span>
+            <span className="kbd">Ctrl+Shift+M</span> bg
+          </span>
+        </div>
+      </footer>
     </div>
   );
 }

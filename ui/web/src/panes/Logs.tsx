@@ -1,298 +1,178 @@
 /**
- * Logs pane — virtualized stderr tail from sidecar.
+ * Logs pane — filter toolbar + level chips + virtualized row list.
  *
- * Features:
- * - Virtualized list (100px visible window using CSS)
- * - Filter box (substring)
- * - Level chips: info / warn / error
- * - Copy-all button
+ * Grid: 88px timestamp · 52px level · 1fr message. Rows are fixed 20px tall
+ * so windowed virtualization works from scrollTop/rowHeight. Virtualization
+ * is critical at 10k lines or the Logs pane freezes the app when training
+ * is hot.
  */
-import React, { useRef, useEffect, useState, useMemo } from "react";
-import { useStore } from "../lib/store";
-import type { LogEntry } from "../lib/store";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Panel } from "../chrome/VectorFrame";
+import { useStore } from "../lib/store";
 
-const LEVEL_COLORS: Record<LogEntry["level"], string> = {
-  info: "var(--dim)",
-  warn: "var(--amber)",
-  error: "var(--magenta)",
-};
-
-const LEVEL_LABELS: LogEntry["level"][] = ["info", "warn", "error"];
-
-// Virtualization constants
-const ROW_HEIGHT = 18;      // px, fixed monospace row height
-const OVERSCAN  = 10;       // extra rows buffered on each end
+const ROW_HEIGHT = 20;
+const OVERSCAN = 10;
 
 export function Logs() {
   const logs = useStore((s) => s.logs);
   const logFilter = useStore((s) => s.logFilter);
   const setLogFilter = useStore((s) => s.setLogFilter);
-  const activeRunId = useStore((s) => s.activeRunId);
 
-  const [levelFilter, setLevelFilter] = useState<Set<LogEntry["level"]>>(
-    new Set(["info", "warn", "error"])
-  );
-  const [autoScroll, setAutoScroll] = useState(true);
-  const listRef = useRef<HTMLDivElement>(null);
+  const [levels, setLevels] = useState({ info: true, warn: true, error: true });
+  const [live, setLive] = useState(true);
 
-  // Windowing state
+  const filtered = useMemo(() => {
+    const needle = logFilter.toLowerCase();
+    return logs.filter(
+      (l) =>
+        levels[l.level as keyof typeof levels] &&
+        (!needle || l.line.toLowerCase().includes(needle)),
+    );
+  }, [logs, logFilter, levels]);
+
+  // ───── Windowed virtualization ─────
+  const scrollRef = useRef<HTMLDivElement>(null);
   const [scrollTop, setScrollTop] = useState(0);
-  const [viewportH, setViewportH] = useState(400);
+  const [viewportH, setViewportH] = useState(0);
 
-  const filteredLogs = useMemo(() => {
-    return logs.filter((entry) => {
-      if (!levelFilter.has(entry.level)) return false;
-      if (activeRunId && entry.run_id && entry.run_id !== activeRunId) return false;
-      if (logFilter && !entry.line.toLowerCase().includes(logFilter.toLowerCase())) return false;
-      return true;
-    });
-  }, [logs, logFilter, levelFilter, activeRunId]);
-
-  // Track viewport height via ResizeObserver
   useEffect(() => {
-    const el = listRef.current;
+    const el = scrollRef.current;
     if (!el) return;
-    setViewportH(el.clientHeight);
-    const ro = new ResizeObserver(() => {
-      if (listRef.current) setViewportH(listRef.current.clientHeight);
+    const ro = new ResizeObserver((entries) => {
+      const h = entries[0]?.contentRect.height ?? 0;
+      setViewportH(h);
     });
     ro.observe(el);
     return () => ro.disconnect();
   }, []);
 
-  // Auto-scroll to bottom when new lines arrive
+  // Auto-scroll to bottom in live mode when new entries arrive.
   useEffect(() => {
-    if (autoScroll && listRef.current) {
-      listRef.current.scrollTop = listRef.current.scrollHeight;
-    }
-  }, [filteredLogs.length, autoScroll]);
+    if (!live || !scrollRef.current) return;
+    const el = scrollRef.current;
+    el.scrollTop = el.scrollHeight;
+  }, [filtered.length, live]);
 
-  // Window slice
-  const total = filteredLogs.length;
+  const totalHeight = filtered.length * ROW_HEIGHT;
   const visibleCount = Math.ceil(viewportH / ROW_HEIGHT) + OVERSCAN;
-  const firstVisible = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN);
-  const lastVisible = Math.min(total, firstVisible + visibleCount + OVERSCAN);
-  const windowSlice = filteredLogs.slice(firstVisible, lastVisible);
-  const padTop = firstVisible * ROW_HEIGHT;
-  const padBottom = Math.max(0, (total - lastVisible) * ROW_HEIGHT);
+  const firstVisible = Math.max(
+    0,
+    Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN,
+  );
+  const lastVisible = Math.min(
+    filtered.length,
+    firstVisible + visibleCount + OVERSCAN,
+  );
+  const window = filtered.slice(firstVisible, lastVisible);
+  const topSpacer = firstVisible * ROW_HEIGHT;
+  const bottomSpacer = (filtered.length - lastVisible) * ROW_HEIGHT;
 
-  const handleScroll = () => {
-    if (!listRef.current) return;
-    const el = listRef.current;
-    setScrollTop(el.scrollTop);
-    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
-    setAutoScroll(atBottom);
-  };
-
-  const handleCopyAll = () => {
-    const text = filteredLogs.map((e) => e.line).join("\n");
-    navigator.clipboard.writeText(text).catch(() => {
-      // Fallback for non-HTTPS
-      const ta = document.createElement("textarea");
-      ta.value = text;
-      document.body.appendChild(ta);
-      ta.select();
-      document.execCommand("copy");
-      document.body.removeChild(ta);
-    });
-  };
-
-  const toggleLevel = (level: LogEntry["level"]) => {
-    setLevelFilter((prev) => {
-      const next = new Set(prev);
-      if (next.has(level)) {
-        if (next.size > 1) next.delete(level); // Keep at least one
-      } else {
-        next.add(level);
-      }
-      return next;
-    });
+  const copyAll = () => {
+    const txt = filtered
+      .map(
+        (l) =>
+          `${new Date(l.timestamp).toISOString().slice(11, 19)} ${l.level.toUpperCase()} ${l.line}`,
+      )
+      .join("\n");
+    navigator.clipboard?.writeText(txt).catch(() => {});
   };
 
   return (
-    <div
-      style={{
-        display: "flex",
-        flexDirection: "column",
-        height: "100%",
-        padding: "8px 12px",
-      }}
-    >
-      {/* Toolbar */}
-      <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 10,
-          marginBottom: 8,
-          flexShrink: 0,
-        }}
-      >
-        {/* Filter input */}
+    <div className="pane">
+      <div className="pane-title">
+        <h1>Logs</h1>
+        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+          <span
+            className="mono"
+            style={{ fontSize: "var(--f-micro)", color: "var(--dim)" }}
+          >
+            {filtered.length.toLocaleString()} / {logs.length.toLocaleString()}{" "}
+            lines
+          </span>
+          <button className="btn btn-ghost" onClick={copyAll}>
+            Copy all
+          </button>
+          <button
+            className={`btn ${live ? "btn-lime" : "btn-ghost"}`}
+            onClick={() => setLive((l) => !l)}
+          >
+            <span
+              className="dot"
+              style={{
+                width: 6,
+                height: 6,
+                background: live ? "var(--lime)" : "var(--dim)",
+                boxShadow: live ? "0 0 6px var(--lime)" : "none",
+              }}
+            />
+            {live ? "Live" : "Paused"}
+          </button>
+        </div>
+      </div>
+
+      <div className="logs-toolbar">
         <input
-          style={{
-            flex: 1,
-            background: "var(--panel-hi)",
-            border: "1px solid var(--border)",
-            color: "var(--text)",
-            padding: "5px 10px",
-            fontSize: "11px",
-            fontFamily: "'JetBrains Mono', monospace",
-            outline: "none",
-          }}
-          placeholder="filter..."
           value={logFilter}
           onChange={(e) => setLogFilter(e.target.value)}
+          placeholder="filter logs…"
+          style={{ flex: 1 }}
         />
-
-        {/* Level chips */}
-        <div style={{ display: "flex", gap: 4 }}>
-          {LEVEL_LABELS.map((level) => (
+        <div className="seg">
+          {(["info", "warn", "error"] as const).map((l) => (
             <button
-              key={level}
-              onClick={() => toggleLevel(level)}
+              key={l}
+              className={levels[l] ? "active" : ""}
+              onClick={() => setLevels((s) => ({ ...s, [l]: !s[l] }))}
               style={{
-                fontSize: "9px",
-                padding: "3px 8px",
-                borderColor: levelFilter.has(level) ? LEVEL_COLORS[level] : "var(--border)",
-                color: levelFilter.has(level) ? LEVEL_COLORS[level] : "var(--dim)",
-                background: levelFilter.has(level)
-                  ? `${LEVEL_COLORS[level]}22`
-                  : "transparent",
+                color: levels[l]
+                  ? l === "warn"
+                    ? "var(--amber)"
+                    : l === "error"
+                    ? "var(--magenta)"
+                    : "var(--cyan)"
+                  : undefined,
               }}
             >
-              {level.toUpperCase()}
+              {l}
             </button>
           ))}
         </div>
-
-        {/* Count */}
-        <span
-          style={{
-            fontSize: "10px",
-            fontFamily: "'JetBrains Mono', monospace",
-            color: "var(--dim)",
-            minWidth: 60,
-            textAlign: "right",
-          }}
-        >
-          {filteredLogs.length} lines
-        </span>
-
-        {/* Copy button */}
-        <button
-          onClick={handleCopyAll}
-          style={{ fontSize: "9px", padding: "3px 10px" }}
-        >
-          COPY
-        </button>
-
-        {/* Auto-scroll indicator */}
-        <button
-          onClick={() => {
-            setAutoScroll(true);
-            if (listRef.current) {
-              listRef.current.scrollTop = listRef.current.scrollHeight;
-            }
-          }}
-          style={{
-            fontSize: "9px",
-            padding: "3px 8px",
-            borderColor: autoScroll ? "var(--lime)" : "var(--border)",
-            color: autoScroll ? "var(--lime)" : "var(--dim)",
-          }}
-        >
-          {autoScroll ? "LIVE" : "TAIL"}
-        </button>
       </div>
 
-      {/* Log list */}
-      <Panel
-        style={{
-          flex: 1,
-          overflow: "hidden",
-          display: "flex",
-          flexDirection: "column",
-        }}
-      >
+      <Panel bodyStyle={{ padding: "12px 0" }}>
         <div
-          ref={listRef}
-          onScroll={handleScroll}
-          style={{
-            flex: 1,
-            overflowY: "auto",
-            padding: "6px 0",
-          }}
+          ref={scrollRef}
+          onScroll={(e) => setScrollTop((e.target as HTMLDivElement).scrollTop)}
+          style={{ height: "calc(100vh - 280px)", overflowY: "auto" }}
         >
-          {filteredLogs.length === 0 ? (
+          <div style={{ height: topSpacer }} />
+          {window.map((l) => (
+            <div key={l.id} className={`log-row ${l.level}`}>
+              <span className="log-time">
+                {new Date(l.timestamp).toISOString().slice(11, 19)}
+              </span>
+              <span className="log-level">{l.level}</span>
+              <span className="log-msg">{l.line}</span>
+            </div>
+          ))}
+          <div style={{ height: bottomSpacer }} />
+          {filtered.length === 0 && (
             <div
               style={{
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
                 padding: 40,
-                color: "var(--dim)",
-                fontFamily: "'Share Tech Mono', monospace",
-                fontSize: "11px",
+                textAlign: "center",
+                color: "var(--text-dim)",
+                fontFamily: "var(--font-heading)",
+                fontSize: 11,
                 letterSpacing: "2px",
               }}
             >
-              {logs.length === 0 ? "NO LOGS YET" : "NO MATCHING LOGS"}
+              NO LOG LINES YET
             </div>
-          ) : (
-            <>
-              {/* Top spacer preserves total scroll height */}
-              {padTop > 0 && <div style={{ height: padTop }} />}
-              {windowSlice.map((entry) => (
-              <div
-                key={entry.id}
-                style={{
-                  display: "flex",
-                  gap: 8,
-                  padding: "0 12px",
-                  fontFamily: "'JetBrains Mono', monospace",
-                  fontSize: "11px",
-                  lineHeight: `${ROW_HEIGHT}px`,
-                  height: ROW_HEIGHT,
-                  overflow: "hidden",
-                  whiteSpace: "nowrap",
-                  borderLeft: entry.level !== "info"
-                    ? `2px solid ${LEVEL_COLORS[entry.level]}`
-                    : "2px solid transparent",
-                }}
-              >
-                {/* Level indicator */}
-                {entry.level !== "info" && (
-                  <span
-                    style={{
-                      color: LEVEL_COLORS[entry.level],
-                      flexShrink: 0,
-                      fontSize: "9px",
-                      textTransform: "uppercase",
-                      letterSpacing: "1px",
-                    }}
-                  >
-                    {entry.level}
-                  </span>
-                )}
-                {/* Line content */}
-                <span
-                  style={{
-                    color: LEVEL_COLORS[entry.level],
-                    overflow: "hidden",
-                    textOverflow: "ellipsis",
-                    flex: 1,
-                  }}
-                >
-                  {entry.line}
-                </span>
-              </div>
-            ))}
-              {/* Bottom spacer preserves total scroll height */}
-              {padBottom > 0 && <div style={{ height: padBottom }} />}
-            </>
           )}
+          {/* Keep totalHeight tracked in a hidden element so layout is stable
+              on rapid resize */}
+          <div style={{ position: "absolute", top: 0, left: 0, width: 0, height: totalHeight, pointerEvents: "none" }} />
         </div>
       </Panel>
     </div>
