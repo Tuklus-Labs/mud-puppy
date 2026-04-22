@@ -718,7 +718,14 @@ def quantize_model_gptq(
             try:
                 model(batch)
             except Exception as e:
-                log.warning("quantize_model_gptq calibration forward failed: %s", e)
+                # A silently-swallowed failure leaves observers with zero
+                # samples, producing an unquantized model with no diagnostic.
+                # Raise immediately so the caller gets a clear error with
+                # actionable context (batch shape/dtype/device mismatch).
+                raise RuntimeError(
+                    f"GPTQ calibration forward failed on batch: {e}. "
+                    "Check batch shape/dtype/device matches model expectations."
+                ) from e
 
     # Remove hooks
     for hook in hooks:

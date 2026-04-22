@@ -197,6 +197,8 @@ class CPUOffloadOptimizer:
         """Copy gradients from GPU to CPU storage, async on _grad_stream."""
         stream = self._grad_stream
         if stream is not None and self.config.async_transfer:
+            # Phase 1: launch all async D2H copies on the dedicated stream.
+            copies: List = []
             with torch.cuda.stream(stream):
                 for pid, param in self._param_map.items():
                     if param.grad is None:
@@ -204,13 +206,24 @@ class CPUOffloadOptimizer:
                     if self.config.pin_memory and pid in self._pinned_buffers:
                         pinned = self._pinned_buffers[pid]
                         pinned.copy_(param.grad, non_blocking=True)
-                        self._cpu_grads[pid].add_(pinned)
+                        copies.append((pid, pinned))
                     else:
-                        self._cpu_grads[pid].add_(
-                            param.grad.to(self._cpu, non_blocking=True)
-                        )
+                        cpu_grad = param.grad.to(self._cpu, non_blocking=True)
+                        copies.append((pid, cpu_grad))
                     param.grad = None
-            # Record event; step() will wait on it before reading CPU grads.
+
+            # Phase 2: block the CPU until all D2H copies on the stream have
+            # completed before reading any pinned/cpu buffer. Without this
+            # synchronize, the .add_() below can read from a pinned buffer
+            # while the GPU copy is still in flight, silently accumulating
+            # stale or zero data.
+            stream.synchronize()
+
+            for pid, buf in copies:
+                self._cpu_grads[pid].add_(buf)
+
+            # Record an event so step()'s existing wait path remains valid
+            # (now purely informational since we already synchronized above).
             evt = torch.cuda.Event()
             evt.record(stream)
             self._grad_sync_event = evt
