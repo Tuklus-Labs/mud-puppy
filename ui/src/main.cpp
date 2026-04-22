@@ -8,22 +8,44 @@
 
 #include <curl/curl.h>
 
+#include <cerrno>
 #include <csignal>
 #include <filesystem>
 #include <unistd.h>
+#include <fcntl.h>
 
-// Global pointers for SIGTERM handler.
-static mp_studio::TrainingManager* g_tm = nullptr;
-static mp_studio::WsBridge* g_ws = nullptr;
+// Self-pipe for SIGTERM/SIGINT wakeup.
+// The signal handler only calls write() (async-signal-safe).
+// A GLib FD source reads from the pipe on the main thread and calls
+// g_application_quit() safely.
+static int g_shutdown_pipe[2] = {-1, -1};
 
 static void handle_sigterm(int) {
-    // Clean shutdown: quit the GTK main loop which triggers destructors.
-    // g_idle_add is async-signal-safe enough for this purpose.
-    g_idle_add([](gpointer) -> gboolean {
-        GApplication* gapp = g_application_get_default();
-        if (gapp) g_application_quit(gapp);
-        return G_SOURCE_REMOVE;
-    }, nullptr);
+    // write() is listed as async-signal-safe by POSIX.
+    // Ignore errors -- if the pipe is full or closed the process is
+    // already shutting down.
+    char c = 1;
+    while (true) {
+        ssize_t n = ::write(g_shutdown_pipe[1], &c, 1);
+        if (n >= 0) break;
+        if (errno == EINTR) continue;
+        break;  // EAGAIN / EPIPE: don't block the signal handler.
+    }
+}
+
+// GLib IO callback: runs on the GMainLoop thread (async-signal-safe is
+// not required here). Reads the wakeup byte and quits the application.
+static gboolean on_shutdown_pipe_ready(GIOChannel* /*chan*/,
+                                       GIOCondition /*cond*/,
+                                       gpointer /*data*/) {
+    char buf[16];
+    ssize_t n;
+    do { n = ::read(g_shutdown_pipe[0], buf, sizeof(buf)); }
+    while (n == -1 && errno == EINTR);
+
+    GApplication* gapp = g_application_get_default();
+    if (gapp) g_application_quit(gapp);
+    return G_SOURCE_CONTINUE;  // keep the source alive until the loop exits
 }
 
 int main(int /*argc*/, char** argv) {
@@ -42,9 +64,21 @@ int main(int /*argc*/, char** argv) {
     // Ignore SIGPIPE (broken pipe from sidecar stderr).
     signal(SIGPIPE, SIG_IGN);
 
-    // Install SIGTERM/SIGINT for clean shutdown of child processes.
-    signal(SIGTERM, handle_sigterm);
-    signal(SIGINT,  handle_sigterm);
+    // Create the self-pipe used by the async-signal-safe SIGTERM/SIGINT handler.
+    if (::pipe2(g_shutdown_pipe, O_CLOEXEC | O_NONBLOCK) != 0) {
+        PHOS_LOG_ERROR("pipe2(shutdown_pipe) failed: {}", strerror(errno));
+        return 1;
+    }
+
+    // Install SIGTERM/SIGINT handlers that only write one byte to the pipe.
+    // The actual g_application_quit() runs on the GMainLoop thread via the
+    // GLib IO watch registered below.
+    struct sigaction sa_term{};
+    sa_term.sa_handler = handle_sigterm;
+    sigemptyset(&sa_term.sa_mask);
+    sa_term.sa_flags = SA_RESTART;
+    ::sigaction(SIGTERM, &sa_term, nullptr);
+    ::sigaction(SIGINT,  &sa_term, nullptr);
 
     // libcurl requires one global init before any easy handle is created.
     if (curl_global_init(CURL_GLOBAL_ALL) != CURLE_OK) {
@@ -76,10 +110,6 @@ int main(int /*argc*/, char** argv) {
         [&ws](const std::string& run_id, int port) {
             ws.connect(run_id, port);
         });
-
-    // Store for SIGTERM handler (signal-safe pointers).
-    g_tm = &tm;
-    g_ws = &ws;
 
     // --- IPC handlers ---
     // Only handlers declared in manifest.toml are registered here.
@@ -129,9 +159,22 @@ int main(int /*argc*/, char** argv) {
         return mp_studio::dataset_peek(path, n);
     }));
 
+    // Register a GLib IO watch so the main thread reacts to the shutdown pipe.
+    // When SIGTERM/SIGINT fires, handle_sigterm() writes one byte; GLib wakes
+    // the main loop and on_shutdown_pipe_ready() calls g_application_quit().
+    GIOChannel* shutdown_chan = g_io_channel_unix_new(g_shutdown_pipe[0]);
+    g_io_channel_set_close_on_unref(shutdown_chan, FALSE);  // we close manually
+    g_io_add_watch(shutdown_chan, G_IO_IN, on_shutdown_pipe_ready, nullptr);
+    g_io_channel_unref(shutdown_chan);  // GLib retains the ref via the watch
+
     int rc = app.run();
 
     // libcurl cleanup mirrors the init at startup.
     curl_global_cleanup();
+
+    // Close the shutdown self-pipe now that the main loop has exited.
+    if (g_shutdown_pipe[0] >= 0) { ::close(g_shutdown_pipe[0]); g_shutdown_pipe[0] = -1; }
+    if (g_shutdown_pipe[1] >= 0) { ::close(g_shutdown_pipe[1]); g_shutdown_pipe[1] = -1; }
+
     return rc;
 }

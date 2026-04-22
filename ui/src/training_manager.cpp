@@ -340,7 +340,17 @@ RunHandle TrainingManager::start(const nlohmann::json& config) {
     }
 
     if (pid == 0) {
-        // Child.
+        // Child: reset signal dispositions modified by the parent before execv.
+        // The SIGCHLD handler writes to the parent's sigchld_pipe_; if the child
+        // inherits it and receives SIGCHLD between fork and execv it would
+        // corrupt the parent's self-pipe. SIG_DFL is safe because the child
+        // process will install its own handlers after execv.
+        struct sigaction sa_dfl{};
+        sa_dfl.sa_handler = SIG_DFL;
+        sigemptyset(&sa_dfl.sa_mask);
+        ::sigaction(SIGCHLD, &sa_dfl, nullptr);
+        ::signal(SIGPIPE, SIG_DFL);
+
         ::dup2(out_pipe[1], STDOUT_FILENO);
         ::dup2(err_pipe[1], STDERR_FILENO);
         ::close(out_pipe[0]); ::close(out_pipe[1]);
