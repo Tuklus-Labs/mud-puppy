@@ -280,6 +280,23 @@ def load_model(config: TrainingConfig, calibration_data: Optional[List[torch.Ten
         If None and GPTQ+ROCm is requested, attempts to load a pre-quantized
         checkpoint from config.model_name_or_path instead.
     """
+    # Common UX trap: user passes a path ending in a weight-file name
+    # (model.safetensors, pytorch_model.bin, etc) instead of the repo
+    # directory. HF `from_pretrained` expects a directory containing
+    # config.json + tokenizer files, not the weight blob itself. Catch
+    # this before we get a cryptic "config.json not found" error.
+    _weight_suffixes = (
+        ".safetensors", ".bin", ".pt", ".pth", ".ckpt", ".gguf",
+    )
+    mp = str(config.model_name_or_path)
+    if os.path.isfile(mp) and mp.lower().endswith(_weight_suffixes):
+        parent = os.path.dirname(mp) or "."
+        raise RuntimeError(
+            f"model_name_or_path points at a weight file ({mp}). "
+            f"HuggingFace from_pretrained needs the model DIRECTORY, not "
+            f"the weight blob. Try: {parent}"
+        )
+
     try:
         tokenizer = AutoTokenizer.from_pretrained(
             config.model_name_or_path, trust_remote_code=config.trust_remote_code
