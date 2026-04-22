@@ -511,7 +511,18 @@ class TrainingConfig:
         return state.replace(params=sharded_params)
 
     def setup_xla_flags(self) -> None:
-        """Set XLA flags from configuration."""
+        """Append this config's ``xla_flags`` to ``$XLA_FLAGS`` if set.
+
+        .. warning::
+
+            Must be called **before** the first ``import jax`` to take
+            effect. XLA reads ``XLA_FLAGS`` once at import time; setting
+            it later is a no-op. Use the module-level
+            :func:`setup_xla_flags_from_env` helper early in your program
+            (before the JAX backend module is imported) to pick up flags
+            from a config loaded from disk. This method is retained for
+            programmatic callers that haven't yet imported JAX.
+        """
         if self.xla_flags:
             current = os.environ.get("XLA_FLAGS", "")
             if current:

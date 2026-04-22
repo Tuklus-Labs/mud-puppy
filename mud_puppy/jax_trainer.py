@@ -893,6 +893,13 @@ def run_training(config: TrainingConfig) -> None:
     print(f"[mud-puppy] Precision: {config.precision}")
     print(f"[mud-puppy] Devices: {jax.device_count()}")
 
+    # Apply user XLA flags to the live process if any. XLA reads
+    # XLA_FLAGS at JAX import time, so this only affects XLA-level
+    # compilation flags that are re-read per-compile (not device-
+    # selection flags like --xla_force_host_platform_device_count which
+    # require the env var to be set before `import jax`).
+    config.setup_xla_flags()
+
     # Create output directory
     os.makedirs(config.output_dir, exist_ok=True)
 
