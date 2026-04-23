@@ -1,7 +1,11 @@
+import logging
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Optional
+
+log = logging.getLogger(__name__)
 
 
 def _dequantize_packed(qweight, scale, out_features, in_features, dtype):
@@ -22,12 +26,42 @@ class _Linear4bitFn(torch.autograd.Function):
 
     This function saves only qweight (packed uint8) + scale (fp32) and
     re-dequantizes during backward. Trades ~2x compute for ~4x memory.
+
+    When ``MUD_PUPPY_INT4_TRITON=1`` and Triton is available, forward and
+    backward call the fused Triton kernels in ``int4_kernels`` which
+    dequant+matmul inline without ever materializing the full weight.
+    ~3-5x faster on the 7900 XTX for the typical QLoRA linear shapes
+    (4096x11008 MLP, 5120x5120 attn). Off by default; see
+    ``int4_kernels._is_enabled``.
     """
 
     @staticmethod
     def forward(ctx, input, qweight, scale, bias, out_features, in_features, dtype):
-        w = _dequantize_packed(qweight, scale, out_features, in_features, dtype)
-        output = F.linear(input, w, bias)
+        # Try the Triton fused path first if it's enabled. Any failure
+        # (kernel absent, unsupported shape, runtime error) falls back to
+        # the pure-PyTorch dequant+linear path below so training never
+        # stops just because a kernel misbehaved.
+        output = None
+        used_triton = False
+        try:
+            from . import int4_kernels
+            if int4_kernels._is_enabled():
+                output = int4_kernels.triton_int4_matmul(
+                    input.contiguous(), qweight, scale
+                )
+                if bias is not None:
+                    output = output + bias
+                used_triton = True
+        except Exception as exc:  # pragma: no cover - fallback path
+            log.warning(
+                "int4 triton forward failed (%s); falling back to pytorch",
+                exc,
+            )
+            output = None
+
+        if output is None:
+            w = _dequantize_packed(qweight, scale, out_features, in_features, dtype)
+            output = F.linear(input, w, bias)
 
         # Save packed tensors (tiny) instead of dequantized weight (huge)
         ctx.save_for_backward(qweight, scale)
@@ -35,18 +69,38 @@ class _Linear4bitFn(torch.autograd.Function):
         ctx.in_features = in_features
         ctx.dtype = dtype
         ctx.has_bias = bias is not None
+        ctx.used_triton = used_triton
 
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
         qweight, scale = ctx.saved_tensors
+        grad_input = None
 
-        # Re-dequantize during backward (~0.1ms per layer, saves ~20MB per layer)
-        w = _dequantize_packed(qweight, scale, ctx.out_features, ctx.in_features, ctx.dtype)
+        # Mirror the forward-path selection: if forward used Triton, try
+        # the Triton backward too. Fall through to pytorch on any failure.
+        if ctx.used_triton:
+            try:
+                from . import int4_kernels
+                grad_input = int4_kernels.triton_int4_grad_input(
+                    grad_output.contiguous(), qweight, scale,
+                    in_features=ctx.in_features,
+                )
+            except Exception as exc:  # pragma: no cover - fallback path
+                log.warning(
+                    "int4 triton backward failed (%s); falling back to pytorch",
+                    exc,
+                )
+                grad_input = None
 
-        # grad_input = grad_output @ W (needed for LoRA gradient flow)
-        grad_input = grad_output @ w
+        if grad_input is None:
+            # Re-dequantize during backward (~0.1ms per layer, saves ~20MB per layer)
+            w = _dequantize_packed(
+                qweight, scale, ctx.out_features, ctx.in_features, ctx.dtype
+            )
+            # grad_input = grad_output @ W (needed for LoRA gradient flow)
+            grad_input = grad_output @ w
 
         # grad_bias = sum over batch+seq dims
         grad_bias = None
