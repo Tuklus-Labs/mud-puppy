@@ -198,6 +198,30 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["fp16", "bf16", "fp32"],
         help="precision for the merged model weights",
     )
+    # ------------------- GGUF export + kernel-anvil -------------------
+    parser.add_argument(
+        "--export-gguf",
+        dest="export_gguf",
+        action="store_true",
+        help="after training, convert the output to GGUF (llama.cpp format). "
+             "Runs LoRA merge if needed, then convert_hf_to_gguf.py, "
+             "optionally llama-quantize, and optionally kernel-anvil "
+             "gguf-optimize for per-shape kernel tuning.",
+    )
+    parser.add_argument(
+        "--gguf-quant",
+        dest="gguf_quant",
+        default="Q4_K_M",
+        help="GGUF quantization type for --export-gguf (default: Q4_K_M). "
+             "Empty string keeps fp16. Accepts any llama-quantize type.",
+    )
+    parser.add_argument(
+        "--no-kernel-anvil",
+        dest="optimize_with_kernel_anvil",
+        action="store_false",
+        default=True,
+        help="skip the kernel-anvil gguf-optimize step after --export-gguf",
+    )
     parser.add_argument(
         "--gptq-group-size",
         dest="gptq_group_size",
@@ -352,6 +376,33 @@ def main() -> None:
         run_embedding_training(config)
     else:
         run_training(config)
+
+    # Optional post-training: export to GGUF (+ kernel-anvil optimize).
+    # Runs regardless of method once training succeeds.
+    if getattr(args, "export_gguf", False):
+        from .gguf_export import export_to_gguf, ExportConfig, GgufExportError
+
+        out_dir = config.output_dir
+        # For LoRA/QLoRA the output_dir contains adapter_config.json; the
+        # export path detects and merges automatically. For full/other,
+        # the same directory holds the merged model already.
+        export_cfg = ExportConfig(
+            source_dir=out_dir,
+            out_path="model.gguf",
+            quant=args.gguf_quant,
+            optimize_with_kernel_anvil=args.optimize_with_kernel_anvil,
+        )
+        try:
+            print(f"[mud-puppy] Exporting to GGUF ({args.gguf_quant or 'fp16'})...")
+            result = export_to_gguf(export_cfg)
+            for step in result.steps:
+                print(f"  - {step}")
+            print(f"[mud-puppy] GGUF ready: {result.gguf_path}")
+            if result.serve_command:
+                print("[mud-puppy] To serve with llama.cpp:")
+                print(f"    {result.serve_command}")
+        except GgufExportError as exc:
+            print(f"[mud-puppy] GGUF export failed: {exc}")
 
 
 if __name__ == "__main__":
