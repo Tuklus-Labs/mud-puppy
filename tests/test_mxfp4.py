@@ -72,11 +72,18 @@ def test_e8m0_roundtrip_powers_of_two(k: int) -> None:
     assert torch.allclose(back, scale, rtol=1e-6)
 
 
-def test_e8m0_rounds_to_nearest_power_of_two() -> None:
-    # 1.4 rounds to 1.0 (2^0), 1.6 rounds to 2.0 (2^1).
-    scale = torch.tensor([1.4, 1.6], dtype=torch.float32)
+def test_e8m0_ceils_to_next_power_of_two() -> None:
+    """Encoder uses ceil so the decoded scale is always >= input scale.
+
+    This guarantees the MXFP4 grid covers the block's dynamic range
+    without saturation, which is required for unbiased stochastic
+    rounding of values near the block max.
+    """
+    # 1.0 is a power of 2 -> exact. 1.4 and 1.6 both ceil to 2.0 (byte 128).
+    # 2.0 is exact (byte 128). 2.01 ceils to 4.0 (byte 129).
+    scale = torch.tensor([1.0, 1.4, 1.6, 2.0, 2.01], dtype=torch.float32)
     byte = _e8m0_encode(scale)
-    assert byte.tolist() == [127, 128]
+    assert byte.tolist() == [127, 128, 128, 128, 129]
 
 
 def test_e8m0_clamps_overflow() -> None:
@@ -292,12 +299,12 @@ def test_quantize_with_scale_matches_quantize_rtn() -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA/HIP")
 def test_quantize_on_gpu() -> None:
     x = torch.randn(1024, device="cuda", dtype=torch.bfloat16)
-    q = quantize_mxfp4(x, block_size=32)
+    q, scale_bytes = quantize_mxfp4_with_scale(x, block_size=32)
     assert q.device == x.device
     assert q.dtype == x.dtype
-    # Quick grid check on one block
+    # Ground-truth block scale from the with-scale API, not inferred from output.
+    scale = _e8m0_decode(scale_bytes, torch.float32)[0].item()
     b = q.reshape(-1, 32)[0].float()
-    if b.abs().max() > 0:
-        scale = b.abs().max().item() / E2M1_MAX
-        log2s = math.log2(scale)
-        assert abs(log2s - round(log2s)) < 1e-3
+    for v in b.tolist():
+        normalized = abs(v) / scale
+        assert any(abs(normalized - lvl) < 1e-2 for lvl in E2M1_POSITIVE_VALUES)

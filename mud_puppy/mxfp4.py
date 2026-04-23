@@ -73,25 +73,31 @@ def _e2m1_levels(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
 
 
 def _e8m0_encode(scale: torch.Tensor) -> torch.Tensor:
-    """Round a positive fp32 scale to the nearest E8M0 (power of 2).
+    """Encode a positive fp32 scale to E8M0 (power of 2 >= input).
 
-    E8M0 stores an 8-bit exponent with bias 127. We:
-      1. Take log2 of the scale.
-      2. Round to nearest integer exponent.
-      3. Clamp to [-127, 127] (byte value 0..254; 255 is reserved NaN).
+    E8M0 stores an 8-bit exponent with bias 127. Callers pass
+    ``block_max / 6`` and we want the smallest power of 2 >= that
+    value -- i.e. ``ceil(log2(scale))`` -- so that after dividing the
+    block by the decoded scale, no element lies outside ``[-6, 6]`` and
+    thus no element saturates. Round-to-nearest would sometimes pick
+    a scale smaller than block_max/6 and silently clip values near the
+    block's dynamic-range edge, biasing stochastic rounding.
 
-    Returns the encoded byte as int32 (0..254). Callers that need the
-    actual scale value should call ``_e8m0_decode`` on the byte.
+    Steps:
+      1. Clean non-finite inputs: NaN -> 0 (byte 0), Inf -> 2^127 (byte 254).
+         Without this, log2(inf) produces a CUDA int32 wrap to 0.
+      2. Clamp to the smallest representable positive scale (2^-127).
+      3. ``ceil(log2(scale))``.
+      4. Clamp exponent to [-127, 127] (byte 0..254; 255 reserved NaN).
+
+    Returns int32 in [0, 254].
     """
-    # Handle non-finite inputs explicitly: nan -> floor to 2^-127 (byte 0);
-    # inf -> saturate to 2^127 (byte 254). Without this, log2(inf) produces
-    # a CUDA int32 conversion that wraps to 0 on some stacks.
     TWO_POW_NEG_127 = 5.877471754111438e-39
     TWO_POW_127 = 1.7014118346046923e38
     scale = torch.where(torch.isnan(scale), torch.zeros_like(scale), scale)
     scale = torch.where(torch.isinf(scale), torch.full_like(scale, TWO_POW_127), scale)
     safe = scale.clamp_min(TWO_POW_NEG_127)
-    exp = torch.log2(safe).round().to(torch.int32)
+    exp = torch.log2(safe).ceil().to(torch.int32)
     exp = exp.clamp(min=-127, max=127)
     return exp + 127  # byte value
 
