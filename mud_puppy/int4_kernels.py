@@ -83,24 +83,46 @@ if TRITON_AVAILABLE:
     #   - small-M training (4, 16)
     #   - medium-M training (256, 512, 1024 = typical QLoRA B*S)
     # BLOCK_K must be even (nibble packing) and >= 32 for matrix cores.
+    # GROUP_M controls L2 cache blocking: consecutive programs share the
+    # same W slice when grouped. 4-8 is the sweet spot on RDNA3 (enough
+    # L2 reuse without starving CU occupancy).
     _FWD_CONFIGS = [
-        triton.Config({"BLOCK_M": 16, "BLOCK_N": 64,  "BLOCK_K": 64},  num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_M": 16, "BLOCK_N": 128, "BLOCK_K": 64},  num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_M": 32, "BLOCK_N": 64,  "BLOCK_K": 64},  num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_M": 32, "BLOCK_N": 128, "BLOCK_K": 32},  num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64,  "BLOCK_K": 32},  num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32},  num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32},  num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128,"BLOCK_K": 32},  num_warps=8, num_stages=2),
+        # No-swizzle fallbacks for shapes where L2 grouping hurts (small M or N)
+        triton.Config({"BLOCK_M": 16,  "BLOCK_N": 64,  "BLOCK_K": 64, "GROUP_M": 1},  num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 16,  "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 1},  num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 32,  "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_M": 1},  num_warps=4, num_stages=2),
+        # Swizzled configs for larger shapes where L2 reuse pays off
+        triton.Config({"BLOCK_M": 16,  "BLOCK_N": 64,  "BLOCK_K": 64, "GROUP_M": 8},  num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 16,  "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 8},  num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 32,  "BLOCK_N": 64,  "BLOCK_K": 64, "GROUP_M": 8},  num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 32,  "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_M": 4},  num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 32,  "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 8},  num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 64,  "BLOCK_K": 32, "GROUP_M": 4},  num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_M": 4},  num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 8},  num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64,  "BLOCK_K": 32, "GROUP_M": 4},  num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_M": 4},  num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 4},  num_warps=8, num_stages=3),
     ]
+    # Backward is symmetric to forward: grid is (M/BM, K/BK), inner over N.
+    # Same config space; swizzle groups M tiles to share W reads.
     _BWD_CONFIGS = [
-        triton.Config({"BLOCK_M": 16, "BLOCK_N": 64,  "BLOCK_K": 64},  num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_M": 32, "BLOCK_N": 64,  "BLOCK_K": 64},  num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_M": 32, "BLOCK_N": 128, "BLOCK_K": 32},  num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64,  "BLOCK_K": 32},  num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32},  num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32},  num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128,"BLOCK_K": 32},  num_warps=8, num_stages=2),
+        # No-swizzle fallbacks
+        triton.Config({"BLOCK_M": 16,  "BLOCK_N": 64,  "BLOCK_K": 64, "GROUP_M": 1},  num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 16,  "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 1},  num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 32,  "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_M": 1},  num_warps=4, num_stages=2),
+        # Swizzled configs
+        triton.Config({"BLOCK_M": 16,  "BLOCK_N": 64,  "BLOCK_K": 64, "GROUP_M": 8},  num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 16,  "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 8},  num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 32,  "BLOCK_N": 64,  "BLOCK_K": 64, "GROUP_M": 8},  num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 32,  "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_M": 4},  num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 32,  "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 8},  num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 64,  "BLOCK_K": 32, "GROUP_M": 4},  num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_M": 4},  num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 8},  num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64,  "BLOCK_K": 32, "GROUP_M": 4},  num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_M": 4},  num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 4},  num_warps=8, num_stages=3),
     ]
 
 
@@ -120,6 +142,7 @@ if TRITON_AVAILABLE:
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
+        GROUP_M: tl.constexpr,
     ):
         """C = A @ dequant(QB).T using tl.dot on dequantized tiles.
 
@@ -132,9 +155,21 @@ if TRITON_AVAILABLE:
         fp16 tile by extracting low+high nibbles and interleaving. That
         tile is then transposed to [BLOCK_K, BLOCK_N] so tl.dot(A, B)
         routes through RDNA3/CDNA matrix cores.
+
+        Program-ID swizzling groups GROUP_M consecutive M tiles within
+        each N tile so they share the same W slice in L2. With W read
+        through the inner K loop, adjacent programs in scheduling order
+        hit warm L2 lines.
         """
-        pid_m = tl.program_id(0)
-        pid_n = tl.program_id(1)
+        pid = tl.program_id(0)
+        num_pid_m = tl.cdiv(M, BLOCK_M)
+        num_pid_n = tl.cdiv(N, BLOCK_N)
+        num_pid_in_group = GROUP_M * num_pid_n
+        group_id = pid // num_pid_in_group
+        first_pid_m = group_id * GROUP_M
+        group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+        pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+        pid_n = (pid % num_pid_in_group) // group_size_m
 
         offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
         offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -219,15 +254,28 @@ if TRITON_AVAILABLE:
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
+        GROUP_M: tl.constexpr,
     ):
-        """grad_input[M, K] = grad_output[M, N] @ W[N, K] with W dequanted inline.
+        """grad_input[M, K] = grad_output[M, N] @ W[M, N] with W dequanted inline.
 
         BLOCK_K must be even. Walks N in BLOCK_N chunks, loading grad_output
         [M, BLOCK_N] and W[BLOCK_N, BLOCK_K] (expanded from packed int4)
         and accumulating via tl.dot.
+
+        Swizzle packs GROUP_M consecutive M tiles per K tile. The inner N
+        loop reads W[:, BK slice of K]. Programs sharing a pid_k share
+        the same W columns, so L2 hits amortize the otherwise-redundant
+        47x DRAM reads that hurt the naive (M, K) grid order.
         """
-        pid_m = tl.program_id(0)
-        pid_k = tl.program_id(1)
+        pid = tl.program_id(0)
+        num_pid_m = tl.cdiv(M, BLOCK_M)
+        num_pid_k = tl.cdiv(K, BLOCK_K)
+        num_pid_in_group = GROUP_M * num_pid_k
+        group_id = pid // num_pid_in_group
+        first_pid_m = group_id * GROUP_M
+        group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+        pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+        pid_k = (pid % num_pid_in_group) // group_size_m
 
         offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
         offs_k_full = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
@@ -349,10 +397,10 @@ def triton_int4_matmul(
 
     scale_1d = scale.reshape(-1).contiguous().to(torch.float32)
 
-    # Grid is computed inside autotune's launcher based on tile choice.
+    # 1D grid because the kernel does its own (pid_m, pid_n) swizzling
+    # for L2 cache reuse. Total programs = cdiv(M, BM) * cdiv(N, BN).
     grid = lambda meta: (
-        triton.cdiv(M, meta["BLOCK_M"]),
-        triton.cdiv(N, meta["BLOCK_N"]),
+        triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]),
     )
     _int4_matmul_forward_kernel[grid](
         x_2d, qweight, scale_1d, c,
@@ -392,8 +440,7 @@ def triton_int4_grad_input(
     scale_1d = scale.reshape(-1).contiguous().to(torch.float32)
 
     grid = lambda meta: (
-        triton.cdiv(M, meta["BLOCK_M"]),
-        triton.cdiv(K, meta["BLOCK_K"]),
+        triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(K, meta["BLOCK_K"]),
     )
     _int4_matmul_backward_kernel[grid](
         go_2d, qweight, scale_1d, gi,
