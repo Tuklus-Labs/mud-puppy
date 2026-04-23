@@ -281,31 +281,45 @@ def pack_mxfp4(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Quantize ``x`` and return (packed_nibbles, scale_bytes).
 
-    ``packed_nibbles`` is uint8 of length ``ceil(numel(x)/2)`` with two
-    E2M1 values per byte (low nibble = even index, high nibble = odd).
-    ``scale_bytes`` is uint8 length ``ceil(numel(x)/block_size)``.
+    Output shapes (assuming ``x`` has shape ``(..., K)``):
+        packed_nibbles: uint8 ``(..., ceil(K/2))`` -- 2 E2M1 values per
+            byte (low nibble = even K index, high nibble = odd K index).
+        scale_bytes:    uint8 ``(..., ceil(K/block_size))`` -- one E8M0
+            byte per K-block along the last axis.
 
-    Together they are a complete, self-describing MXFP4 representation
-    of ``x``; ``unpack_mxfp4`` with the original shape reproduces the
-    round-to-nearest quantized tensor bit-exactly.
+    For 1D input of length ``N``, outputs are 1D of lengths ``ceil(N/2)``
+    and ``ceil(N/block_size)``. Leading dimensions (if any) are preserved
+    so callers can slice per-row/per-channel without reshaping.
+
+    ``unpack_mxfp4`` with the original shape reproduces the round-to-nearest
+    quantized tensor bit-exactly.
     """
     on_grid, scale_byte = quantize_mxfp4_with_scale(x, block_size=block_size)
-    # Expand per-block scale so each element in the block sees its own
-    # (identical) scale for the index lookup.
     scale = _e8m0_decode(scale_byte, torch.float32)
-    # Flatten and align on block boundaries.
-    flat_on_grid, shape, pad = _reshape_to_blocks(on_grid.to(torch.float32), block_size)
-    # flat_on_grid: [num_blocks, block_size]; scale: [num_blocks]
-    idx = _e2m1_to_index(flat_on_grid, scale.unsqueeze(-1))
-    idx_flat = idx.reshape(-1)  # length = num_blocks * block_size (padded)
 
-    # Pack two nibbles per byte.
+    flat_on_grid, shape, pad = _reshape_to_blocks(on_grid.to(torch.float32), block_size)
+    idx = _e2m1_to_index(flat_on_grid, scale.unsqueeze(-1))
+    idx_flat = idx.reshape(-1)
+
     if idx_flat.numel() % 2:
         idx_flat = torch.cat([idx_flat, idx_flat.new_zeros(1)])
     low = idx_flat[0::2] & 0x0F
     high = idx_flat[1::2] & 0x0F
     packed = (low | (high << 4)).to(torch.uint8)
-    return packed, scale_byte.to(torch.uint8)
+    scale_bytes = scale_byte.to(torch.uint8)
+
+    # Reshape to match input's leading dims. Requires the last axis of
+    # the input to be divisible by 2 (nibble pairing) and by block_size
+    # (whole blocks per row); weight tensors used for QAT meet this.
+    if x.dim() >= 2:
+        last = x.shape[-1]
+        leading = tuple(x.shape[:-1])
+        if last % 2 == 0 and last % block_size == 0:
+            packed = packed.reshape(*leading, last // 2)
+            scale_bytes = scale_bytes.reshape(*leading, last // block_size)
+        # else: leave flat. Callers with odd-K must handle reshape themselves.
+
+    return packed, scale_bytes
 
 
 def unpack_mxfp4(
@@ -318,28 +332,31 @@ def unpack_mxfp4(
     """Invert ``pack_mxfp4``: recover the dequantized tensor.
 
     ``shape`` is the tensor shape before packing (needed because packing
-    may have added up to one byte of padding).
+    may have added up to one byte of padding). ``packed`` and
+    ``scale_bytes`` may be 1D (legacy) or N-D with matching leading
+    dimensions (from the updated ``pack_mxfp4``); both are flattened
+    here before expansion.
     """
-    # Unpack nibbles.
+    # Flatten inputs; leading dims are reconstructed from `shape`.
+    packed = packed.reshape(-1)
+    scale_bytes_flat = scale_bytes.reshape(-1)
+
     low = (packed & 0x0F).to(torch.int32)
     high = ((packed >> 4) & 0x0F).to(torch.int32)
-    nibbles = torch.stack([low, high], dim=-1).reshape(-1)  # 2 nibbles per byte
+    nibbles = torch.stack([low, high], dim=-1).reshape(-1)
 
-    # Slice off padding at the tensor tail.
     total_elems = int(torch.tensor(shape).prod().item())
     padded_total = ((total_elems + block_size - 1) // block_size) * block_size
     nibbles = nibbles[:padded_total]
 
-    # Decode nibble -> signed E2M1 value at unit scale.
     mag_levels = torch.tensor(E2M1_POSITIVE_VALUES, dtype=torch.float32, device=packed.device)
     sign = torch.where((nibbles & 0x8) != 0, -1.0, 1.0)
     mag_idx = (nibbles & 0x7).clamp(max=7)
     magnitudes = mag_levels[mag_idx]
     unit = sign * magnitudes  # [padded_total], fp32 on unit scale
 
-    # Apply per-block scale.
     blocks = unit.reshape(-1, block_size)
-    scale = _e8m0_decode(scale_bytes.to(torch.int32), torch.float32).unsqueeze(-1)
+    scale = _e8m0_decode(scale_bytes_flat.to(torch.int32), torch.float32).unsqueeze(-1)
     out = (blocks * scale).reshape(-1)[:total_elems]
 
     return out.reshape(shape).to(dtype)
