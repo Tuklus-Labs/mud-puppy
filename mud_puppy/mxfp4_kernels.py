@@ -1,5 +1,7 @@
 """Triton fused dequant + matmul for MXFP4-packed weights (W4A16).
 
+Also hosts the ``MXFP4Linear`` module that consumes these kernels.
+
 Mirrors ``int4_kernels.py`` but with:
     * E2M1 nibble -> magnitude via a small LUT (8 fp32 values).
     * E8M0 block scale (one byte per 32-element MXFP4 block along K).
@@ -20,10 +22,15 @@ weight in memory. Activations stay in bf16/fp16 (W4A16) throughout.
 
 from __future__ import annotations
 
+import logging
 import os
-from typing import Optional
+from typing import List, Optional
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+log = logging.getLogger(__name__)
 
 try:
     import triton
@@ -371,3 +378,204 @@ def triton_mxfp4_grad_input(
     )
 
     return gi.to(grad_output.dtype).reshape(*orig_shape[:-1], K)
+
+
+# ---------------------------------------------------------------------------
+# Packed-storage Linear module
+# ---------------------------------------------------------------------------
+
+
+class _MXFP4LinearFn(torch.autograd.Function):
+    """Custom autograd for MXFP4-packed linear.
+
+    Saves only the packed qweight + scales across the autograd graph
+    (not the dequantized bf16 weight). For a 20B MoE model that's the
+    difference between a training run fitting in 15 GB and OOMing at 40 GB.
+
+    Uses the Triton fused kernel when ``MUD_PUPPY_MXFP4_TRITON=1`` is
+    set and the kernel is available. Otherwise falls back to
+    ``unpack_mxfp4`` + ``F.linear`` -- slower but correct and
+    non-kernel-dependent for CI.
+    """
+
+    @staticmethod
+    def forward(ctx, input, qweight, scales, bias, in_features, out_features, dtype):
+        output = None
+        used_triton = False
+        try:
+            if _is_enabled():
+                output = triton_mxfp4_matmul(
+                    input.contiguous(), qweight, scales, in_features=in_features,
+                )
+                if bias is not None:
+                    output = output + bias
+                used_triton = True
+        except Exception as exc:  # pragma: no cover - fallback path
+            log.warning("mxfp4 triton forward failed (%s); falling back to pytorch", exc)
+            output = None
+
+        if output is None:
+            from .mxfp4 import unpack_mxfp4
+            # Unpack may return a padded-K weight if in_features was padded
+            # at quantize time; slice back to true in_features.
+            padded_k = qweight.shape[-1] * 2
+            w = unpack_mxfp4(qweight, scales, (out_features, padded_k), block_size=32, dtype=dtype)
+            w = w[:, :in_features].contiguous()
+            output = F.linear(input, w, bias)
+
+        ctx.save_for_backward(qweight, scales)
+        ctx.in_features = in_features
+        ctx.out_features = out_features
+        ctx.dtype = dtype
+        ctx.has_bias = bias is not None
+        ctx.used_triton = used_triton
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        qweight, scales = ctx.saved_tensors
+        grad_input = None
+        if ctx.used_triton:
+            try:
+                grad_input = triton_mxfp4_grad_input(
+                    grad_output.contiguous(), qweight, scales, in_features=ctx.in_features,
+                )
+            except Exception as exc:  # pragma: no cover
+                log.warning("mxfp4 triton backward failed (%s); falling back", exc)
+                grad_input = None
+
+        if grad_input is None:
+            from .mxfp4 import unpack_mxfp4
+            padded_k = qweight.shape[-1] * 2
+            w = unpack_mxfp4(
+                qweight, scales,
+                (ctx.out_features, padded_k),
+                block_size=32, dtype=ctx.dtype,
+            )
+            w = w[:, :ctx.in_features].contiguous()
+            grad_input = grad_output @ w
+
+        grad_bias = None
+        if ctx.has_bias:
+            grad_bias = grad_output.reshape(-1, ctx.out_features).sum(0)
+
+        # No grads for qweight, scales, in_features, out_features, dtype
+        return grad_input, None, None, grad_bias, None, None, None
+
+
+class MXFP4Linear(nn.Linear):
+    """Frozen 4-bit linear layer with native MXFP4 packed storage.
+
+    Inherits from ``nn.Linear`` so PEFT/LoRA recognizes it via isinstance.
+    Stores weights as packed E2M1 nibbles + E8M0 block scales (~3.76x
+    compression vs bf16). On-the-fly dequantize + matmul via the Triton
+    kernels in this module.
+
+    VRAM per layer: out * ceil(in/2) bytes (packed) + out * ceil(in/32) bytes (scales).
+    vs nn.Linear: out * in * 2 bytes (bf16).
+    Savings: ~3.76x.
+
+    This is the *inference-and-LoRA-target* module. Weights don't update
+    during training; use ``MXFP4QATLinear`` (mxfp4_train.py) for the
+    QAT-with-bf16-master path.
+    """
+
+    BLOCK_SIZE: int = 32
+
+    def __init__(self, linear: nn.Linear, dtype: torch.dtype = torch.bfloat16):
+        nn.Module.__init__(self)
+        self.in_features = linear.in_features
+        self.out_features = linear.out_features
+        self.dtype = dtype
+
+        # Pad K to a multiple of BLOCK_SIZE (32) so every row has whole blocks.
+        pad = (-self.in_features) % self.BLOCK_SIZE
+        if pad:
+            w = F.pad(linear.weight.detach(), (0, pad))
+        else:
+            w = linear.weight.detach()
+        self._padded_in = self.in_features + pad
+
+        from .mxfp4 import pack_mxfp4
+        packed, scale_bytes = pack_mxfp4(w.to(torch.float32), block_size=self.BLOCK_SIZE)
+        self.register_buffer("qweight", packed)
+        self.register_buffer("scales", scale_bytes)
+
+        if linear.bias is not None:
+            self.register_parameter(
+                "bias", nn.Parameter(linear.bias.detach().to(dtype), requires_grad=False)
+            )
+        else:
+            self.register_parameter("bias", None)
+
+    @property
+    def weight(self):
+        """Dequantize on access. PEFT may read this for dtype/device info."""
+        return self._dequantize()
+
+    @weight.setter
+    def weight(self, value):
+        # No-op: PEFT's _prepare_model_for_kbit_training may try to assign.
+        pass
+
+    def _dequantize(self) -> torch.Tensor:
+        from .mxfp4 import unpack_mxfp4
+        w = unpack_mxfp4(
+            self.qweight, self.scales,
+            (self.out_features, self._padded_in),
+            block_size=self.BLOCK_SIZE, dtype=self.dtype,
+        )
+        return w[:, :self.in_features].contiguous()
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return _MXFP4LinearFn.apply(
+            input.to(self.dtype),
+            self.qweight,
+            self.scales,
+            self.bias,
+            self.in_features,
+            self.out_features,
+            self.dtype,
+        )
+
+    def extra_repr(self) -> str:
+        return (
+            f"in_features={self.in_features}, out_features={self.out_features}, "
+            f"bias={self.bias is not None}, quant=mxfp4_packed"
+        )
+
+
+def _set_module(model: nn.Module, name: str, module: nn.Module) -> None:
+    parent = model
+    parts = name.split(".")
+    for p in parts[:-1]:
+        parent = getattr(parent, p)
+    setattr(parent, parts[-1], module)
+
+
+def quantize_model_mxfp4(
+    model: nn.Module,
+    dtype: torch.dtype = torch.bfloat16,
+    skip_modules: Optional[List[str]] = None,
+    min_size: int = 1024,
+) -> nn.Module:
+    """Replace ``nn.Linear`` layers with :class:`MXFP4Linear`.
+
+    Matches the signature of ``bnb_rocm.quantize_model_4bit`` so the CLI
+    can route to either path based on ``config.quant_format``. Default
+    skip list protects embeddings and output projections where 4-bit
+    quant typically costs more perplexity than it saves memory.
+    """
+    skip_modules = skip_modules or [
+        "lm_head", "embed_tokens", "word_embeddings",
+        "wte", "wpe", "score", "classifier",
+    ]
+    for name, module in list(model.named_modules()):
+        if any(s in name.lower() for s in skip_modules):
+            continue
+        if isinstance(module, nn.Linear) and not isinstance(module, MXFP4Linear):
+            if module.weight.numel() < min_size:
+                continue
+            q = MXFP4Linear(module, dtype=dtype)
+            _set_module(model, name, q)
+    return model
