@@ -382,18 +382,26 @@ def load_model(config: TrainingConfig, calibration_data: Optional[List[torch.Ten
     elif config.finetuning_method == "qlora":
         model_dtype = torch.bfloat16 if config.precision == "bf16" else torch.float16
 
-        # ROCm fix: Load to CPU first, then move to GPU (avoid device_map segfaults)
+        # Graceful loader: tier 1 (CausalLM) -> tier 2 (VL-extract) -> tier 3
+        # (synthesize from unknown arch). Lets QLoRA work on Mistral3/LLaVA/etc
+        # by extracting the text backbone, and on future unreleased models by
+        # structural pattern matching.
+        from .model_loader import load_model_graceful
         try:
-            model = AutoModelForCausalLM.from_pretrained(
+            result = load_model_graceful(
                 config.model_name_or_path,
                 dtype=model_dtype,
                 trust_remote_code=config.trust_remote_code,
-                device_map=None,  # Load to CPU
+                device_map=None,  # load to CPU first (ROCm segfault avoidance)
                 low_cpu_mem_usage=True,
             )
-        except OSError as e:
+            model = result.model
+            if result.tier > 1:
+                print(f"[mud-puppy] model_loader tier={result.tier}: "
+                      + "; ".join(result.notes))
+        except (OSError, RuntimeError) as e:
             raise RuntimeError(
-                f"Failed to load model from {config.model_name_or_path}"
+                f"Failed to load model from {config.model_name_or_path}: {e}"
             ) from e
 
         # Apply 4-bit quantization based on backend choice
@@ -499,17 +507,25 @@ def load_model(config: TrainingConfig, calibration_data: Optional[List[torch.Ten
         }
         model_dtype = dtype_map.get(config.precision, torch.float16)
 
+        # Graceful loader: tier 1 (CausalLM) -> tier 2 (VL-extract) -> tier 3
+        # (synthesize). Same rationale as the QLoRA branch: any model the HF
+        # ecosystem can load should be trainable, including unreleased ones.
+        from .model_loader import load_model_graceful
         try:
-            model = AutoModelForCausalLM.from_pretrained(
+            result = load_model_graceful(
                 config.model_name_or_path,
-                trust_remote_code=config.trust_remote_code,
                 dtype=model_dtype,
-                device_map=None,  # Load to CPU
+                trust_remote_code=config.trust_remote_code,
+                device_map=None,
                 low_cpu_mem_usage=True,
             )
-        except OSError as e:
+            model = result.model
+            if result.tier > 1:
+                print(f"[mud-puppy] model_loader tier={result.tier}: "
+                      + "; ".join(result.notes))
+        except (OSError, RuntimeError) as e:
             raise RuntimeError(
-                f"Failed to load model from {config.model_name_or_path}"
+                f"Failed to load model from {config.model_name_or_path}: {e}"
             ) from e
 
         # Move to GPU if available and not streaming
@@ -560,6 +576,75 @@ def load_model(config: TrainingConfig, calibration_data: Optional[List[torch.Ten
     return model, tokenizer
 
 
+def _detect_lora_targets(model: nn.Module, default: List[str]) -> List[str]:
+    """Pick LoRA target module short-names for a model of unknown family.
+
+    Strategy: walk all nn.Linear modules, collect their short names
+    (the last dotted segment), intersect with a curated allow-list of
+    attention/MLP projection names seen across every modern transformer
+    family (LLaMA, Mistral, Qwen, Phi, Gemma, GPT-2, GPT-NeoX, MPT,
+    Falcon, CodeGen, OPT, StableLM, BLOOM, and the VL wrappers of
+    those). Fall back to ``default`` if nothing matches.
+
+    Returning too MANY targets is safer than too few: peft silently
+    drops names that don't exist in the model, and adding a few extra
+    LoRA adapters on present modules is a compute cost, not a
+    correctness cost.
+    """
+    # Union of projection names seen in modern transformer implementations.
+    # Expand freely; false positives on unusual models are cheap.
+    KNOWN_TARGETS = {
+        # LLaMA / Mistral / Qwen / Gemma / Phi3 / Pixtral
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        "gate_proj", "up_proj", "down_proj",
+        # GPT-2 / GPT-NeoX / MPT family
+        "c_attn", "c_proj", "c_fc",
+        # GPT-Neo / GPT-J
+        "out_proj",
+        # Falcon / RefinedWeb
+        "query_key_value", "dense", "dense_h_to_4h", "dense_4h_to_h",
+        # BLOOM
+        "self_attention.query_key_value",
+        # T5-family (just in case)
+        "q", "k", "v", "o", "wi", "wo", "wi_0", "wi_1",
+        # MPT
+        "Wqkv", "out_proj",
+        # StableLM, CodeGen
+        "qkv_proj", "attn_out",
+    }
+
+    present_shortnames: set[str] = set()
+    for name, module in model.named_modules():
+        if not isinstance(module, nn.Linear):
+            continue
+        short = name.rsplit(".", 1)[-1]
+        if short in KNOWN_TARGETS:
+            present_shortnames.add(short)
+
+    if not present_shortnames:
+        # No curated names matched. Second-pass heuristic: any Linear
+        # whose parent path contains "attn"/"attention"/"mlp" is a
+        # plausible target.
+        for name, module in model.named_modules():
+            if not isinstance(module, nn.Linear):
+                continue
+            lname = name.lower()
+            if any(k in lname for k in ("attn", "attention", "mlp",
+                                         "feed_forward", "ffn")):
+                short = name.rsplit(".", 1)[-1]
+                # Skip generic short names like "linear" that collide
+                # with unrelated layers.
+                if short and short not in {"linear", "fc", "classifier"}:
+                    present_shortnames.add(short)
+
+    if not present_shortnames:
+        print(f"[mud-puppy] Warning: no LoRA targets detected, using default: {default}")
+        return list(default)
+
+    # Sort for stability (so log lines are deterministic across runs).
+    return sorted(present_shortnames)
+
+
 def prepare_lora(model: nn.Module, config: TrainingConfig) -> nn.Module:
     """Attach LoRA/QLoRA adapters to the model."""
     try:
@@ -567,36 +652,11 @@ def prepare_lora(model: nn.Module, config: TrainingConfig) -> nn.Module:
     except ImportError as e:
         raise RuntimeError("peft is required for LoRA training") from e
 
-    # Auto-detect target modules based on model architecture
+    # Auto-detect target modules based on model architecture. Ordered
+    # from most-specific to least; first hit wins.
     target_modules = config.lora_target_modules
-
-    # Get all module names to check what's available
-    module_names = [name for name, _ in model.named_modules()]
-    module_names_str = " ".join(module_names)
-
-    # Check if default LLaMA-style modules exist
-    if "q_proj" not in module_names_str:
-        # GPT-2 style: c_attn, c_proj, c_fc
-        if "c_attn" in module_names_str:
-            target_modules = ["c_attn", "c_proj"]
-            print(f"[mud-puppy] Auto-detected GPT-2 style model, using targets: {target_modules}")
-        # GPT-Neo/J style: q_proj exists but different structure
-        elif "attn.attention" in module_names_str:
-            target_modules = ["q_proj", "v_proj", "k_proj", "out_proj"]
-            print(f"[mud-puppy] Auto-detected GPT-Neo style model, using targets: {target_modules}")
-        else:
-            # Fall back to finding any Linear layers with common attention names
-            linear_modules = []
-            for name, module in model.named_modules():
-                if isinstance(module, nn.Linear):
-                    short_name = name.split(".")[-1]
-                    if short_name not in linear_modules and any(
-                        kw in name.lower() for kw in ["attn", "query", "key", "value", "proj"]
-                    ):
-                        linear_modules.append(short_name)
-            if linear_modules:
-                target_modules = list(set(linear_modules))[:4]
-                print(f"[mud-puppy] Auto-detected target modules: {target_modules}")
+    target_modules = _detect_lora_targets(model, default=target_modules)
+    print(f"[mud-puppy] LoRA target modules: {target_modules}")
 
     lora_config = LoraConfig(
         r=config.lora_r,
