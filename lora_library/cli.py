@@ -294,7 +294,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
             server.load_adapter(args.adapter)
 
         # Start REST API
-        server.start_rest_api(host=args.host, port=args.port)
+        server.start_rest_api(
+            host=args.host,
+            port=args.port,
+            max_new_tokens_cap=args.max_new_tokens,
+        )
     else:
         print("Error: --model required for serve command")
         return 1
@@ -497,8 +501,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     serve_parser.add_argument(
         "--host",
-        default="0.0.0.0",
-        help="Host to bind to",
+        default="127.0.0.1",
+        help=(
+            "Host to bind to (default: 127.0.0.1). "
+            "Binding to 0.0.0.0 exposes inference to the LAN; "
+            "use a reverse proxy with auth in production."
+        ),
     )
     serve_parser.add_argument(
         "--port", "-p",
@@ -511,6 +519,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=10,
         help="Maximum adapters to cache",
+    )
+    serve_parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=4096,
+        help=(
+            "Server-side cap on max_new_tokens per /generate request "
+            "(default: 4096). Requests exceeding this return HTTP 400."
+        ),
     )
 
     # export command

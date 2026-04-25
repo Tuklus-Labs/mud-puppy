@@ -41,9 +41,10 @@ htmlcov/
 *.log
 logs/
 
-# Model outputs (optional - uncomment if desired)
-# outputs/
-# checkpoints/
+# Model outputs (large + regenerable)
+outputs/
+checkpoints/
+training_data_sets/
 
 # OS
 .DS_Store

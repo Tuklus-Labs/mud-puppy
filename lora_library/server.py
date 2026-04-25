@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import gc
 import json
+import logging
 import os
+import secrets
 import threading
 import time
 from collections import OrderedDict
@@ -16,6 +18,17 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+
+log = logging.getLogger(__name__)
+
+# Default cap on max_new_tokens for generation requests.
+# Requests exceeding this (either directly or via --max-new-tokens) are rejected with HTTP 400.
+DEFAULT_MAX_NEW_TOKENS_CAP = 4096
+
+# Environment variable that, if set to a non-empty string, enables bearer-token auth
+# on the REST API. When unset, auth is disabled and the server relies on a
+# localhost-only bind as its security boundary.
+BEARER_TOKEN_ENV = "MUD_PUPPY_LORA_TOKEN"
 
 try:
     import jax
@@ -226,19 +239,77 @@ class AdapterServer:
         checkpointer = ocp.PyTreeCheckpointer()
         return checkpointer.restore(str(adapter_path))
 
+    def _load_adapter_metadata(self, name: str) -> Dict[str, Any]:
+        """Load adapter metadata (alpha, r, etc.) from disk if available.
+
+        Looks for ``adapter_config.json`` or ``adapter_config.yaml`` in the
+        adapter directory (``adapters_dir/name/``). Returns an empty dict if
+        no sidecar is found; callers must handle missing keys.
+
+        The sidecar may be written by trainers (e.g. ``batch_trainer``) to
+        preserve the ``alpha`` / ``r`` used at training time so inference
+        merges the delta with the correct scaling (``alpha / r``).
+        """
+        adapter_dir = self.adapters_dir / name
+        if not adapter_dir.exists():
+            return {}
+
+        # Prefer JSON (no yaml dependency needed to read it).
+        json_path = adapter_dir / "adapter_config.json"
+        if json_path.exists():
+            try:
+                with open(json_path, "r") as f:
+                    return json.load(f) or {}
+            except (OSError, ValueError) as e:
+                log.warning(
+                    "[lora-server] Failed to parse %s: %s", json_path, e
+                )
+                return {}
+
+        yaml_path = adapter_dir / "adapter_config.yaml"
+        if yaml_path.exists():
+            try:
+                import yaml  # optional; only needed when sidecar is YAML
+                with open(yaml_path, "r") as f:
+                    return yaml.safe_load(f) or {}
+            except ImportError:
+                log.warning(
+                    "[lora-server] Found %s but PyYAML is not installed; "
+                    "cannot read adapter metadata.",
+                    yaml_path,
+                )
+                return {}
+            except (OSError, ValueError) as e:
+                log.warning(
+                    "[lora-server] Failed to parse %s: %s", yaml_path, e
+                )
+                return {}
+
+        return {}
+
     def _merge_params(
         self,
         base_params: Dict[str, Any],
         lora_params: Dict[str, Any],
+        adapter_metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Merge LoRA params into base params for inference.
 
         For inference, we merge the LoRA weights directly:
         W_effective = W_base + (B @ A) * scaling
 
+        Scaling follows the standard LoRA convention ``alpha / r``. ``alpha``
+        and ``r`` are taken from ``adapter_metadata`` when present (written
+        by the trainer to ``adapter_config.json`` / ``.yaml`` alongside the
+        orbax checkpoint). When no metadata is available, ``r`` is inferred
+        from the shape of the ``lora_a`` tensor and ``alpha`` defaults to
+        the common convention ``alpha = 2 * r``. A warning is emitted so
+        callers know they are relying on defaults.
+
         Args:
             base_params: Base model parameters.
             lora_params: LoRA adapter parameters.
+            adapter_metadata: Optional dict with ``alpha`` and/or ``r`` keys.
 
         Returns:
             Merged parameters.
@@ -250,6 +321,11 @@ class AdapterServer:
 
         # Find lora_a and lora_b pairs
         lora_a_keys = [k for k in flat_lora.keys() if "lora_a" in k]
+
+        meta = adapter_metadata or {}
+        meta_alpha = meta.get("alpha")
+        meta_r = meta.get("r")
+        defaulted = False
 
         for a_key in lora_a_keys:
             # Construct corresponding B key and kernel key
@@ -264,11 +340,31 @@ class AdapterServer:
                 # Note: A is (in_features, r), B is (r, out_features)
                 delta = jnp.matmul(lora_a, lora_b)
 
-                # Get scaling from params if available, otherwise use default
-                r = lora_a.shape[-1]
-                scaling = 2.0  # Default alpha/r = 16/8
+                # Scaling = alpha / r. Prefer metadata; fall back to the
+                # shape of lora_a for r and the alpha=2r convention.
+                r = int(meta_r) if meta_r is not None else int(lora_a.shape[-1])
+                if meta_alpha is not None:
+                    alpha = float(meta_alpha)
+                else:
+                    alpha = float(2 * r)  # conventional default alpha = 2r
+                    defaulted = True
+                if r <= 0:
+                    raise ValueError(
+                        f"Invalid LoRA rank r={r} for adapter key {a_key}"
+                    )
+                scaling = alpha / r
 
                 merged[kernel_key] = flat_base[kernel_key] + delta * scaling
+
+        if defaulted and lora_a_keys:
+            log.warning(
+                "[lora-server] No adapter_config.{json,yaml} sidecar found "
+                "for adapter; falling back to alpha=2*r scaling. If this "
+                "adapter was trained with a non-default alpha (e.g. 16 "
+                "with r=8, alpha=32 with r=16), merged weights will be "
+                "scaled incorrectly. Save an adapter_config.json with "
+                "{\"alpha\": <float>, \"r\": <int>} alongside the params."
+            )
 
         return freeze(unflatten_dict(merged))
 
@@ -286,15 +382,20 @@ class AdapterServer:
                 # Load from disk
                 print(f"[lora-server] Loading adapter: {name}")
                 lora_params = self._load_adapter_params(name)
+                adapter_metadata = self._load_adapter_metadata(name)
 
                 state = AdapterState(
                     name=name,
                     params=lora_params,
+                    metadata=adapter_metadata,
                 )
                 self.cache.put(name, state)
 
-            # Merge with base and set active
-            self._active_params = self._merge_params(self.base_params, state.params)
+            # Merge with base and set active. Pass through any alpha/r
+            # metadata so the scaling matches the adapter's training config.
+            self._active_params = self._merge_params(
+                self.base_params, state.params, state.metadata
+            )
             self._active_adapter = name
 
             print(f"[lora-server] Active adapter: {name}")
@@ -515,21 +616,63 @@ class AdapterServer:
 
     def start_rest_api(
         self,
-        host: str = "0.0.0.0",
+        host: str = "127.0.0.1",
         port: int = 8080,
+        max_new_tokens_cap: int = DEFAULT_MAX_NEW_TOKENS_CAP,
+        auth_token: Optional[str] = None,
     ) -> None:
         """Start REST API server.
 
         Args:
-            host: Host to bind to.
+            host: Host to bind to. Defaults to localhost. Binding to 0.0.0.0
+                exposes inference to the LAN; do so only behind a reverse proxy
+                that enforces authentication.
             port: Port to listen on.
+            max_new_tokens_cap: Server-side maximum for the ``max_new_tokens``
+                generation parameter. Requests exceeding this are rejected with
+                HTTP 400.
+            auth_token: Optional bearer token. If ``None``, the environment
+                variable ``MUD_PUPPY_LORA_TOKEN`` is consulted. If neither is
+                set, bearer auth is disabled (localhost-only bind is the
+                security boundary).
         """
         try:
             from flask import Flask, request, jsonify
         except ImportError:
             raise RuntimeError("Flask required for REST API. Install with: pip install flask")
 
+        # Resolve auth token: explicit arg wins, else env var, else disabled.
+        if auth_token is None:
+            env_token = os.environ.get(BEARER_TOKEN_ENV, "")
+            auth_token = env_token if env_token else None
+
+        auth_enabled = auth_token is not None and len(auth_token) > 0
+
         app = Flask("lora-server")
+
+        # Endpoints that skip auth even when auth is enabled.
+        _public_paths = {"/health"}
+
+        def _require_auth() -> Optional[Tuple[Any, int]]:
+            """Verify bearer token. Returns (response, status) on failure, else None."""
+            if not auth_enabled:
+                return None
+            if request.path in _public_paths:
+                return None
+            header = request.headers.get("Authorization", "")
+            prefix = "Bearer "
+            if not header.startswith(prefix):
+                return jsonify({"error": "missing or malformed Authorization header"}), 401
+            presented = header[len(prefix):]
+            if not secrets.compare_digest(presented, auth_token):
+                return jsonify({"error": "invalid bearer token"}), 401
+            return None
+
+        @app.before_request
+        def _auth_gate():
+            fail = _require_auth()
+            if fail is not None:
+                return fail
 
         @app.route("/health", methods=["GET"])
         def health():
@@ -558,10 +701,28 @@ class AdapterServer:
 
         @app.route("/generate", methods=["POST"])
         def generate():
-            data = request.json
+            data = request.json or {}
             prompt = data.get("prompt", "")
             adapter = data.get("adapter")
             kwargs = {k: v for k, v in data.items() if k not in ("prompt", "adapter")}
+
+            # Enforce server-side cap on max_new_tokens.
+            requested_mnt = kwargs.get("max_new_tokens")
+            if requested_mnt is not None:
+                try:
+                    requested_mnt_int = int(requested_mnt)
+                except (TypeError, ValueError):
+                    return jsonify({"error": "max_new_tokens must be an integer"}), 400
+                if requested_mnt_int <= 0:
+                    return jsonify({"error": "max_new_tokens must be positive"}), 400
+                if requested_mnt_int > max_new_tokens_cap:
+                    return jsonify({
+                        "error": (
+                            f"max_new_tokens={requested_mnt_int} exceeds server cap "
+                            f"of {max_new_tokens_cap}"
+                        ),
+                    }), 400
+                kwargs["max_new_tokens"] = requested_mnt_int
 
             try:
                 result = self.generate(prompt, adapter=adapter, **kwargs)
@@ -576,7 +737,21 @@ class AdapterServer:
         def stats():
             return jsonify(self.get_stats())
 
-        print(f"[lora-server] Starting REST API on {host}:{port}")
+        if auth_enabled:
+            print("[lora-server] Bearer auth: enabled")
+        else:
+            print("[lora-server] Bearer auth: disabled (localhost-only bind)")
+
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            print(
+                f"[lora-server] WARNING: binding to {host} exposes inference beyond "
+                f"localhost. Put this behind a reverse proxy with auth in production."
+            )
+
+        print(
+            f"[lora-server] Starting REST API on {host}:{port} "
+            f"(max_new_tokens cap: {max_new_tokens_cap})"
+        )
         app.run(host=host, port=port, threaded=True)
 
 

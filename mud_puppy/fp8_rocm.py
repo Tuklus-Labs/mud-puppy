@@ -49,9 +49,11 @@ Limitations
 from __future__ import annotations
 
 import logging
+import os
 from typing import Iterable, Optional
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -64,6 +66,22 @@ log = logging.getLogger(__name__)
 _FP8_E4M3_MAX = 448.0
 # Amax floor to prevent scale explosion when a tensor is all-zero.
 _AMAX_EPS = 1e-8
+
+# Opt-out for the cross-rank amax allreduce. Defaults ON so FSDP/DDP behavior
+# is unchanged. Set MUD_PUPPY_FP8_ALLREDUCE=0 to disable the allreduce in
+# _update_amax -- needed for pipeline parallelism, where different ranks own
+# different FP8Linear instances and a blanket ``dist.all_reduce`` on the WORLD
+# group would deadlock (only the ranks that actually own the module call into
+# the collective). Read at call time (not import time) so ``monkeypatch.setenv``
+# in tests and post-import config hooks in pipeline-parallel launchers both work.
+def _fp8_allreduce_enabled() -> bool:
+    return os.environ.get("MUD_PUPPY_FP8_ALLREDUCE", "1") not in (
+        "0",
+        "false",
+        "False",
+        "no",
+        "off",
+    )
 
 
 def _fp8_cast_ste(t: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
@@ -94,29 +112,15 @@ def _fp8_cast_ste(t: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 def is_fp8_hardware_available() -> bool:
     """Return True if ``torch._scaled_mm`` will actually run on this device.
 
-    Probes by trying a small scaled mm. Not cached: caching at module level
-    would permanently return False if called before torch.cuda is initialized
-    (e.g. in test environments), and the probe cost (~2ms) is negligible
-    compared to any real use.
+    Thin alias over :func:`mud_puppy.arch.is_fp8_runnable` so both the
+    kernel-tuning side (``arch.ArchInfo.has_hw_fp8``, static) and the
+    runtime probe (here) agree on a single answer. On CDNA3/MI300 and
+    RDNA4 this returns True; on RDNA3 / 7900 XTX it returns False and
+    :class:`FP8Linear` falls back to the STE emulation path.
     """
-    if not (hasattr(torch, "_scaled_mm") and hasattr(torch, "float8_e4m3fn")):
-        return False
-    if not torch.cuda.is_available():
-        return False
-    try:
-        a = torch.zeros(16, 32, device="cuda", dtype=torch.bfloat16).to(
-            torch.float8_e4m3fn
-        )
-        b = torch.zeros(32, 16, device="cuda", dtype=torch.bfloat16).to(
-            torch.float8_e4m3fn
-        )
-        sa = torch.tensor(1.0, device="cuda")
-        sb = torch.tensor(1.0, device="cuda")
-        torch._scaled_mm(a, b, scale_a=sa, scale_b=sb, out_dtype=torch.bfloat16)
-        return True
-    except Exception as exc:
-        log.debug("FP8 hardware probe failed: %s", exc)
-        return False
+    from .arch import is_fp8_runnable
+
+    return is_fp8_runnable()
 
 
 class FP8Linear(nn.Module):
@@ -126,6 +130,18 @@ class FP8Linear(nn.Module):
     every forward we cast an FP8 view of the weight and the input,
     matmul, then unscale. Delayed scaling: the cast uses the amax from
     the *previous* step, so there's no global reduction in the hot path.
+
+    Distributed behavior
+    ~~~~~~~~~~~~~~~~~~~~
+
+    When ``torch.distributed`` is initialized, ``_update_amax`` issues an
+    ``all_reduce(MAX)`` across ``dist.group.WORLD`` so every rank agrees on
+    the same per-tensor scale (required for FSDP/DDP where the weight is
+    replicated). This is not correct under pipeline parallelism, where
+    different ranks own different ``FP8Linear`` modules and only some ranks
+    enter the collective, causing a deadlock. Set
+    ``MUD_PUPPY_FP8_ALLREDUCE=0`` in the environment to disable the
+    cross-rank amax reduction entirely.
     """
 
     def __init__(
@@ -142,7 +158,14 @@ class FP8Linear(nn.Module):
 
         # Master weight in original dtype; optimizer updates this copy.
         self.weight = nn.Parameter(linear.weight.detach().clone())
-        self.bias = linear.bias
+        # Clone the bias into a fresh Parameter so updates to FP8Linear's
+        # bias don't silently mutate the original nn.Linear tensor that
+        # may still be referenced elsewhere (e.g. in a checkpoint or by
+        # another module holding onto the same handle).
+        if linear.bias is not None:
+            self.bias = nn.Parameter(linear.bias.detach().clone())
+        else:
+            self.bias = None
 
         # Delayed-scaling observers: store amax as a buffer so it
         # survives checkpoint round-trips. Initialized to a conservative
@@ -182,6 +205,20 @@ class FP8Linear(nn.Module):
         EMA decayed term (buf * momentum) is NaN, torch.maximum propagates it,
         and every subsequent forward pass produces NaN forever regardless of
         how clean new_amax is.
+
+        FSDP/DDP fix: Transformer Engine's delayed-scaling recipe requires
+        allreduce(max) on amax across ranks so every rank agrees on the same
+        scale for the replicated weight. Without this, each rank derives a
+        different per-tensor scale and silent numerical drift accumulates.
+        Skipped when not distributed so single-GPU behavior is unchanged.
+
+        Pipeline-parallelism opt-out: the allreduce is on ``dist.group.WORLD``
+        by default. Under pipeline parallelism, different ranks own
+        different ``FP8Linear`` instances, so only some ranks enter this
+        function for a given module and the collective deadlocks. Set
+        ``MUD_PUPPY_FP8_ALLREDUCE=0`` in the environment to skip the
+        allreduce entirely; the amax then stays per-rank, which is correct
+        for pipeline stages that do not share a replicated weight.
         """
         buf_clean = torch.nan_to_num(
             buf,
@@ -195,6 +232,15 @@ class FP8Linear(nn.Module):
             posinf=_FP8_E4M3_MAX,
             neginf=_AMAX_EPS,
         )
+        if (
+            _fp8_allreduce_enabled()
+            and dist.is_available()
+            and dist.is_initialized()
+        ):
+            # Reduce across ranks so all ranks see the same amax. Needs a
+            # contiguous tensor on the collective's device; new_clean is
+            # already detached above.
+            dist.all_reduce(new_clean, op=dist.ReduceOp.MAX)
         decayed = buf_clean * self.amax_momentum
         buf.copy_(torch.maximum(decayed, new_clean).clamp(min=_AMAX_EPS))
 

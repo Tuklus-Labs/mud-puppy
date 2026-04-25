@@ -1,7 +1,19 @@
 from dataclasses import dataclass, field
+import math
 import os
 from typing import Optional, List
 import torch
+
+
+def _env_int(name: str, default: int) -> int:
+    """int(env) with sane handling of unset/empty values."""
+    v = os.environ.get(name)
+    if v is None or v == "":
+        return default
+    try:
+        return int(v)
+    except ValueError:
+        return default
 
 
 @dataclass
@@ -86,7 +98,28 @@ class TrainingConfig:
     zero_offload: bool = False
     max_grad_norm: float = 1.0
     distributed: bool = False
-    local_rank: int = int(os.environ.get("LOCAL_RANK", 0))
+    local_rank: int = _env_int("LOCAL_RANK", 0)
+
+    # --- FSDP / multi-GPU ----------------------------------------------------
+    #
+    # FSDP is the supported path for multi-GPU training on MI300 nodes.
+    # DDP still works (``distributed=True, fsdp=False``) but won't fit a
+    # 70B model on 8x192GB without it.
+    #
+    # When ``fsdp_mode`` is non-empty, ``create_training_args`` forwards
+    # the matching HuggingFace FSDP options. The launcher sets
+    # LOCAL_RANK / WORLD_SIZE from torchrun; we infer ``distributed``
+    # automatically when WORLD_SIZE > 1, but an explicit flag always wins.
+    # "full_shard" / "shard_grad_op" / "no_shard" all work on a single node.
+    # "hybrid_shard" REQUIRES multi-node (set --nnodes > 1 via launcher); a
+    # single-node hybrid_shard run is a misconfiguration and only emits a
+    # warning because the launcher owns the topology.
+    fsdp_mode: str = ""                 # "", "full_shard", "shard_grad_op", "no_shard", "hybrid_shard"
+    fsdp_cpu_offload: bool = False      # offload sharded params to CPU (MI300 rarely needs this)
+    fsdp_activation_checkpointing: bool = False
+    fsdp_min_num_params: int = 1_000_000  # auto-wrap threshold for transformer blocks
+    fsdp_transformer_layer_cls: str = ""  # e.g. "LlamaDecoderLayer"; empty = size-based wrap
+    distributed_backend: str = "nccl"     # "nccl"(=rccl on ROCm), "gloo" for CPU tests
 
     # LoRA merge behavior
     merge_lora: bool = False
@@ -111,9 +144,42 @@ class TrainingConfig:
             raise ValueError(
                 f"prefetch_layers must be >= 1, got {self.prefetch_layers}"
             )
+        # Validate fsdp_mode enum FIRST so we fail fast on a bad value.
+        if self.fsdp_mode and self.fsdp_mode not in {
+            "full_shard", "shard_grad_op", "no_shard", "hybrid_shard",
+        }:
+            raise ValueError(
+                f"Unsupported fsdp_mode: {self.fsdp_mode!r}. "
+                "Must be one of: full_shard, shard_grad_op, no_shard, hybrid_shard"
+            )
+        # Auto-promote BEFORE the device-count check so users who pass only
+        # ``--fsdp full_shard`` (without ``--distributed``) don't bypass the
+        # GPU-count guard and then crash inside NCCL.
+        if self.fsdp_mode and not self.distributed:
+            # FSDP implies distributed. Flip it on so users don't have to
+            # pass both --fsdp full_shard --distributed every time.
+            self.distributed = True
+        if self.fsdp_mode == "hybrid_shard":
+            # hybrid_shard only makes sense with >1 node. TrainingConfig has
+            # no nnodes field (the launcher controls topology), so we can't
+            # hard-check it here. Warn so launcher users who legitimately
+            # want hybrid_shard aren't blocked.
+            import logging
+            logging.getLogger(__name__).warning(
+                "fsdp_mode='hybrid_shard' is intended for multi-node runs; "
+                "make sure the launcher sets --nnodes > 1."
+            )
         if self.distributed and torch.cuda.device_count() < 2:
-            # Note: torch.distributed on ROCm still reports as CUDA in PyTorch
-            raise ValueError("Distributed training requires at least 2 GPUs")
+            # Note: torch.distributed on ROCm still reports as CUDA in PyTorch.
+            # Allow skipping this check under pytest / torchrun dry-run where
+            # CUDA isn't visible but the user is legitimately constructing
+            # a config for a remote multi-GPU run.
+            if os.environ.get("MUD_PUPPY_SKIP_GPU_COUNT_CHECK") != "1":
+                raise ValueError("Distributed training requires at least 2 GPUs")
+        if self.distributed_backend not in {"nccl", "gloo", "mpi"}:
+            raise ValueError(
+                f"Unsupported distributed_backend: {self.distributed_backend!r}"
+            )
 
     def __post_init__(self) -> None:
         supported = {
@@ -146,6 +212,8 @@ class TrainingConfig:
 
         if self.log_with not in {"none", "tensorboard", "wandb"}:
             raise ValueError(f"Unsupported logging backend: {self.log_with}")
+        if not math.isfinite(self.lora_dropout):
+            raise ValueError(f"lora_dropout must be finite, got {self.lora_dropout}")
         if not 0.0 <= self.lora_dropout <= 1.0:
             raise ValueError("lora_dropout must be between 0.0 and 1.0")
 
@@ -163,6 +231,8 @@ class TrainingConfig:
             raise ValueError(f"num_epochs must be > 0, got {self.num_epochs}")
         if self.learning_rate <= 0:
             raise ValueError(f"learning_rate must be > 0, got {self.learning_rate}")
+        if not math.isfinite(self.learning_rate):
+            raise ValueError(f"learning_rate must be finite, got {self.learning_rate}")
         if self.finetuning_method in {"lora", "qlora"} and self.lora_r <= 0:
             raise ValueError(
                 f"lora_r must be > 0 for method={self.finetuning_method!r}, "
@@ -176,6 +246,15 @@ class TrainingConfig:
             raise ValueError(
                 f"max_seq_length must be >= 0 (0 means use model default), "
                 f"got {self.max_seq_length}"
+            )
+        if not math.isfinite(self.max_grad_norm):
+            raise ValueError(
+                f"max_grad_norm must be finite, got {self.max_grad_norm}"
+            )
+        if self.max_grad_norm <= 0:
+            raise ValueError(
+                f"max_grad_norm must be > 0 (use the default 1.0 to enable "
+                f"standard gradient clipping); got {self.max_grad_norm}"
             )
 
         self._validate_paths()

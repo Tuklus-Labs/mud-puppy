@@ -76,3 +76,6 @@ multimodal = [
 [project.scripts]
 mud-puppy = "mud_puppy.cli:main"
 mud-puppy-interactive = "mud_puppy.interactive:main"
+
+[tool.setuptools.packages.find]
+include = ["mud_puppy*"]

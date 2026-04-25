@@ -65,8 +65,12 @@ def _e2m1_lut(device: torch.device) -> torch.Tensor:
 
 if TRITON_AVAILABLE:
 
-    # Autotune configs: BLOCK_K must be a multiple of 32 (the MXFP4 block size).
+    # Autotune configs: BLOCK_K must be a multiple of 32 (MXFP4 block size).
+    # Unified RDNA3 + CDNA3 config space. Triton's autotune picks per-arch
+    # per-shape; the extra CDNA-friendly entries are ignored on RDNA3 once
+    # the cache warms.
     _FWD_CONFIGS = [
+        # ----- RDNA3 (7900 XTX) -----
         triton.Config({"BLOCK_M": 16,  "BLOCK_N": 64,  "BLOCK_K": 32, "GROUP_M": 1},  num_warps=4, num_stages=2),
         triton.Config({"BLOCK_M": 16,  "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_M": 1},  num_warps=4, num_stages=2),
         triton.Config({"BLOCK_M": 32,  "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_M": 1},  num_warps=4, num_stages=2),
@@ -77,6 +81,14 @@ if TRITON_AVAILABLE:
         triton.Config({"BLOCK_M": 64,  "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 8},  num_warps=8, num_stages=3),
         triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_M": 4},  num_warps=8, num_stages=2),
         triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 4},  num_warps=8, num_stages=3),
+        # ----- CDNA3 (MI300X) -----
+        # BLOCK_K must stay a multiple of 32 (MXFP4 block boundary).
+        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_M": 8}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64,  "GROUP_M": 8}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_M": 8}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 64,  "GROUP_M": 8}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 64,  "GROUP_M": 8}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 128, "GROUP_M": 8}, num_warps=8, num_stages=4),
     ]
     _BWD_CONFIGS = list(_FWD_CONFIGS)  # Same tile space; swizzle semantics match.
 
@@ -171,7 +183,14 @@ if TRITON_AVAILABLE:
                 mask=n_mask[:, None] & scale_k_mask[None, :],
                 other=127,  # decodes to scale=1.0 for masked positions (unused)
             ).to(tl.int32)
-            block_scales = tl.exp2((scale_bytes - 127).to(tl.float32))  # [BN, BPT]
+            # E8M0 reserves 0xFF as NaN. Left raw, (255 - 127) = 128 so
+            # exp2 returns 2^128 == +inf, which poisons the fp32
+            # accumulator for the whole block. Detect NaN blocks and
+            # force the decoded weight contribution to 0.0.
+            nan_mask = scale_bytes == 255
+            scale_bytes_safe = tl.where(nan_mask, 127, scale_bytes)
+            block_scales = tl.exp2((scale_bytes_safe - 127).to(tl.float32))  # [BN, BPT]
+            block_scales = tl.where(nan_mask, 0.0, block_scales)
 
             # Broadcast scales across 32 K positions each.
             # [BN, BPT] -> [BN, BPT, 32] -> [BN, BPT*32] = [BN, BLOCK_K]
@@ -185,6 +204,10 @@ if TRITON_AVAILABLE:
             w_fp = tl.where(k_mask[None, :], w_fp, 0.0)
 
             # Transpose for tl.dot(M,K) @ (K,N).
+            # TODO(CDNA-optimization): tl.trans kills RDNA3 coalesce; consider
+            # row-major B layout when retuning. See Pass 1 audit (2026-04-22):
+            # changing the tl.dot layout is a real correctness risk on CDNA
+            # so we leave it alone for now.
             w_fp_t = tl.trans(w_fp)
             acc += tl.dot(a_tile, w_fp_t.to(a_tile.dtype), allow_tf32=False)
 
@@ -271,7 +294,12 @@ if TRITON_AVAILABLE:
                 mask=n_mask[:, None] & scale_k_mask[None, :],
                 other=127,
             ).to(tl.int32)
-            block_scales = tl.exp2((scale_bytes - 127).to(tl.float32))
+            # E8M0 reserves 0xFF as NaN. Zero out NaN blocks' contribution
+            # rather than letting (255 - 127) exp2 to 2^128 == +inf.
+            nan_mask = scale_bytes == 255
+            scale_bytes_safe = tl.where(nan_mask, 127, scale_bytes)
+            block_scales = tl.exp2((scale_bytes_safe - 127).to(tl.float32))
+            block_scales = tl.where(nan_mask, 0.0, block_scales)
 
             scales_3d = block_scales.reshape(BLOCK_N, BLOCKS_PER_TILE, 1)
             scales_expanded = tl.broadcast_to(scales_3d, (BLOCK_N, BLOCKS_PER_TILE, 32))

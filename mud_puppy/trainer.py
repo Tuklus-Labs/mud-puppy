@@ -732,7 +732,45 @@ def create_training_args(config: TrainingConfig) -> TrainingArguments:
     # transformers 5.0 changed report_to behavior - empty list means no reporting
     report_to = [] if config.log_with == "none" else [config.log_with]
 
-    return TrainingArguments(
+    # -------------------- FSDP wiring --------------------
+    # HuggingFace TrainingArguments accepts ``fsdp`` as a string or list
+    # of tokens: {"full_shard", "shard_grad_op", "no_shard", "hybrid_shard",
+    # "offload", "auto_wrap"}. We compose it from the dedicated config
+    # fields so users don't have to memorize the token soup.
+    fsdp_tokens: List[str] = []
+    fsdp_config_dict: Dict[str, Any] = {}
+    if config.fsdp_mode:
+        fsdp_tokens.append(config.fsdp_mode)
+        fsdp_tokens.append("auto_wrap")
+        if config.fsdp_cpu_offload:
+            fsdp_tokens.append("offload")
+        if config.fsdp_transformer_layer_cls:
+            # Class-based wrap: one FSDP unit per transformer block. This
+            # is the standard pattern for LLM training and tends to give
+            # much better memory behavior than min-num-params wrapping
+            # because it aligns shard boundaries with activation
+            # recomputation boundaries.
+            fsdp_config_dict["transformer_layer_cls_to_wrap"] = [
+                config.fsdp_transformer_layer_cls
+            ]
+        else:
+            fsdp_config_dict["min_num_params"] = config.fsdp_min_num_params
+        if config.fsdp_activation_checkpointing:
+            fsdp_config_dict["activation_checkpointing"] = True
+        # Keep the param+grad flat in bf16 on MI300 to match amp dtype and
+        # let RCCL push bigger bf16 buckets. Users can still override via
+        # env.
+        fsdp_config_dict.setdefault(
+            "backward_prefetch", "backward_pre"
+        )
+        fsdp_config_dict.setdefault(
+            "sharding_strategy", config.fsdp_mode.upper()
+        )
+        fsdp_config_dict.setdefault("use_orig_params", True)
+
+    fsdp_str = " ".join(fsdp_tokens) if fsdp_tokens else ""
+
+    kwargs: Dict[str, Any] = dict(
         output_dir=config.output_dir,
         per_device_train_batch_size=config.batch_size,
         gradient_accumulation_steps=config.gradient_accumulation,
@@ -746,9 +784,10 @@ def create_training_args(config: TrainingConfig) -> TrainingArguments:
         optim="adamw_torch_fused" if torch.cuda.is_available() else "adamw_torch",
         lr_scheduler_type=config.lr_scheduler,
         eval_strategy="epoch" if config.early_stopping_patience > 0 else "no",
-        save_strategy="epoch",
+        save_strategy=getattr(config, "save_strategy", "epoch"),
+        save_steps=getattr(config, "save_steps", 500),
         logging_strategy="steps",
-        logging_steps=10,
+        logging_steps=getattr(config, "logging_steps", 10),
         report_to=report_to,
         save_total_limit=2,
         load_best_model_at_end=config.early_stopping_patience > 0,
@@ -758,6 +797,10 @@ def create_training_args(config: TrainingConfig) -> TrainingArguments:
         ddp_find_unused_parameters=False,
         remove_unused_columns=False,
     )
+    if fsdp_str:
+        kwargs["fsdp"] = fsdp_str
+        kwargs["fsdp_config"] = fsdp_config_dict
+    return TrainingArguments(**kwargs)
 
 
 def load_and_preprocess_dataset(
@@ -901,14 +944,68 @@ def load_and_preprocess_dataset(
 
 
 def setup_distributed(config: TrainingConfig) -> bool:
-    """Initialize distributed training if requested."""
+    """Initialize distributed training if requested.
+
+    On ROCm the ``nccl`` backend is transparently RCCL; PyTorch picks the
+    right one based on the build. For MI300 nodes we additionally set a
+    small number of env var defaults that materially help performance on
+    xGMI fabric; users can override by exporting the same variables
+    before invoking the launcher.
+    """
+    # Auto-promote to distributed when torchrun provided a world size.
+    # This lets ``mud-puppy`` scripts that don't know about --distributed
+    # still do the right thing behind torchrun.
+    world_size = int(os.environ.get("WORLD_SIZE") or "1")
+    if world_size > 1 and not config.distributed:
+        log.info("WORLD_SIZE=%d detected; enabling distributed", world_size)
+        config.distributed = True
+
     if not config.distributed:
         return False
 
+    # Guard: if the user asked for distributed but there's no launcher env,
+    # ``init_process_group`` would otherwise block forever on rendezvous.
+    # Accept either torchrun's WORLD_SIZE>1 OR explicit MASTER_ADDR+MASTER_PORT
+    # (for static init), and otherwise fail with a clear message.
     if not dist.is_initialized():
-        dist.init_process_group(backend="nccl")
+        has_torchrun = world_size > 1
+        has_static = bool(os.environ.get("MASTER_ADDR")) and bool(
+            os.environ.get("MASTER_PORT")
+        )
+        if not (has_torchrun or has_static):
+            raise RuntimeError(
+                "--distributed requires torchrun or MASTER_ADDR/MASTER_PORT; "
+                "see scripts/mud-puppy-launch"
+            )
 
-    torch.cuda.set_device(config.local_rank)
+    # CDNA-specific tuning. All of these are overridable via the shell.
+    from .arch import get_arch
+
+    # Touch the device first so get_arch can actually read gcnArchName.
+    # One set_device call, placed after the guard so we don't pin a device
+    # for a run that's about to error out.
+    if torch.cuda.is_available():
+        torch.cuda.set_device(config.local_rank)
+    info = get_arch(config.local_rank) if torch.cuda.is_available() else None
+    if info is not None and info.is_cdna:
+        # RCCL on MI300 xGMI benefits from these defaults. They're
+        # ignored on other hardware.
+        os.environ.setdefault("NCCL_PROTO", "Simple,LL,LL128")
+        os.environ.setdefault("NCCL_ALGO", "Tree,Ring")
+        # P2P over xGMI; falls back automatically if links are absent.
+        os.environ.setdefault("NCCL_P2P_DISABLE", "0")
+        # RCCL-specific: rely on HSA_OVERRIDE only when user sets it.
+        os.environ.setdefault("RCCL_MSCCL_ENABLE", "1")
+
+    if not dist.is_initialized():
+        dist.init_process_group(backend=config.distributed_backend)
+
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    log.info(
+        "distributed init: rank=%d world=%d backend=%s arch=%s",
+        rank, world_size, config.distributed_backend,
+        info.family.value if info else "cpu",
+    )
     return True
 
 

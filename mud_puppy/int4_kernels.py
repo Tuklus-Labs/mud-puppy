@@ -86,7 +86,18 @@ if TRITON_AVAILABLE:
     # GROUP_M controls L2 cache blocking: consecutive programs share the
     # same W slice when grouped. 4-8 is the sweet spot on RDNA3 (enough
     # L2 reuse without starving CU occupancy).
+    #
+    # We provide a unified config list that spans RDNA3 (wave=32, GDDR6)
+    # and CDNA3 (wave=64, HBM3). Triton's autotune picks the fastest
+    # config per-device per-shape, so the cost of the extra CDNA
+    # candidates is paid once on first run and then cached.
+    #
+    # CDNA-tuned configs prefer:
+    #   * BLOCK_K=64 or 128 (HBM3 hides larger K strides cheaply)
+    #   * num_stages=3-4 (more in-flight DRAM requests)
+    #   * num_warps=4 at BLOCK_M=128 (wave=64 means 4 warps = 256 threads)
     _FWD_CONFIGS = [
+        # ----- RDNA3-friendly (7900 XTX) -----
         # No-swizzle fallbacks for shapes where L2 grouping hurts (small M or N)
         triton.Config({"BLOCK_M": 16,  "BLOCK_N": 64,  "BLOCK_K": 64, "GROUP_M": 1},  num_warps=4, num_stages=2),
         triton.Config({"BLOCK_M": 16,  "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 1},  num_warps=4, num_stages=2),
@@ -103,10 +114,21 @@ if TRITON_AVAILABLE:
         triton.Config({"BLOCK_M": 128, "BLOCK_N": 64,  "BLOCK_K": 32, "GROUP_M": 4},  num_warps=8, num_stages=2),
         triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_M": 4},  num_warps=8, num_stages=2),
         triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 4},  num_warps=8, num_stages=3),
+        # ----- CDNA3-friendly (MI300X) -----
+        # Larger BLOCK_K amortizes HBM3 latency; num_warps=4 with
+        # BLOCK_M=128 hits 256 threads which is a natural tile on a
+        # 64-wide wavefront.
+        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_M": 8}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64,  "GROUP_M": 8}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_M": 8}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 64,  "GROUP_M": 8}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 64,  "GROUP_M": 8}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 128, "GROUP_M": 8}, num_warps=8, num_stages=4),
     ]
     # Backward is symmetric to forward: grid is (M/BM, K/BK), inner over N.
     # Same config space; swizzle groups M tiles to share W reads.
     _BWD_CONFIGS = [
+        # ----- RDNA3-friendly -----
         # No-swizzle fallbacks
         triton.Config({"BLOCK_M": 16,  "BLOCK_N": 64,  "BLOCK_K": 64, "GROUP_M": 1},  num_warps=4, num_stages=2),
         triton.Config({"BLOCK_M": 16,  "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 1},  num_warps=4, num_stages=2),
@@ -123,6 +145,13 @@ if TRITON_AVAILABLE:
         triton.Config({"BLOCK_M": 128, "BLOCK_N": 64,  "BLOCK_K": 32, "GROUP_M": 4},  num_warps=8, num_stages=2),
         triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_M": 4},  num_warps=8, num_stages=2),
         triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 4},  num_warps=8, num_stages=3),
+        # ----- CDNA3-friendly -----
+        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_M": 8}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64,  "GROUP_M": 8}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_M": 8}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 64,  "GROUP_M": 8}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 64,  "GROUP_M": 8}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 128, "GROUP_M": 8}, num_warps=8, num_stages=4),
     ]
 
 
@@ -229,6 +258,10 @@ if TRITON_AVAILABLE:
             b_fp = tl.where(k_mask[None, :], b_fp, 0.0)
 
             # tl.dot wants (M, K) @ (K, N); we have B as [N, K] -> transpose to [K, N].
+            # TODO(CDNA-optimization): tl.trans kills RDNA3 coalesce; consider
+            # row-major B layout when retuning. See Pass 1 audit (2026-04-22):
+            # changing the tl.dot layout is a real correctness risk so we
+            # leave it alone for now.
             b_fp_t = tl.trans(b_fp)
 
             # Cast to A's dtype for the matmul; accumulator stays fp32.
@@ -334,8 +367,10 @@ if TRITON_AVAILABLE:
 # ---------------------------------------------------------------------------
 
 
-# Default tile sizes. kernel-anvil's sweep can replace these per-shape,
-# but these are a safe starting point for 7900 XTX / RDNA3.
+# Default tile sizes for the manual (non-autotuned) path. kernel-anvil's
+# sweep can replace these per-shape. These are a safe starting point for
+# 7900 XTX / RDNA3; CDNA3 users should rely on @triton.autotune to pick
+# from the larger config set above.
 _DEFAULT_FWD_CONFIG = {
     "BLOCK_M": 16,
     "BLOCK_N": 64,

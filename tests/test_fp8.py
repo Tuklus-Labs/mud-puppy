@@ -273,6 +273,27 @@ def test_amax_nan_weight_stays_finite():
 # ---------------------------------------------------------------------------
 
 
+def test_fp8_allreduce_env_toggle(monkeypatch):
+    """MUD_PUPPY_FP8_ALLREDUCE must be read at call time, not at import.
+
+    Regression: the flag was read into a module-level constant at import, so
+    ``monkeypatch.setenv`` after the module had loaded had no effect and
+    pipeline-parallel users who set the env in a post-import config hook
+    couldn't disable the allreduce. The helper now re-reads the env every call.
+    """
+    from mud_puppy.fp8_rocm import _fp8_allreduce_enabled
+
+    monkeypatch.setenv("MUD_PUPPY_FP8_ALLREDUCE", "0")
+    assert _fp8_allreduce_enabled() is False
+    monkeypatch.setenv("MUD_PUPPY_FP8_ALLREDUCE", "1")
+    assert _fp8_allreduce_enabled() is True
+    monkeypatch.setenv("MUD_PUPPY_FP8_ALLREDUCE", "false")
+    assert _fp8_allreduce_enabled() is False
+    monkeypatch.delenv("MUD_PUPPY_FP8_ALLREDUCE", raising=False)
+    # Default ON when unset
+    assert _fp8_allreduce_enabled() is True
+
+
 def test_fp8_recovers_from_nan_checkpoint():
     """Loading a checkpoint with NaN amax buffers must not poison forward passes.
 

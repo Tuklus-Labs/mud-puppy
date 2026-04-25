@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# mud-puppy-launch: torchrun wrapper for single- or multi-node training.
+#
+# Usage:
+#   mud-puppy-launch [--nproc N] [--nnodes M] [--master-addr HOST] \
+#                    [--master-port PORT] [--node-rank R] -- \
+#                    <mud-puppy args...>
+#
+# Examples:
+#   # Single node, 8xMI300X, FSDP full shard on Llama-70B
+#   mud-puppy-launch --nproc 8 -- \
+#     meta-llama/Llama-3.3-70B-Instruct data.jsonl \
+#     --method full --precision bf16 \
+#     --fsdp full_shard --fsdp-wrap-class LlamaDecoderLayer \
+#     --fsdp-activation-checkpointing --batch-size 1 \
+#     --gradient-accumulation 8 --output ./outputs/llama70b
+#
+#   # Two nodes, 8 GPUs each (16 total)
+#   # On node 0:
+#   mud-puppy-launch --nproc 8 --nnodes 2 --node-rank 0 \
+#     --master-addr 10.0.0.1 --master-port 29500 -- \
+#     <model> <data> --fsdp hybrid_shard ...
+#
+# Defaults: nproc = $(nvidia-smi -L | wc -l) || $(rocm-smi --showid | grep GPU | wc -l) || 1
+
+set -euo pipefail
+
+NPROC=""
+NNODES=1
+NODE_RANK=0
+MASTER_ADDR="127.0.0.1"
+MASTER_PORT="29500"
+RDZV_ID="${RDZV_ID:-mud-puppy-$$}"
+
+# ----- parse launcher flags (stop at --) -----
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --nproc)       NPROC="$2";       shift 2 ;;
+        --nnodes)      NNODES="$2";      shift 2 ;;
+        --node-rank)   NODE_RANK="$2";   shift 2 ;;
+        --master-addr) MASTER_ADDR="$2"; shift 2 ;;
+        --master-port) MASTER_PORT="$2"; shift 2 ;;
+        --rdzv-id)     RDZV_ID="$2";     shift 2 ;;
+        --)            shift; break ;;
+        -h|--help)
+            sed -n '2,25p' "$0" | sed 's/^# \?//'
+            exit 0
+            ;;
+        *)
+            echo "mud-puppy-launch: unknown flag '$1' (missing '--' before mud-puppy args?)" >&2
+            exit 2
+            ;;
+    esac
+done
+
+# Auto-detect GPU count if --nproc omitted. Prefer rocm-smi on AMD boxes;
+# fall back to nvidia-smi; default to 1.
+#
+# Note: `grep -c` ALWAYS prints a number (0 if no matches), so NPROC will
+# never be empty after the rocm-smi path. We test for "empty OR zero" and
+# clear NPROC before falling through so the final ${NPROC:-1} default works.
+if [[ -z "$NPROC" ]]; then
+    if command -v rocm-smi &>/dev/null; then
+        NPROC=$(rocm-smi --showid 2>/dev/null | grep -c '^GPU' || true)
+    fi
+    if [[ -z "${NPROC:-}" || "$NPROC" -eq 0 ]] && command -v nvidia-smi &>/dev/null; then
+        unset NPROC
+        NPROC=$(nvidia-smi -L 2>/dev/null | wc -l)
+    fi
+    NPROC=${NPROC:-1}
+fi
+
+if [[ "$NPROC" -lt 1 ]]; then
+    echo "mud-puppy-launch: could not determine GPU count; pass --nproc" >&2
+    exit 1
+fi
+
+# ----- ROCm / CDNA env hints (safe on NVIDIA too, it ignores them) -----
+# Users can pre-export to override. We only set defaults.
+export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
+export TORCH_NCCL_BLOCKING_WAIT="${TORCH_NCCL_BLOCKING_WAIT:-0}"
+# NCCL_IB_HCA is deliberately NOT exported here: an empty export ("") tells
+# NCCL to use no IB fabric rather than to auto-detect, which silently
+# degrades multi-node performance. Users who want to pin IB HCAs should
+# export the variable themselves.
+# Speed up HF tokenizer init under DDP.
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
+
+echo "[mud-puppy-launch] nproc=$NPROC nnodes=$NNODES node_rank=$NODE_RANK master=$MASTER_ADDR:$MASTER_PORT"
+echo "[mud-puppy-launch] args: $*"
+
+# Prefer torchrun. Fall back to python -m torch.distributed.run for
+# ancient installs (we shouldn't hit this with torch >=2.0).
+if command -v torchrun &>/dev/null; then
+    LAUNCHER=(torchrun)
+else
+    LAUNCHER=(python3 -m torch.distributed.run)
+fi
+
+exec "${LAUNCHER[@]}" \
+    --nproc_per_node="$NPROC" \
+    --nnodes="$NNODES" \
+    --node_rank="$NODE_RANK" \
+    --master_addr="$MASTER_ADDR" \
+    --master_port="$MASTER_PORT" \
+    --rdzv_id="$RDZV_ID" \
+    -m mud_puppy.cli "$@"

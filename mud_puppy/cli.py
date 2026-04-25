@@ -1,7 +1,7 @@
 import argparse
 import os
 
-from .config import TrainingConfig
+from .config import TrainingConfig, _env_int
 from .trainer import run_training
 
 
@@ -249,6 +249,80 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.01,
         help="GPTQ Hessian damping percentage, must be in (0, 1) (default: 0.01)",
     )
+    # ------------------- checkpoint cadence -----------------------
+    parser.add_argument(
+        "--save-strategy",
+        dest="save_strategy",
+        default="epoch",
+        choices=["epoch", "steps", "no"],
+        help="HuggingFace Trainer save_strategy (default: epoch). "
+             "Use 'steps' for mid-run checkpoints on long runs.",
+    )
+    parser.add_argument(
+        "--save-steps",
+        dest="save_steps",
+        type=int,
+        default=500,
+        help="save_steps value when --save-strategy=steps (default 500)",
+    )
+    parser.add_argument(
+        "--logging-steps",
+        dest="logging_steps",
+        type=int,
+        default=10,
+        help="HF Trainer logging_steps (default 10)",
+    )
+
+    # ------------------- Heretic (abliteration) --------------------
+    parser.add_argument(
+        "--heretic",
+        dest="heretic",
+        action="store_true",
+        help="after training (and LoRA merge if applicable), run heretic "
+             "(p-e-w/heretic-llm) to orthogonalize the refusal direction out "
+             "of the model. Output goes to <output>/heretic/ and becomes the "
+             "input to --export-gguf if both are set.",
+    )
+    parser.add_argument(
+        "--heretic-n-trials",
+        dest="heretic_n_trials",
+        type=int,
+        default=30,
+        help="Optuna trial count for heretic (default 30)",
+    )
+    parser.add_argument(
+        "--heretic-quantization",
+        dest="heretic_quantization",
+        default="BNB_4BIT",
+        choices=["NONE", "BNB_4BIT"],
+        help="heretic quantization for the analysis pass. "
+             "BNB_4BIT is required for 14B+ models on consumer 24GB GPUs.",
+    )
+    parser.add_argument(
+        "--heretic-good-prompts-dataset",
+        dest="heretic_good_prompts_dataset",
+        default=None,
+        help="override heretic good-prompt pool (HF dataset id)",
+    )
+    parser.add_argument(
+        "--heretic-bad-prompts-dataset",
+        dest="heretic_bad_prompts_dataset",
+        default=None,
+        help="override heretic bad-prompt pool (HF dataset id)",
+    )
+    parser.add_argument(
+        "--heretic-system-prompt",
+        dest="heretic_system_prompt",
+        default=None,
+        help="explicit system prompt during refusal analysis",
+    )
+    parser.add_argument(
+        "--heretic-extra",
+        dest="heretic_extra",
+        default="",
+        help="free-form pass-through to heretic CLI (space-separated, "
+             "use quotes for values with spaces)",
+    )
     parser.add_argument("--monitor", dest="monitor", action="store_true",
         help="enable real-time web training dashboard (port 5980)")
     parser.add_argument("--monitor-port", dest="monitor_port", type=int, default=5980,
@@ -263,8 +337,58 @@ def build_parser() -> argparse.ArgumentParser:
         "--local-rank",
         dest="local_rank",
         type=int,
-        default=int(os.environ.get("LOCAL_RANK", 0)),
+        default=_env_int("LOCAL_RANK", 0),
         help="rank of this process for distributed training",
+    )
+    parser.add_argument(
+        "--distributed-backend",
+        dest="distributed_backend",
+        default="nccl",
+        choices=["nccl", "gloo", "mpi"],
+        help="distributed backend; nccl is RCCL on ROCm (default: nccl)",
+    )
+    # FSDP (multi-GPU, CDNA / MI300 path)
+    parser.add_argument(
+        "--fsdp",
+        dest="fsdp_mode",
+        default="",
+        choices=["", "full_shard", "shard_grad_op", "no_shard", "hybrid_shard"],
+        help=(
+            "enable Fully Sharded Data Parallel; 'full_shard' shards "
+            "params+grads+optimizer across all GPUs (recommended for 70B+ "
+            "on MI300x8); 'hybrid_shard' shards within a node and "
+            "replicates across nodes (multi-node only)"
+        ),
+    )
+    parser.add_argument(
+        "--fsdp-cpu-offload",
+        dest="fsdp_cpu_offload",
+        action="store_true",
+        help="offload sharded params to CPU (rarely needed on MI300/192GB)",
+    )
+    parser.add_argument(
+        "--fsdp-activation-checkpointing",
+        dest="fsdp_activation_checkpointing",
+        action="store_true",
+        help="checkpoint activations inside FSDP units (complements gradient_checkpointing)",
+    )
+    parser.add_argument(
+        "--fsdp-min-num-params",
+        dest="fsdp_min_num_params",
+        type=int,
+        default=1_000_000,
+        help="auto-wrap threshold when --fsdp-wrap-class is not set",
+    )
+    parser.add_argument(
+        "--fsdp-wrap-class",
+        dest="fsdp_transformer_layer_cls",
+        default="",
+        help=(
+            "wrap each instance of this class as one FSDP unit, e.g. "
+            "LlamaDecoderLayer, Qwen2DecoderLayer, MixtralDecoderLayer. "
+            "Class-based wrap is the right pattern for transformer LLMs; "
+            "min-num-params is a fallback for unfamiliar architectures."
+        ),
     )
 
     # Optional training hyperparameters
@@ -331,6 +455,12 @@ def main() -> None:
         monitor_port=args.monitor_port,
         distributed=args.distributed,
         local_rank=args.local_rank,
+        distributed_backend=args.distributed_backend,
+        fsdp_mode=args.fsdp_mode,
+        fsdp_cpu_offload=args.fsdp_cpu_offload,
+        fsdp_activation_checkpointing=args.fsdp_activation_checkpointing,
+        fsdp_min_num_params=args.fsdp_min_num_params,
+        fsdp_transformer_layer_cls=args.fsdp_transformer_layer_cls,
         quant_backend=args.quant_backend,
         gptq_group_size=args.gptq_group_size,
         gptq_actorder=args.gptq_actorder,
@@ -358,6 +488,13 @@ def main() -> None:
 
     config = TrainingConfig(**config_kwargs)
 
+    # Optional trainer knobs added to config via attribute assignment so
+    # the dataclass does not need its schema extended just for HF Trainer
+    # passthroughs. trainer.py reads via getattr-with-default.
+    config.save_strategy = args.save_strategy
+    config.save_steps = args.save_steps
+    config.logging_steps = args.logging_steps
+
     if config.finetuning_method == "preference":
         from .preference import run_preference_training
 
@@ -377,17 +514,71 @@ def main() -> None:
     else:
         run_training(config)
 
+    # Optional post-training: heretic abliteration between training and GGUF.
+    heretic_out_dir: str | None = None
+    if getattr(args, "heretic", False):
+        from .heretic_hook import (
+            HereticConfig, HereticError, run_heretic, heretic_output_dir,
+            is_heretic_available,
+        )
+
+        if not is_heretic_available():
+            print("[mud-puppy] --heretic requested but heretic-llm is not "
+                  "installed in mud-puppy's env. Run: pip install --no-deps "
+                  "heretic-llm==1.2.0 ; pip install optuna questionary "
+                  "pydantic-settings kernels psutil hf-transfer. Skipping.")
+        else:
+            # Determine the input dir for heretic. If we ran LoRA/QLoRA with
+            # --merge-lora, the merged weights live at <output>/merged/ (see
+            # merge_lora_weights). Otherwise the training output is the model.
+            merged_dir = os.path.join(config.output_dir, "merged")
+            if os.path.isdir(merged_dir) and os.path.isfile(
+                os.path.join(merged_dir, "config.json")
+            ):
+                heretic_input = merged_dir
+            elif os.path.isfile(os.path.join(config.output_dir, "config.json")):
+                heretic_input = config.output_dir
+            else:
+                print("[mud-puppy] --heretic requested but cannot locate an "
+                      "HF-loadable model dir. Looked at merged/ and output_dir. "
+                      "Skipping. (LoRA runs need --merge-lora to produce "
+                      "heretic-compatible weights.)")
+                heretic_input = None
+
+            if heretic_input is not None:
+                heretic_out_dir = heretic_output_dir(config.output_dir)
+                extra = (args.heretic_extra or "").split()
+                hcfg = HereticConfig(
+                    model_dir=heretic_input,
+                    out_dir=heretic_out_dir,
+                    n_trials=args.heretic_n_trials,
+                    quantization=args.heretic_quantization,
+                    good_prompts_dataset=args.heretic_good_prompts_dataset,
+                    bad_prompts_dataset=args.heretic_bad_prompts_dataset,
+                    system_prompt=args.heretic_system_prompt,
+                    extra_args=extra,
+                )
+                try:
+                    print(f"[mud-puppy] Running heretic: "
+                          f"input={heretic_input} -> output={heretic_out_dir}")
+                    heretic_out_dir = run_heretic(hcfg)
+                    print(f"[mud-puppy] Heretic output: {heretic_out_dir}")
+                except HereticError as exc:
+                    print(f"[mud-puppy] Heretic failed: {exc}")
+                    heretic_out_dir = None
+
     # Optional post-training: export to GGUF (+ kernel-anvil optimize).
     # Runs regardless of method once training succeeds.
     if getattr(args, "export_gguf", False):
         from .gguf_export import export_to_gguf, ExportConfig, GgufExportError
 
-        out_dir = config.output_dir
+        # Prefer the heretic output if it landed; otherwise the training dir.
+        source_dir = heretic_out_dir if heretic_out_dir else config.output_dir
         # For LoRA/QLoRA the output_dir contains adapter_config.json; the
         # export path detects and merges automatically. For full/other,
         # the same directory holds the merged model already.
         export_cfg = ExportConfig(
-            source_dir=out_dir,
+            source_dir=source_dir,
             out_path="model.gguf",
             quant=args.gguf_quant,
             optimize_with_kernel_anvil=args.optimize_with_kernel_anvil,
