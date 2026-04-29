@@ -165,3 +165,73 @@ def test_is_enabled_respects_env(monkeypatch):
     assert _is_enabled() is False
     monkeypatch.setenv("MUD_PUPPY_MXFP4_TRITON", "")
     assert _is_enabled() is False
+
+
+# ---------------------------------------------------------------------------
+# anvil-train config override
+# ---------------------------------------------------------------------------
+
+
+# Pick an RDNA3-friendly config that exists in _FWD_CONFIGS so the kernel
+# definitely compiles for it without surprises. The point of this test is
+# to verify the bypass path itself (config != None branch in
+# triton_mxfp4_matmul / triton_mxfp4_grad_input), not to hunt for new
+# winners.
+_ANVIL_FWD_CFG = {
+    "BLOCK_M": 32, "BLOCK_N": 128, "BLOCK_K": 32,
+    "GROUP_M": 1, "num_warps": 4, "num_stages": 2,
+    # Diagnostic-only fields the loader leaves on the dict; the kernel
+    # wrapper must filter these without choking.
+    "speedup_vs_baseline": 1.42,
+    "profiled_us": 12.3,
+}
+_ANVIL_BWD_CFG = dict(_ANVIL_FWD_CFG)
+
+
+@requires_gpu_triton
+def test_forward_with_anvil_config_passes_rel_tol():
+    """Anvil-supplied config must still satisfy the 1% rel-tol gate."""
+    from mud_puppy.mxfp4_kernels import triton_mxfp4_matmul
+
+    M, K, N = 8, 1024, 1024
+    packed, scales, wshape = _make_packed_weight(N, K, seed=42)
+    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+
+    ref = _reference_matmul(x, packed, scales, wshape, torch.bfloat16)
+    out = triton_mxfp4_matmul(x, packed, scales, in_features=K, config=_ANVIL_FWD_CFG)
+
+    assert out.shape == ref.shape
+    _assert_close(out, ref, name="fwd anvil-cfg")
+
+
+@requires_gpu_triton
+def test_grad_input_with_anvil_config_passes_rel_tol():
+    from mud_puppy.mxfp4_kernels import triton_mxfp4_grad_input
+
+    M, K, N = 8, 1024, 1024
+    packed, scales, wshape = _make_packed_weight(N, K, seed=42)
+    w_ref = unpack_mxfp4(packed, scales, wshape, block_size=32, dtype=torch.bfloat16)
+    grad_output = torch.randn(M, N, device="cuda", dtype=torch.bfloat16)
+    ref_gi = torch.nn.functional.linear(grad_output, w_ref.T.contiguous())
+
+    gi = triton_mxfp4_grad_input(
+        grad_output, packed, scales, in_features=K, config=_ANVIL_BWD_CFG,
+    )
+    assert gi.shape == (M, K)
+    _assert_close(gi, ref_gi, name="bwd anvil-cfg")
+
+
+@requires_gpu_triton
+def test_forward_with_no_config_unchanged():
+    """``config=None`` must give bit-equivalent results to the legacy path."""
+    from mud_puppy.mxfp4_kernels import triton_mxfp4_matmul
+
+    M, K, N = 4, 1024, 1024
+    packed, scales, wshape = _make_packed_weight(N, K, seed=11)
+    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+
+    out_default = triton_mxfp4_matmul(x, packed, scales, in_features=K)
+    out_explicit = triton_mxfp4_matmul(x, packed, scales, in_features=K, config=None)
+    # Default path runs autotune; both results pick the same winner so
+    # output should match exactly.
+    assert torch.equal(out_default, out_explicit)

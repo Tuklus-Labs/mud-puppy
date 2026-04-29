@@ -325,11 +325,43 @@ def _is_enabled() -> bool:
     return TRITON_AVAILABLE and val in ("1", "true", "yes", "on")
 
 
+# Constexpr keys the underlying Triton kernel requires when called via
+# ``.fn`` (the raw JITFunction). The autotuner normally fills these in
+# from a Config; when anvil_loader supplies a config dict directly we
+# reproduce the splat manually so the JIT sees the same kwargs it would
+# have seen from autotune.
+_FWD_CONSTEXPR_KEYS = ("BLOCK_M", "BLOCK_N", "BLOCK_K", "GROUP_M")
+_BWD_CONSTEXPR_KEYS = ("BLOCK_M", "BLOCK_N", "BLOCK_K", "GROUP_M")
+# Launch-time meta keys (not constexprs but consumed by the JITFunction
+# launcher). Splatting these alongside the constexprs reproduces what
+# triton.autotune does internally before calling the raw kernel.
+_LAUNCH_META_KEYS = ("num_warps", "num_stages")
+
+
+def _split_kernel_config(
+    config: dict, constexpr_keys: tuple[str, ...],
+) -> tuple[dict, dict]:
+    """Split an anvil-train cell into (constexpr_kwargs, launch_meta_kwargs).
+
+    Diagnostic-only fields like ``speedup_vs_baseline`` and
+    ``profiled_us`` are filtered out. Missing constexprs raise a
+    ``KeyError`` so the caller can fall back to autotune rather than
+    launching a kernel with garbage tile sizes.
+    """
+    constexpr_kwargs = {k: int(config[k]) for k in constexpr_keys}
+    launch_kwargs = {}
+    for k in _LAUNCH_META_KEYS:
+        if k in config:
+            launch_kwargs[k] = int(config[k])
+    return constexpr_kwargs, launch_kwargs
+
+
 def triton_mxfp4_matmul(
     x: torch.Tensor,
     qweight: torch.Tensor,
     scales: torch.Tensor,
     in_features: int,
+    config: Optional[dict] = None,
 ) -> torch.Tensor:
     """Compute ``out = x @ dequant_mxfp4(qweight, scales).T`` via Triton.
 
@@ -339,6 +371,11 @@ def triton_mxfp4_matmul(
         scales: uint8[N, ceil(K/32)] E8M0 scale bytes.
         in_features: true K (unpadded). qweight/scales may be sized for
             a padded K; this parameter tells the kernel where to stop.
+        config: optional anvil-train cell (BLOCK_M/N/K, GROUP_M,
+            num_warps, num_stages). When provided, bypasses
+            ``@triton.autotune`` and launches the raw JIT kernel with
+            these tile sizes. ``None`` keeps the existing autotuned
+            launch path.
     """
     if not TRITON_AVAILABLE:
         raise RuntimeError("triton_mxfp4_matmul requires Triton")
@@ -352,17 +389,35 @@ def triton_mxfp4_matmul(
     c = torch.empty(M, N, dtype=torch.float32, device=x.device)
     lut = _e2m1_lut(x.device)
 
-    grid = lambda meta: (
-        triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]),
-    )
-    _mxfp4_matmul_forward_kernel[grid](
-        x_2d, qweight, scales, lut, c,
-        M, N, K,
-        x_2d.stride(0), x_2d.stride(1),
-        qweight.stride(0), qweight.stride(1),
-        scales.stride(0), scales.stride(1),
-        c.stride(0), c.stride(1),
-    )
+    if config is None:
+        grid = lambda meta: (
+            triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]),
+        )
+        _mxfp4_matmul_forward_kernel[grid](
+            x_2d, qweight, scales, lut, c,
+            M, N, K,
+            x_2d.stride(0), x_2d.stride(1),
+            qweight.stride(0), qweight.stride(1),
+            scales.stride(0), scales.stride(1),
+            c.stride(0), c.stride(1),
+        )
+    else:
+        # Bypass @triton.autotune: launch the raw JITFunction with the
+        # caller-supplied tile sizes. This is the anvil-loader hot path.
+        ce_kwargs, launch_kwargs = _split_kernel_config(config, _FWD_CONSTEXPR_KEYS)
+        grid = (
+            triton.cdiv(M, ce_kwargs["BLOCK_M"]) * triton.cdiv(N, ce_kwargs["BLOCK_N"]),
+        )
+        _mxfp4_matmul_forward_kernel.fn[grid](
+            x_2d, qweight, scales, lut, c,
+            M, N, K,
+            x_2d.stride(0), x_2d.stride(1),
+            qweight.stride(0), qweight.stride(1),
+            scales.stride(0), scales.stride(1),
+            c.stride(0), c.stride(1),
+            **ce_kwargs,
+            **launch_kwargs,
+        )
 
     return c.to(x.dtype).reshape(*orig_shape[:-1], N)
 
@@ -372,6 +427,7 @@ def triton_mxfp4_grad_input(
     qweight: torch.Tensor,
     scales: torch.Tensor,
     in_features: int,
+    config: Optional[dict] = None,
 ) -> torch.Tensor:
     """Compute ``grad_input = grad_output @ dequant_mxfp4(qweight, scales)``.
 
@@ -380,6 +436,8 @@ def triton_mxfp4_grad_input(
         qweight: uint8[N, ceil(K/2)] packed nibbles.
         scales: uint8[N, ceil(K/32)] E8M0 bytes.
         in_features: true K.
+        config: optional anvil-train cell. Same semantics as in
+            :func:`triton_mxfp4_matmul`.
     """
     if not TRITON_AVAILABLE:
         raise RuntimeError("triton_mxfp4_grad_input requires Triton")
@@ -393,17 +451,33 @@ def triton_mxfp4_grad_input(
     gi = torch.empty(M, K, dtype=torch.float32, device=grad_output.device)
     lut = _e2m1_lut(grad_output.device)
 
-    grid = lambda meta: (
-        triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(K, meta["BLOCK_K"]),
-    )
-    _mxfp4_matmul_backward_kernel[grid](
-        go_2d, qweight, scales, lut, gi,
-        M, N, K,
-        go_2d.stride(0), go_2d.stride(1),
-        qweight.stride(0), qweight.stride(1),
-        scales.stride(0), scales.stride(1),
-        gi.stride(0), gi.stride(1),
-    )
+    if config is None:
+        grid = lambda meta: (
+            triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(K, meta["BLOCK_K"]),
+        )
+        _mxfp4_matmul_backward_kernel[grid](
+            go_2d, qweight, scales, lut, gi,
+            M, N, K,
+            go_2d.stride(0), go_2d.stride(1),
+            qweight.stride(0), qweight.stride(1),
+            scales.stride(0), scales.stride(1),
+            gi.stride(0), gi.stride(1),
+        )
+    else:
+        ce_kwargs, launch_kwargs = _split_kernel_config(config, _BWD_CONSTEXPR_KEYS)
+        grid = (
+            triton.cdiv(M, ce_kwargs["BLOCK_M"]) * triton.cdiv(K, ce_kwargs["BLOCK_K"]),
+        )
+        _mxfp4_matmul_backward_kernel.fn[grid](
+            go_2d, qweight, scales, lut, gi,
+            M, N, K,
+            go_2d.stride(0), go_2d.stride(1),
+            qweight.stride(0), qweight.stride(1),
+            scales.stride(0), scales.stride(1),
+            gi.stride(0), gi.stride(1),
+            **ce_kwargs,
+            **launch_kwargs,
+        )
 
     return gi.to(grad_output.dtype).reshape(*orig_shape[:-1], K)
 
@@ -427,13 +501,17 @@ class _MXFP4LinearFn(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, input, qweight, scales, bias, in_features, out_features, dtype):
+    def forward(
+        ctx, input, qweight, scales, bias, in_features, out_features, dtype,
+        fwd_config=None, bwd_config=None,
+    ):
         output = None
         used_triton = False
         try:
             if _is_enabled():
                 output = triton_mxfp4_matmul(
-                    input.contiguous(), qweight, scales, in_features=in_features,
+                    input.contiguous(), qweight, scales,
+                    in_features=in_features, config=fwd_config,
                 )
                 if bias is not None:
                     output = output + bias
@@ -457,6 +535,7 @@ class _MXFP4LinearFn(torch.autograd.Function):
         ctx.dtype = dtype
         ctx.has_bias = bias is not None
         ctx.used_triton = used_triton
+        ctx.bwd_config = bwd_config
         return output
 
     @staticmethod
@@ -466,7 +545,8 @@ class _MXFP4LinearFn(torch.autograd.Function):
         if ctx.used_triton:
             try:
                 grad_input = triton_mxfp4_grad_input(
-                    grad_output.contiguous(), qweight, scales, in_features=ctx.in_features,
+                    grad_output.contiguous(), qweight, scales,
+                    in_features=ctx.in_features, config=ctx.bwd_config,
                 )
             except Exception as exc:  # pragma: no cover
                 log.warning("mxfp4 triton backward failed (%s); falling back", exc)
@@ -487,8 +567,9 @@ class _MXFP4LinearFn(torch.autograd.Function):
         if ctx.has_bias:
             grad_bias = grad_output.reshape(-1, ctx.out_features).sum(0)
 
-        # No grads for qweight, scales, in_features, out_features, dtype
-        return grad_input, None, None, grad_bias, None, None, None
+        # No grads for qweight, scales, in_features, out_features, dtype,
+        # fwd_config, bwd_config
+        return grad_input, None, None, grad_bias, None, None, None, None, None
 
 
 class MXFP4Linear(nn.Linear):
@@ -536,6 +617,13 @@ class MXFP4Linear(nn.Linear):
         else:
             self.register_parameter("bias", None)
 
+        # anvil-train config slots. Populated externally (see
+        # ``apply_anvil_configs`` below) when an anvil-train JSON is
+        # available for this layer's (op, M, N, K) cell. ``None`` keeps
+        # the existing @triton.autotune behaviour.
+        self._anvil_fwd_config: Optional[dict] = None
+        self._anvil_bwd_config: Optional[dict] = None
+
     @property
     def weight(self):
         """Dequantize on access. PEFT may read this for dtype/device info."""
@@ -564,6 +652,8 @@ class MXFP4Linear(nn.Linear):
             self.in_features,
             self.out_features,
             self.dtype,
+            self._anvil_fwd_config,
+            self._anvil_bwd_config,
         )
 
     def extra_repr(self) -> str:
@@ -579,6 +669,45 @@ def _set_module(model: nn.Module, name: str, module: nn.Module) -> None:
     for p in parts[:-1]:
         parent = getattr(parent, p)
     setattr(parent, parts[-1], module)
+
+
+def apply_anvil_configs(
+    model: nn.Module,
+    anvil_cfg,  # type: AnvilTrainConfig | None
+    M: int,
+) -> int:
+    """Stash anvil-train per-cell configs on every :class:`MXFP4Linear` in ``model``.
+
+    For each layer, looks up ``mxfp4_fwd`` and ``mxfp4_grad_input`` cells
+    keyed by the layer's (M, N, K) and stores the result on
+    ``_anvil_fwd_config`` / ``_anvil_bwd_config``. Layers whose cell is
+    absent keep ``None`` and fall through to ``@triton.autotune`` at
+    forward time.
+
+    Returns the number of (layer, op) slots populated. The caller logs
+    a one-line ``"mud-puppy: applied N anvil-train configs"`` summary.
+
+    ``M`` is the expected token count per step (B*S). It's a single
+    scalar because anvil-train tunes per (model, B, S) tuple, not per
+    layer.
+    """
+    if anvil_cfg is None:
+        return 0
+    applied = 0
+    for module in model.modules():
+        if not isinstance(module, MXFP4Linear):
+            continue
+        N = module.out_features
+        K = module.in_features
+        fwd = anvil_cfg.get_kernel_config("mxfp4_fwd", M, N, K)
+        bwd = anvil_cfg.get_kernel_config("mxfp4_grad_input", M, N, K)
+        if fwd is not None:
+            module._anvil_fwd_config = fwd
+            applied += 1
+        if bwd is not None:
+            module._anvil_bwd_config = bwd
+            applied += 1
+    return applied
 
 
 def quantize_model_mxfp4(

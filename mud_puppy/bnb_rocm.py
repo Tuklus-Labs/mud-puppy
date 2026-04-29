@@ -36,7 +36,10 @@ class _Linear4bitFn(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, input, qweight, scale, bias, out_features, in_features, dtype):
+    def forward(
+        ctx, input, qweight, scale, bias, out_features, in_features, dtype,
+        fwd_config=None, bwd_config=None,
+    ):
         # Try the Triton fused path first if it's enabled. Any failure
         # (kernel absent, unsupported shape, runtime error) falls back to
         # the pure-PyTorch dequant+linear path below so training never
@@ -47,7 +50,7 @@ class _Linear4bitFn(torch.autograd.Function):
             from . import int4_kernels
             if int4_kernels._is_enabled():
                 output = int4_kernels.triton_int4_matmul(
-                    input.contiguous(), qweight, scale
+                    input.contiguous(), qweight, scale, config=fwd_config,
                 )
                 if bias is not None:
                     output = output + bias
@@ -70,6 +73,7 @@ class _Linear4bitFn(torch.autograd.Function):
         ctx.dtype = dtype
         ctx.has_bias = bias is not None
         ctx.used_triton = used_triton
+        ctx.bwd_config = bwd_config
 
         return output
 
@@ -85,7 +89,7 @@ class _Linear4bitFn(torch.autograd.Function):
                 from . import int4_kernels
                 grad_input = int4_kernels.triton_int4_grad_input(
                     grad_output.contiguous(), qweight, scale,
-                    in_features=ctx.in_features,
+                    in_features=ctx.in_features, config=ctx.bwd_config,
                 )
             except Exception as exc:  # pragma: no cover - fallback path
                 log.warning(
@@ -107,8 +111,9 @@ class _Linear4bitFn(torch.autograd.Function):
         if ctx.has_bias:
             grad_bias = grad_output.reshape(-1, ctx.out_features).sum(0)
 
-        # No grads for qweight, scale, out_features, in_features, dtype
-        return grad_input, None, None, grad_bias, None, None, None
+        # No grads for qweight, scale, out_features, in_features, dtype,
+        # fwd_config, bwd_config
+        return grad_input, None, None, grad_bias, None, None, None, None, None
 
 
 class Linear4bit(nn.Linear):
@@ -159,6 +164,12 @@ class Linear4bit(nn.Linear):
         else:
             self.register_parameter("bias", None)
 
+        # anvil-train config slots (populated externally; see
+        # ``apply_anvil_configs`` in this module). ``None`` keeps the
+        # existing ``@triton.autotune`` behaviour unchanged.
+        self._anvil_fwd_config: Optional[dict] = None
+        self._anvil_bwd_config: Optional[dict] = None
+
     @property
     def weight(self):
         """Dequantize on access. PEFT may read this for dtype/device info."""
@@ -184,6 +195,8 @@ class Linear4bit(nn.Linear):
             self.out_features,
             self.in_features,
             self.dtype,
+            self._anvil_fwd_config,
+            self._anvil_bwd_config,
         )
 
     def extra_repr(self) -> str:
@@ -199,6 +212,40 @@ def _set_module(model: nn.Module, name: str, module: nn.Module):
     for p in parts[:-1]:
         parent = getattr(parent, p)
     setattr(parent, parts[-1], module)
+
+
+def apply_anvil_configs(
+    model: nn.Module,
+    anvil_cfg,  # type: AnvilTrainConfig | None
+    M: int,
+) -> int:
+    """Stash anvil-train per-cell configs on every :class:`Linear4bit` in ``model``.
+
+    Mirror of ``mxfp4_kernels.apply_anvil_configs`` for the INT4 path.
+    Looks up ``int4_fwd`` and ``int4_grad_input`` cells keyed by the
+    layer's (M, N, K) and stores them on the layer. Layers whose cell
+    is absent keep ``None`` and fall through to ``@triton.autotune``.
+
+    Returns the number of (layer, op) slots populated. ``M`` is the
+    expected token count per step (B*S).
+    """
+    if anvil_cfg is None:
+        return 0
+    applied = 0
+    for module in model.modules():
+        if not isinstance(module, Linear4bit):
+            continue
+        N = module.out_features
+        K = module.in_features
+        fwd = anvil_cfg.get_kernel_config("int4_fwd", M, N, K)
+        bwd = anvil_cfg.get_kernel_config("int4_grad_input", M, N, K)
+        if fwd is not None:
+            module._anvil_fwd_config = fwd
+            applied += 1
+        if bwd is not None:
+            module._anvil_bwd_config = bwd
+            applied += 1
+    return applied
 
 
 def quantize_model_4bit(
