@@ -247,6 +247,65 @@ def test_linear4bit_triton_forward_matches_pytorch(monkeypatch):
     )
 
 
+# ---------------------------------------------------------------------------
+# anvil-train config override
+# ---------------------------------------------------------------------------
+
+
+# A config from _FWD_CONFIGS that is known to compile and work on RDNA3
+# shapes. The bypass path lives in the wrapper's ``if config is None``
+# branch; this test makes sure the non-None branch reaches the same
+# numerics as the autotuned path within the existing 5e-2 abs gate.
+_ANVIL_INT4_CFG = {
+    "BLOCK_M": 32, "BLOCK_N": 128, "BLOCK_K": 64,
+    "GROUP_M": 8, "num_warps": 4, "num_stages": 3,
+    "speedup_vs_baseline": 1.27,
+    "profiled_us": 19.0,
+}
+
+
+@requires_gpu_triton
+def test_int4_forward_with_anvil_config():
+    from mud_puppy.int4_kernels import triton_int4_matmul
+
+    M, K, N = 16, 1024, 1024
+    q, _ = _build_linear4bit(K, N, dtype=torch.bfloat16, seed=42)
+    q = q.cuda()
+    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+
+    ref = _reference_forward(x, q)
+    out = triton_int4_matmul(x, q.qweight, q.scale, config=_ANVIL_INT4_CFG)
+
+    assert out.shape == ref.shape
+    diff = (out.float() - ref.float()).abs()
+    max_diff = diff.max().item()
+    assert max_diff < 5e-2, (
+        f"int4 forward (anvil cfg) diverges: max|Δ|={max_diff:.4e}"
+    )
+
+
+@requires_gpu_triton
+def test_int4_grad_input_with_anvil_config():
+    from mud_puppy.int4_kernels import triton_int4_grad_input
+
+    M, K, N = 16, 1024, 1024
+    q, _ = _build_linear4bit(K, N, dtype=torch.bfloat16, seed=42)
+    q = q.cuda()
+
+    w = _dequantize_packed(q.qweight, q.scale, q.out_features, q.in_features, q.dtype)
+    grad_output = torch.randn(M, N, device="cuda", dtype=torch.bfloat16)
+    ref_gi = grad_output.to(torch.float32) @ w.to(torch.float32)
+
+    gi = triton_int4_grad_input(
+        grad_output, q.qweight, q.scale, in_features=K, config=_ANVIL_INT4_CFG,
+    )
+    assert gi.shape == (M, K)
+    max_diff = (gi.float() - ref_gi).abs().max().item()
+    assert max_diff < 5e-2, (
+        f"int4 grad_input (anvil cfg) diverges: max|Δ|={max_diff:.4e}"
+    )
+
+
 @requires_gpu_triton
 def test_linear4bit_triton_backward_matches_pytorch(monkeypatch):
     """Gradients through Linear4bit must match between triton and pytorch paths."""

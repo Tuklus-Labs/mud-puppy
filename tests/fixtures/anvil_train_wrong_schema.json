@@ -1,0 +1,9 @@
+{
+  "schema": "anvil-train/v999",
+  "gpu": "gfx1100",
+  "kernel_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "model": "future-model",
+  "batch": 1,
+  "seq": 4096,
+  "ops": {}
+}

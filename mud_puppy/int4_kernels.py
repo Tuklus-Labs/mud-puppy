@@ -397,6 +397,29 @@ def _is_enabled() -> bool:
     return TRITON_AVAILABLE and val in ("1", "true", "yes", "on")
 
 
+# Constexpr keys the underlying Triton kernels require when called via
+# ``.fn`` (the raw JITFunction). Same key set on forward and backward
+# kernels (see _int4_matmul_forward_kernel / _int4_matmul_backward_kernel
+# signatures above). Mirrors mxfp4_kernels._FWD_CONSTEXPR_KEYS.
+_INT4_CONSTEXPR_KEYS = ("BLOCK_M", "BLOCK_N", "BLOCK_K", "GROUP_M")
+_INT4_LAUNCH_META_KEYS = ("num_warps", "num_stages")
+
+
+def _split_int4_config(config: dict) -> tuple[dict, dict]:
+    """Split an anvil-train cell into (constexpr_kwargs, launch_meta_kwargs).
+
+    Diagnostic-only fields (``speedup_vs_baseline``, ``profiled_us``)
+    are dropped. A ``KeyError`` on a missing constexpr is intentional --
+    the caller should feed a complete cell or pass ``config=None``.
+    """
+    ce_kwargs = {k: int(config[k]) for k in _INT4_CONSTEXPR_KEYS}
+    launch_kwargs = {}
+    for k in _INT4_LAUNCH_META_KEYS:
+        if k in config:
+            launch_kwargs[k] = int(config[k])
+    return ce_kwargs, launch_kwargs
+
+
 def triton_int4_matmul(
     x: torch.Tensor,
     qweight: torch.Tensor,
@@ -432,19 +455,36 @@ def triton_int4_matmul(
 
     scale_1d = scale.reshape(-1).contiguous().to(torch.float32)
 
-    # 1D grid because the kernel does its own (pid_m, pid_n) swizzling
-    # for L2 cache reuse. Total programs = cdiv(M, BM) * cdiv(N, BN).
-    grid = lambda meta: (
-        triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]),
-    )
-    _int4_matmul_forward_kernel[grid](
-        x_2d, qweight, scale_1d, c,
-        M, N, K,
-        x_2d.stride(0), x_2d.stride(1),
-        qweight.stride(0), qweight.stride(1),
-        scale_1d.stride(0),
-        c.stride(0), c.stride(1),
-    )
+    if config is None:
+        # 1D grid because the kernel does its own (pid_m, pid_n) swizzling
+        # for L2 cache reuse. Total programs = cdiv(M, BM) * cdiv(N, BN).
+        grid = lambda meta: (
+            triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]),
+        )
+        _int4_matmul_forward_kernel[grid](
+            x_2d, qweight, scale_1d, c,
+            M, N, K,
+            x_2d.stride(0), x_2d.stride(1),
+            qweight.stride(0), qweight.stride(1),
+            scale_1d.stride(0),
+            c.stride(0), c.stride(1),
+        )
+    else:
+        # Bypass @triton.autotune with the anvil-supplied tile sizes.
+        ce_kwargs, launch_kwargs = _split_int4_config(config)
+        grid = (
+            triton.cdiv(M, ce_kwargs["BLOCK_M"]) * triton.cdiv(N, ce_kwargs["BLOCK_N"]),
+        )
+        _int4_matmul_forward_kernel.fn[grid](
+            x_2d, qweight, scale_1d, c,
+            M, N, K,
+            x_2d.stride(0), x_2d.stride(1),
+            qweight.stride(0), qweight.stride(1),
+            scale_1d.stride(0),
+            c.stride(0), c.stride(1),
+            **ce_kwargs,
+            **launch_kwargs,
+        )
 
     return c.to(out_dtype).reshape(*orig_shape[:-1], N)
 
@@ -474,16 +514,32 @@ def triton_int4_grad_input(
     gi = torch.empty(M, K, dtype=torch.float32, device=grad_output.device)
     scale_1d = scale.reshape(-1).contiguous().to(torch.float32)
 
-    grid = lambda meta: (
-        triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(K, meta["BLOCK_K"]),
-    )
-    _int4_matmul_backward_kernel[grid](
-        go_2d, qweight, scale_1d, gi,
-        M, N, K,
-        go_2d.stride(0), go_2d.stride(1),
-        qweight.stride(0), qweight.stride(1),
-        scale_1d.stride(0),
-        gi.stride(0), gi.stride(1),
-    )
+    if config is None:
+        grid = lambda meta: (
+            triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(K, meta["BLOCK_K"]),
+        )
+        _int4_matmul_backward_kernel[grid](
+            go_2d, qweight, scale_1d, gi,
+            M, N, K,
+            go_2d.stride(0), go_2d.stride(1),
+            qweight.stride(0), qweight.stride(1),
+            scale_1d.stride(0),
+            gi.stride(0), gi.stride(1),
+        )
+    else:
+        ce_kwargs, launch_kwargs = _split_int4_config(config)
+        grid = (
+            triton.cdiv(M, ce_kwargs["BLOCK_M"]) * triton.cdiv(K, ce_kwargs["BLOCK_K"]),
+        )
+        _int4_matmul_backward_kernel.fn[grid](
+            go_2d, qweight, scale_1d, gi,
+            M, N, K,
+            go_2d.stride(0), go_2d.stride(1),
+            qweight.stride(0), qweight.stride(1),
+            scale_1d.stride(0),
+            gi.stride(0), gi.stride(1),
+            **ce_kwargs,
+            **launch_kwargs,
+        )
 
     return gi.to(grad_output.dtype).reshape(*orig_shape[:-1], K)

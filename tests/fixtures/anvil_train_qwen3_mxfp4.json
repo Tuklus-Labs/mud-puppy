@@ -1,0 +1,57 @@
+{
+  "schema": "anvil-train/v1",
+  "gpu": "gfx1100",
+  "rocm_version": "7.1",
+  "torch_version": "2.10.0+rocm7.1",
+  "triton_version": "3.6.0",
+  "kernel_hash": "sha256:__PLACEHOLDER__",
+  "model": "Qwen3-8B",
+  "batch": 1,
+  "seq": 4096,
+  "ops": {
+    "mxfp4_fwd": {
+      "1,1,1": {
+        "BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32,
+        "GROUP_M": 8, "num_warps": 8, "num_stages": 4,
+        "speedup_vs_baseline": 1.33,
+        "profiled_us": 18.4
+      },
+      "1,2,1": {
+        "BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64,
+        "GROUP_M": 8, "num_warps": 8, "num_stages": 3,
+        "speedup_vs_baseline": 1.41,
+        "profiled_us": 56.2
+      },
+      "1,1,2": {
+        "BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64,
+        "GROUP_M": 4, "num_warps": 8, "num_stages": 3,
+        "speedup_vs_baseline": 1.18,
+        "profiled_us": 44.9
+      }
+    },
+    "mxfp4_grad_input": {
+      "1,1,1": {
+        "BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64,
+        "GROUP_M": 8, "num_warps": 8, "num_stages": 3,
+        "speedup_vs_baseline": 1.22,
+        "profiled_us": 22.1
+      }
+    },
+    "int4_fwd": {
+      "1,1,1": {
+        "BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64,
+        "GROUP_M": 8, "num_warps": 8, "num_stages": 3,
+        "speedup_vs_baseline": 1.27,
+        "profiled_us": 19.0
+      }
+    },
+    "int4_grad_input": {
+      "1,1,1": {
+        "BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64,
+        "GROUP_M": 8, "num_warps": 8, "num_stages": 3,
+        "speedup_vs_baseline": 1.21,
+        "profiled_us": 23.7
+      }
+    }
+  }
+}

@@ -426,6 +426,26 @@ def load_model(config: TrainingConfig, calibration_data: Optional[List[torch.Ten
         print("[mud-puppy] Preparing model for k-bit training...")
         _prepare_model_for_kbit_training_rocm(model)
 
+        # Apply anvil-train kernel configs if a cached JSON exists for
+        # this (model, batch, seq, quant) tuple. No-op when the cache is
+        # missing -- kernels stay on @triton.autotune.
+        try:
+            from . import anvil_loader
+
+            _max_seq = int(getattr(config, "max_seq_length", 0) or 0) or 2048
+            _batch = int(getattr(config, "per_device_batch_size", 1) or 1)
+            _quant_slug = "mxfp4" if quant_backend == "mxfp4" else "int4"
+            anvil_loader.apply_to_model(
+                model,
+                model_id=str(config.model_name_or_path),
+                batch=_batch,
+                seq=_max_seq,
+                quant=_quant_slug,
+            )
+        except Exception as _exc:  # pragma: no cover - defensive
+            # Anvil is opt-in / cache-driven; never let it break a training run.
+            print(f"[mud-puppy] anvil-train config skipped: {_exc}")
+
     # GPTQ: either ROCm-native real GPTQ, or auto-gptq on CUDA
     elif config.finetuning_method == "gptq":
         if is_rocm():
