@@ -81,6 +81,11 @@ if TRITON_AVAILABLE:
         triton.Config({"BLOCK_M": 64,  "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 8},  num_warps=8, num_stages=3),
         triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_M": 4},  num_warps=8, num_stages=2),
         triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 4},  num_warps=8, num_stages=3),
+        # Wide-grid winner across 5 representative training shapes (Qwen3-8B
+        # hidden / FFN, gpt-oss-20b hidden / FFN-up). Headroom benchmark on
+        # 7900 XTX (2026-04-28): 1.05x–1.57x over the prior RDNA3 list,
+        # avg 1.33x. See docs/plans/2026-04-28-kernel-anvil-training-impl.md.
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64,  "BLOCK_K": 32, "GROUP_M": 8},  num_warps=8, num_stages=4),
         # ----- CDNA3 (MI300X) -----
         # BLOCK_K must stay a multiple of 32 (MXFP4 block boundary).
         triton.Config({"BLOCK_M": 64,  "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_M": 8}, num_warps=4, num_stages=3),
